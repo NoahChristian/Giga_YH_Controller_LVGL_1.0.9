@@ -1,0 +1,22 @@
+# Arduino IDE temporary build folders
+/build/
+/bin/
+
+#Arduino personal identification file
+arduino_secrets.h
+
+# Hardware specific compiled files
+*.elf
+*.hex
+*.d
+*.o
+
+# Visual Studio Code / PlatformIO temporary files
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+
+# System specific junk files
+.DS_Store
+Thumbs.db
