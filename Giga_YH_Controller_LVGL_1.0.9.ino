@@ -78,9 +78,22 @@
 #define MAX_POWER 900
 #define STARTUP_DELAY 10 //Startup Delay in Seconds (e.g. 10 minutes as 600 seconds)
 
+//2026-07 oscillation fix: total_power_from_grid is one whole-household reading that
+//  Home Assistant publishes identically to both Line1Set and Line2Set, so each line's
+//  accumulator only claims half of it (see the /2.0 in the b_New_L{1,2}_Power blocks)
+//  -- otherwise the two lines' corrections double-count the same signal.
+//EMA_ALPHA smooths onMqttMessage's incoming reading before it reaches the accumulator;
+//  derived from the measured real Refoss->HA report cadence (~15.8s between readings in
+//  logged data) for an effective ~35s smoothing time constant.
+#define EMA_ALPHA 0.35
+//MAX_STEP_PER_UPDATE caps how much a single 30s update may change output by. Default is
+//  a conservative starting point grounded in the incident log, not a hardware-verified
+//  limit -- revisit once real-world behavior after this fix can be observed.
+#define MAX_STEP_PER_UPDATE 100.0
+
 bool trace = true;
 
-#define VERSION_POWER "1.0.9"
+#define VERSION_POWER "1.0.10"
 //version 1.0.0 - clock showing UTC
 //version 1.0.1 - fixed clock and included version referencing
 //version 1.0.2 - include MQTT publishing and pubsub
@@ -95,6 +108,10 @@ bool trace = true;
 //version 1.0.7 - First production version
 //version 1.0.8 - Running version minor fixes including watchdog on inputs
 //version 1.0.9 - GitHub version posting
+//version 1.0.10 - Fix output oscillation traced to a logged 2026-07-11 incident: total_power_from_grid
+//                 is one whole-household reading published to both Line1Set/Line2Set, so each line
+//                 was double-applying the same correction. Now halved, EMA-filtered, and slew-rate
+//                 limited per update -- see EMA_ALPHA/MAX_STEP_PER_UPDATE above.
 //
 //TODO: Report on output
 //      Time of Use
@@ -383,8 +400,8 @@ void onMqttMessage(int messageSize) {
     tbuf[size]=NULL;
     if (verbosity > 4) Serial.print(String(tbuf));
     if (verbosity > 4) Serial.println();
-    //set number based on input
-    f_L1_Power = String(tbuf).toFloat();
+    //smoothed (EMA) rather than a raw overwrite -- see EMA_ALPHA note above
+    f_L1_Power = EMA_ALPHA * String(tbuf).toFloat() + (1 - EMA_ALPHA) * f_L1_Power;
     if (trace) {Serial.print("f_L1_Power = "); Serial.println(f_L1_Power,3);}
     b_New_L1_Power = true;
   }
@@ -398,8 +415,8 @@ void onMqttMessage(int messageSize) {
     tbuf[size]=NULL;
     if (verbosity > 4) Serial.print(String(tbuf));
     if (verbosity > 4) Serial.println();
-    //set number based on input
-    f_L2_Power = String(tbuf).toFloat();
+    //smoothed (EMA) rather than a raw overwrite -- see EMA_ALPHA note above
+    f_L2_Power = EMA_ALPHA * String(tbuf).toFloat() + (1 - EMA_ALPHA) * f_L2_Power;
     b_New_L2_Power = true;
   }
 }
@@ -701,7 +718,10 @@ void loop() {
     if(!b_Start) { //account for delays in readout as well as power feeder 30 sec otherwise throw out update
       float tOutput; //use positive and negative values
       if (currentTime > (lastPowerChangeL1 + 30000)){
-        tOutput = L1_Output + f_L1_Power; //if f_L1_Power is negative, it will lower power out
+        //f_L1_Power is total_power_from_grid, one whole-household reading published
+        //  identically to both Line1Set and Line2Set -- halve it so the two lines
+        //  don't each independently apply the full correction (2026-07 oscillation fix)
+        tOutput = L1_Output + f_L1_Power / 2.0; //if f_L1_Power is negative, it will lower power out
         //TODO(L1/L2 balance): with the feeder running, L1 reads positive and L2 reads
         //  negative such that L1+L2 should trend toward 0. The previous cross-line
         //  correction here always fired because it gated on L1_Power/L2_Power, which
@@ -710,6 +730,8 @@ void loop() {
         //  from logged input/output data before reintroducing it.
         if (tOutput > MAX_POWER) tOutput = MAX_POWER;
         if (tOutput<0) tOutput = 0;
+        if (tOutput - L1_Output > MAX_STEP_PER_UPDATE) tOutput = L1_Output + MAX_STEP_PER_UPDATE;
+        else if (L1_Output - tOutput > MAX_STEP_PER_UPDATE) tOutput = L1_Output - MAX_STEP_PER_UPDATE;
         lastPowerChangeL1 = currentTime;
       }else{
         tOutput = L1_Output;
@@ -725,10 +747,13 @@ void loop() {
     if(!b_Start) { //account for delays in readout as well as power feeder 30 sec otherwise throw out update
       float tOutput; //use positive and negative values
       if (currentTime > (lastPowerChangeL2 + 30000)){
-        tOutput = L2_Output + f_L2_Power; //if f_L2_Power is negative, it will lower power out
+        //halved for the same reason as L1 above (2026-07 oscillation fix)
+        tOutput = L2_Output + f_L2_Power / 2.0; //if f_L2_Power is negative, it will lower power out
         //TODO(L1/L2 balance): see matching note in the b_New_L1_Power block above.
         if (tOutput > MAX_POWER) tOutput = MAX_POWER;
         if (tOutput<0) tOutput = 0;
+        if (tOutput - L2_Output > MAX_STEP_PER_UPDATE) tOutput = L2_Output + MAX_STEP_PER_UPDATE;
+        else if (L2_Output - tOutput > MAX_STEP_PER_UPDATE) tOutput = L2_Output - MAX_STEP_PER_UPDATE;
         lastPowerChangeL2 = currentTime;
       }else{
         tOutput = L2_Output;
