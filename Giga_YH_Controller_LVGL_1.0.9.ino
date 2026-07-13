@@ -401,7 +401,7 @@ void onMqttMessage(int messageSize) {
     if (verbosity > 4) Serial.print(String(tbuf));
     if (verbosity > 4) Serial.println();
     //smoothed (EMA) rather than a raw overwrite -- see EMA_ALPHA note above
-    f_L1_Power = EMA_ALPHA * String(tbuf).toFloat() + (1 - EMA_ALPHA) * f_L1_Power;
+    f_L1_Power = EMA_ALPHA * atof(tbuf) + (1 - EMA_ALPHA) * f_L1_Power; //atof avoids a heap-allocating String just to parse a float
     if (trace) {Serial.print("f_L1_Power = "); Serial.println(f_L1_Power,3);}
     b_New_L1_Power = true;
   }
@@ -416,7 +416,7 @@ void onMqttMessage(int messageSize) {
     if (verbosity > 4) Serial.print(String(tbuf));
     if (verbosity > 4) Serial.println();
     //smoothed (EMA) rather than a raw overwrite -- see EMA_ALPHA note above
-    f_L2_Power = EMA_ALPHA * String(tbuf).toFloat() + (1 - EMA_ALPHA) * f_L2_Power;
+    f_L2_Power = EMA_ALPHA * atof(tbuf) + (1 - EMA_ALPHA) * f_L2_Power; //atof avoids a heap-allocating String just to parse a float
     b_New_L2_Power = true;
   }
 }
