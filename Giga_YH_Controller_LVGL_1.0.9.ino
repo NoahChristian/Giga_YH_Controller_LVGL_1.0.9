@@ -77,14 +77,10 @@
 #define UNIT_NUMBER 1
 #define MAX_POWER 900
 #define STARTUP_DELAY 10 //Startup Delay in Seconds (e.g. 10 minutes as 600 seconds)
-#define COLLECTOR_TIME_CONSTANT 30 
 
 bool trace = true;
 
-//Unit >2 is only MQTT subscriber, not publisher Unit 1 is sub/pubber
-#define UNIT_NUMBER 1
-
-#define VERSION_POWER "1.0.7"
+#define VERSION_POWER "1.0.9"
 //version 1.0.0 - clock showing UTC
 //version 1.0.1 - fixed clock and included version referencing
 //version 1.0.2 - include MQTT publishing and pubsub
@@ -105,9 +101,6 @@ bool trace = true;
 //      Holiday schedule
 
 
-//bool syncOut1 = false;
-//bool syncOut2 = false;
-
 uint8_t verbosity = 255;
 // 0 = silent
 // 1 = basics
@@ -122,16 +115,12 @@ char ssid[] = SECRET_SSID;        // your network SSID (name)
 char password[] = SECRET_PASS;    // your network password (use for WPA, or use as key for WEP)
 
 //uint32_t currentTime;
-uint32_t lastSyncTime;
-uint32_t lastClockTime;
-uint32_t elapsedTime;
 uint32_t lastPowerChangeL1=millis();
 uint32_t lastPowerChangeL2=millis();
 
 int wifiStatus = WL_IDLE_STATUS;
 WiFiUDP Udp; // A UDP instance to let us send and receive packets over UDP
 //NTPClient timeClient(Udp);
-WiFiServer server(80); // Start server on port 80
 Arduino_H7_Video Display(800, 480, GigaDisplayShield);
 Arduino_GigaDisplayTouch TouchDetector;
 
@@ -149,11 +138,6 @@ const char pubtopic2[]  = "V1.0/Home/PowerFeeder/Line2";
 const char subtopic1[]  = "V1.0/Home/PowerFeeder/Line1Set";
 const char subtopic2[]  = "V1.0/Home/PowerFeeder/Line2Set";
 
-//set interval for sending messages (milliseconds)
-const long interval = 5000;
-unsigned long previousMillis = 0;
-
-int count = 0;
 //end of Mosquitto
 
 unsigned int localPort = 2390; // local port to listen for UDP packets
@@ -166,9 +150,6 @@ const int NTP_PACKET_SIZE = 48; // NTP timestamp is in the first 48 bytes of the
 
 byte packetBuffer[NTP_PACKET_SIZE]; // buffer to hold incoming and outgoing packets
 
-
-constexpr unsigned long printInterval { 1000 };
-unsigned long printNow {};
 
 //Declarations for LVGL Elements
 lv_obj_t* obj1;
@@ -185,57 +166,34 @@ unsigned long previousTime = millis();
 unsigned long currentTime = millis();
 unsigned long timer485_L1 = millis();
 unsigned long timer485_L2 = millis();
-//uint32_t wdTimer485=millis();
-//bool b_wdTimer485=false;
 int tStart = millis(); //startup counter see STARTUP_DELAY define
 bool b_Start = true; //true=incorporate startup delay (note startup delay starts after code is running)
 
-int num;
-
-//Variables for power control
-String receivedMessage;
-String sendMessage;
-String receivedMessage_Hex;
-
-//bool verbose=false;
-
 uint8_t buffer1[12];//to do: should be 8
 uint8_t highByte1,lowByte1,cksum1;
-uint8_t buffsize1;
 uint8_t receivedChar1;
 bool messageValid1 = false;
 bool bSendMessage1 = false;
-uint8_t head1 = 0, tail1 = 0;
+uint8_t tail1 = 0;
 
 uint8_t buffer2[12];
 uint8_t highByte2,lowByte2,cksum2;
-uint8_t buffsize2;
 uint8_t receivedChar2;
 bool messageValid2 = false;
 bool bSendMessage2 = false;
 bool bDisplayMessage = true; //print 0 to start
-uint8_t head2 = 0, tail2 = 0;
+uint8_t tail2 = 0;
 const float L1_CorrectionFactor=0.683966;
 const float L2_CorrectionFactor=0.683966;
-uint16_t L1_Power = 0;
-uint16_t L1_LastPower = 0;
-uint16_t L2_Power = 0;
-uint16_t L1_CorrectedPower = 0;
-uint16_t L2_CorrectedPower = 0;
 uint16_t L1_Output = 0;
 uint16_t L2_Output = 0;
-
-uint16_t L1_State = 0;
-uint16_t L2_State = 0;
 
 //use float Power1 and 2 for display
 float f_L1_Power=0.0;
 float f_L2_Power=0.0;
 unsigned int Power1=0;
-unsigned int SetpointPower1=0;
 unsigned int PowerCk1=0;
 unsigned int Power2=0;
-unsigned int SetpointPower2=0;
 unsigned int PowerCk2=0;
 bool b_New_L1_Power=false;
 bool b_New_L2_Power=false;
@@ -333,18 +291,6 @@ void connectToWiFi(void){
   printWifiStatus();
 }
 
-void RTCset()  // Set cpu RTC
-{    
-  tm t;
-  t.tm_sec = (0);       // 0-59
-  t.tm_min = (52);        // 0-59
-  t.tm_hour = (14);         // 0-23
-  t.tm_mday = (18);   // 1-31
-  t.tm_mon = (11);       // 0-11  "0" = Jan, -1 
-  t.tm_year = ((22)+100);   // year since 1900,  current year + 100 + 1900 = correct year
-  set_time(mktime(&t));       // set RTC clock                                 
-}
-
 void setNtpTime()
 {
   Udp.begin(localPort);
@@ -416,12 +362,9 @@ unsigned long parseNtpPacket()
 }
 
 void onMqttMessage(int messageSize) {
-  //TODO: because MQTT could send a huge string, this should be made to prevent overruns
   char tbuf[256]="";
-  //char topic[256]="";
   int size=0;
   String topic = mqttClient.messageTopic();
-  //strcpy(topic,mqttClient.messageTopic());
   // we received a message, print out the topic and contents
   if (verbosity > 4) {
     Serial.print("Received a message with topic '");
@@ -432,10 +375,11 @@ void onMqttMessage(int messageSize) {
   }
   if(topic.equals(subtopic1)){
     // use the Stream interface to print the contents
-    while (mqttClient.available()) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
       tbuf[size]=(char)mqttClient.read();
-      size++;    
+      size++;
     }
+    while (mqttClient.available()) mqttClient.read(); //discard anything beyond tbuf's capacity so the next message stays in sync
     tbuf[size]=NULL;
     if (verbosity > 4) Serial.print(String(tbuf));
     if (verbosity > 4) Serial.println();
@@ -446,10 +390,11 @@ void onMqttMessage(int messageSize) {
   }
   if(topic.equals(subtopic2)){
     // use the Stream interface to print the contents
-    while (mqttClient.available()) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
       tbuf[size]=(char)mqttClient.read();
-      size++;    
+      size++;
     }
+    while (mqttClient.available()) mqttClient.read(); //discard anything beyond tbuf's capacity so the next message stays in sync
     tbuf[size]=NULL;
     if (verbosity > 4) Serial.print(String(tbuf));
     if (verbosity > 4) Serial.println();
@@ -461,16 +406,6 @@ void onMqttMessage(int messageSize) {
 
 void displayInValues(float L1, float L2, uint16_t L1PM, uint16_t L2PM) {
   char buffer[128]; // Ensure the buffer is large enough
-  //mega version
-  // display.clearDisplay();
-  // display.setTextSize(2);      // Normal 1:1 pixel scale
-  // display.setTextColor(SSD1306_WHITE); // Draw white text
-  // display.setCursor(0, 0);     // Start at top-left corner
-  // sprintf(buffer, "L1 out =\n %d W\nL2 out =\n %d W\n", L1, L2);
-  // display.write(buffer);
-  // display.display();
-
-  // was using "Local L1 = %d\nLocal L2 = %d\n",L1PM, L2PM
   sprintf(buffer, "L1 in = %.3f W\nL2 in = %.3f W\nCorrected Local\nL1 = %.3f\nL2 = %.3f\n", L1, L2, (float) L1PM*L1_CorrectionFactor, (float) L2PM*L2_CorrectionFactor);
   lv_label_set_text(label2, buffer);  
 }
@@ -544,21 +479,13 @@ void setup() {
   //Try to not leave screen in the dark
   lv_timer_handler();
 
-  //Uno R4 Method
-  //WiFi.begin(ssid, password);
-
-  //Giga Method
   connectToWiFi();
-  //RTC.begin();
   if (verbosity > 0) Serial.println("\nStarting connection to server...");
-  //timeClient.begin();
   if (verbosity > 0) {
     Serial.print("Running version ");
     Serial.println(VERSION_POWER);
   }
 
-  //syncRTC();
-  server.begin();
   if (verbosity > 0) {
     Serial.print("Attempting to connect to the MQTT broker: ");
     Serial.println(broker);
@@ -601,9 +528,7 @@ void setup() {
 int tick = 0;
 
 static char subject_text[256];
-static char wifi_string[512];
 char buffer[200]="";
-String sz_time="finding time";
 unsigned long watchdog = millis();
   
 void loop() {
@@ -621,7 +546,6 @@ void loop() {
       }
       else tail1=0;
     }
-    //timer485_L1 = millis();
   }
 
   if (Serial2.available() > 0) {
@@ -634,7 +558,6 @@ void loop() {
       }
       else tail2=0; //discard the message read eight bytes but invalid
     }
-   //timer485_L2 = millis();
    }
   
   watchdog = millis();
@@ -653,7 +576,7 @@ void loop() {
   if(messageValid1) ///valid message and received from Port, now we can write but don't send msg yet
   {
     Power1 =buffer1[4]*256 + buffer1[5];
-    PowerCk1 = 264 - (buffer1[4] + buffer1[5]) & 0xFF;
+    PowerCk1 = (264 - (buffer1[4] + buffer1[5])) & 0xFF;
     if (PowerCk1 == buffer1[7] ){
       if (verbosity > 4) {
         Serial.print(Power1);
@@ -667,18 +590,19 @@ void loop() {
         Serial.print(" W ");
         Serial.print("NOT VALID\n");
         Serial.print(PowerCk1, HEX);
-        Serial.print(' vs. ');
+        Serial.print(" vs. ");
         Serial.print(buffer1[7], HEX);
         Serial.println();
       }
     }
     messageValid1=false; //message has been consumed
+    tail1 = 0; //frame fully consumed either way; re-arm for next sync sequence (previously only reset on success, allowing tail1 to walk past the buffer on repeated checksum failures)
   }
 
   if(messageValid2) ///valid message
   {
     Power2 =buffer2[4]*256 + buffer2[5];
-    PowerCk2 = 264 - (buffer2[4] + buffer2[5]) & 0xFF;
+    PowerCk2 = (264 - (buffer2[4] + buffer2[5])) & 0xFF;
     if (PowerCk2 == buffer2[7] ){
       if (verbosity > 0) {
         Serial.print(Power2);
@@ -692,18 +616,18 @@ void loop() {
         Serial.print(" W ");
         Serial.print("NOT VALID L2\n");
         Serial.print(PowerCk2, HEX);
-        Serial.print(' vs. ');
+        Serial.print(" vs. ");
         Serial.print(buffer2[7], HEX);
         Serial.println();
       }
     }
     messageValid2=false;
+    tail2 = 0; //frame fully consumed either way; re-arm for next sync sequence
   }
 
-  //currentTime = millis();
-  if (bSendMessage1){    
+  if (bSendMessage1){
     if (trace) {Serial.print("trying to write output to RS485 Port 1 = ");Serial.println(L1_Output);}
-    highByte1 = trunc(L1_Output / 256);
+    highByte1 = (uint8_t)(L1_Output >> 8);
     lowByte1 = ( L1_Output - highByte1*256 );
     cksum1 = 264 - ((highByte1 + lowByte1) & 0xFF);
     {
@@ -714,8 +638,7 @@ void loop() {
       {
         Serial1.write(buffer1, 8);  //write outputs bytes at low level, not null terminated
         if (verbosity > 4) {
-          Serial.print("L1_Output = ");Serial.println(L1_Output);//Serial.print(" L1_CorrectedPower = ");Serial.println(L1_CorrectedPower);
-          //Serial.print(" SetpointPower1 = ");Serial.println(SetpointPower1);
+          Serial.print("L1_Output = ");Serial.println(L1_Output);
         }
       }
     }
@@ -728,7 +651,7 @@ void loop() {
 
   if (bSendMessage2){
     if (trace) {Serial.print("trying to write output to RS485 Port 2 = ");Serial.println(L2_Output);}
-    highByte2 = trunc(L2_Output / 256);
+    highByte2 = (uint8_t)(L2_Output >> 8);
     lowByte2 = ( L2_Output - highByte2*256 );
     cksum2 = 264 - ((highByte2 + lowByte2) & 0xFF);
     {
@@ -739,8 +662,7 @@ void loop() {
       {
         Serial2.write(buffer2, 8);  //write outputs bytes at low level, not null terminated
         if (verbosity > 4) {
-          Serial.print("L2_Output = ");Serial.println(L2_Output);//Serial.print(" L1_CorrectedPower = ");Serial.println(L1_CorrectedPower);
-          //Serial.print(" SetpointPower1 = ");Serial.println(SetpointPower1);
+          Serial.print("L2_Output = ");Serial.println(L2_Output);
         }
       }
     }
@@ -759,7 +681,6 @@ void loop() {
   
   if (currentTime - previousTime >= 1000) {
     tick++;
-    //num = random(4000);    
     strcpy(subject_text,getLocaltime(buffer));
     if(b_Start){
       char buf[60]="";
@@ -773,21 +694,21 @@ void loop() {
     strcpy(subject_text,wifi_info(buffer));
     lv_label_set_text(label3, subject_text);
 
-    // num = random(4000);    
-    // sprintf(subject_text,"%d", num);
-    // lv_label_set_text(label4, subject_text);
     previousTime = currentTime;
   } 
   
   if(b_New_L1_Power){
-    //f_L1_Power = String(tbuf).toFloat();
-    //b_New_L1_Power = true;
     if(!b_Start) { //account for delays in readout as well as power feeder 30 sec otherwise throw out update
       float tOutput; //use positive and negative values
       if (currentTime > (lastPowerChangeL1 + 30000)){
         tOutput = L1_Output + f_L1_Power; //if f_L1_Power is negative, it will lower power out
+        //TODO(L1/L2 balance): with the feeder running, L1 reads positive and L2 reads
+        //  negative such that L1+L2 should trend toward 0. The previous cross-line
+        //  correction here always fired because it gated on L1_Power/L2_Power, which
+        //  were declared but never assigned (always 0), rather than the real Power1/
+        //  Power2 readback. Re-derive the correct coupling (and any P/I/D constants)
+        //  from logged input/output data before reintroducing it.
         if (tOutput > MAX_POWER) tOutput = MAX_POWER;
-        if ((f_L2_Power < 0) && (L2_Power==0)) tOutput += f_L2_Power; //try to balance loads
         if (tOutput<0) tOutput = 0;
         lastPowerChangeL1 = currentTime;
       }else{
@@ -795,29 +716,25 @@ void loop() {
       }
       L1_Output = (int) tOutput;
     }
-    //if (trace) {Serial.print("L1_Output = "); Serial.println(L1_Output);}
     b_New_L1_Power=false;//fully processed power
     bSendMessage1=true; //output the new value to the feeder
     bDisplayMessage=true;
   }
-  
+
   if(b_New_L2_Power){
-    //f_L1_Power = String(tbuf).toFloat();
-    //b_New_L1_Power = true;
     if(!b_Start) { //account for delays in readout as well as power feeder 30 sec otherwise throw out update
       float tOutput; //use positive and negative values
       if (currentTime > (lastPowerChangeL2 + 30000)){
-        tOutput = L2_Output + f_L2_Power; //if f_L1_Power is negative, it will lower power out
+        tOutput = L2_Output + f_L2_Power; //if f_L2_Power is negative, it will lower power out
+        //TODO(L1/L2 balance): see matching note in the b_New_L1_Power block above.
         if (tOutput > MAX_POWER) tOutput = MAX_POWER;
-        if ((f_L1_Power < 0) && (L1_Power==0)) tOutput += f_L1_Power; //try to balance loads
         if (tOutput<0) tOutput = 0;
         lastPowerChangeL2 = currentTime;
       }else{
         tOutput = L2_Output;
       }
-      L2_Output = (int) tOutput; 
+      L2_Output = (int) tOutput;
     }
-    //if (trace) {Serial.print("L2_Output = "); Serial.println(L2_Output);}
     b_New_L2_Power=false;//fully processed power
     bSendMessage2=true; //output the new value to the feeder
     bDisplayMessage=true;
@@ -857,7 +774,7 @@ void loop() {
 
   //if mqtt gets a different number, recalculate new setpoint
   //L1_Output <= Power going out to feeder
-  //L1_Power <= The measured output at L1 main line
+  //Power1 <= The measured local output at L1, read back over RS485
   //b_New_L1_Power <= new L1 power just read
   mqttClient.poll();
 

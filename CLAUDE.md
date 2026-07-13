@@ -77,28 +77,62 @@ publish status back to HA.
   Y-H current-loop reading to actual watts, compensating for the
   non-matching CT winding factor/diameter noted in the file header.
 
-## Known rough edges (see full review for detail)
+## Fixed in the cleanup pass (2026-07)
 
-- `L1_Power`/`L2_Power` are declared and always `0` — never assigned from
-  `Power1`/`Power2` — so the cross-line "balance loads" condition
-  (`L2_Power == 0`) is unconditionally true, not a real check.
-- RS485 receive buffers (`buffer1`/`buffer2`, size 12) reset `tail{1,2}` to
-  0 only on a *successful send*, not on checksum failure — a run of bad
-  frames can walk `tail1/2` past the 8-byte sync window toward the 12-byte
-  array bound.
-- No staleness/failsafe timeout on MQTT input: if HA/broker/WiFi drops, the
-  RS485 watchdog keeps re-sending the *last known* output indefinitely
-  rather than ramping toward 0 — this cuts against the stated goal of
-  keeping export near zero.
-- `onMqttMessage`'s `tbuf[256]` fill loop has no bounds check (acknowledged
-  in a `TODO` in the source).
-- WiFi/MQTT connect failures at boot hang forever (`while(true);` /
+The initial review found several concrete bugs and a pile of dead
+declarations left over from earlier prototyping. These are now fixed:
+
+- RS485 receive buffers (`buffer1`/`buffer2`) now reset `tail{1,2}` to 0
+  after *every* fully-received 8-byte frame, valid or not. Previously the
+  reset only happened on a successful send, so a run of checksum failures
+  could walk `tail1`/`tail2` past the sync window toward the 12-byte array
+  bound — a real out-of-bounds write risk.
+- `onMqttMessage`'s `tbuf[256]` fill loop is now bounds-checked, with any
+  excess bytes past capacity drained (not stored) so an oversized MQTT
+  payload can't overflow the buffer or desync the next message.
+- Fixed `Serial.print(' vs. ')` (a multi-char literal, prints garbage) →
+  `Serial.print(" vs. ")`.
+- Dropped duplicate `#define UNIT_NUMBER`, unused `COLLECTOR_TIME_CONSTANT`,
+  and a long tail of declared-but-never-used globals (`lastSyncTime`,
+  `lastClockTime`, `elapsedTime`, the inert `WiFiServer server(80)`,
+  `interval`/`previousMillis`, `count`, `printInterval`/`printNow`, `num`,
+  `receivedMessage`/`sendMessage`/`receivedMessage_Hex`, `buffsize{1,2}`,
+  `head{1,2}`, `L1_LastPower`, `L1_CorrectedPower`/`L2_CorrectedPower`,
+  `L1_State`/`L2_State`, `SetpointPower{1,2}`, `wifi_string`, `sz_time`) and
+  the never-called `RTCset()`.
+- `VERSION_POWER` now reads `"1.0.9"`, matching the file/header.
+- Cosmetic: explicit parens around the checksum's `-`/`&` mix (was
+  numerically fine but easy to misread), and `trunc(x/256)` replaced with
+  `x >> 8`.
+
+## Known rough edges still open
+
+- **`L1_Power`/`L2_Power` cross-line "balance" logic was removed, not
+  fixed.** It gated on `L1_Power`/`L2_Power`, which were declared and never
+  assigned (dummy placeholders from prototyping) — so the condition was
+  unconditionally true rather than actually checking anything. Per the
+  hardware owner: with the feeder running, L1 reads positive and L2 reads
+  negative such that `L1 + L2` should trend toward 0, and the real
+  cross-line coupling (plus P/I/D-style constants) needs to be re-derived
+  from logged input/output data rather than guessed. See the
+  `TODO(L1/L2 balance)` comments in the `b_New_L1_Power`/`b_New_L2_Power`
+  blocks in `loop()`.
+- **No staleness/failsafe timeout on MQTT input** — intentional per the
+  hardware owner (hold last known output indefinitely if HA/broker/WiFi
+  drops, rather than ramping to 0). Worth revisiting if the deployment
+  profile changes.
+- WiFi/MQTT connect failures at boot still hang forever (`while(true);` /
   `while(1);`) with no reconnect/watchdog-reset path, and there's no WiFi
   reconnect logic if the link drops after `setup()`.
-
-Full findings (severity-ranked, with line references) are tracked outside
-this file — see the review delivered alongside this document rather than
-duplicating it here.
+- `Arduino String` is still used in the MQTT/WiFi hot path
+  (`onMqttMessage`, `wifi_info`, topic publish concatenation) — a heap
+  fragmentation risk on a long-uptime device. Left as-is in this pass since
+  it's a bigger behavioral change that really wants compile/hardware
+  verification (no `arduino-cli`/toolchain was available to build-check
+  this pass).
+- `STARTUP_DELAY` stays at `10` seconds (confirmed intentional by the
+  hardware owner, despite the v1.0.5 changelog describing a 5-minute
+  intent).
 
 ## Conventions / gotchas for future edits
 
