@@ -151,6 +151,35 @@ pins to `MAX_POWER` repeatedly during the incident window (62/719 sampled
 points ≥800W, stdev ≈254W), new logic never approaches the cap on the
 same input (0/719 ≥800W, stdev ≈126W).
 
+## Planned dashboard redesign (design only — not yet implemented)
+
+The current display (`setup()`'s 2x2 `lv_obj_create`/`lv_label_create`
+grid, four static labels) is slated for a touch-navigable redesign:
+a minimal glance Home screen plus five detail screens (Time & rates,
+Connection, Battery, Grid flow, Almanac) reachable by tapping —
+`Arduino_GigaDisplayTouch` is already initialized in `setup()` but
+currently wired to nothing.
+
+This was designed through an extended mockup/critique process *before*
+any LVGL code was written, including corrections driven by real logged
+data (`batterydata.csv`-derived charge/discharge curves, calendar
+verification of weekday vs. weekend time-of-use schedules). The full
+plan, screen-by-screen data-source status (what's free vs. buildable vs.
+genuinely missing), LVGL widget mapping, and phased build order live in
+[`design/lvgl_redesign_plan.md`](design/lvgl_redesign_plan.md).
+
+A self-contained, clickable HTML prototype of every screen — the actual
+visual reference, not just a description — is at
+[`design/mockups/giga_dashboard_mockup.html`](design/mockups/giga_dashboard_mockup.html).
+Open it directly in any browser; no build step or server needed.
+
+Read the plan doc before starting implementation — it explicitly flags
+that this touches the same file as the safety-relevant RS485/MQTT
+control loop (see the 2026-07-11 oscillation incident above, itself a
+timing/responsiveness bug), so new UI work needs to be verified not to
+compete with that loop for cycle time the way the sibling
+`ESP32_Fuel_Gauge` project's old blocking LED animation did.
+
 ## Known rough edges still open
 
 - **`L1_Power`/`L2_Power` cross-line "balance" logic was removed, not
