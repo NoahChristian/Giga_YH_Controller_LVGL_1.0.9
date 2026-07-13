@@ -24,7 +24,7 @@
     <text x="512" y="265">On-peak</text>
   </g>
 
-  <rect x="270" y="295" width="260" height="34" rx="17" fill="#3a1f1c"/>
-  <circle cx="292" cy="312" r="5" fill="#e2574c"/>
-  <text x="410" y="317" text-anchor="middle" fill="#e2574c" font-size="14">On-peak &#183; $0.38/kWh &#183; until 9:00 PM</text>
+  <rect x="253" y="295" width="315" height="34" rx="17" fill="#3a1f1c"/>
+  <circle cx="277" cy="312" r="5" fill="#e2574c"/>
+  <text x="291" y="317" text-anchor="start" fill="#e2574c" font-size="14">On-peak &#183; $0.38/kWh &#183; until 9:00 PM</text>
 </svg>

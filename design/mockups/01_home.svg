@@ -5,13 +5,13 @@
 
   <text x="200" y="95" text-anchor="middle" fill="#f2f2f0" font-size="46" font-weight="400">6:07 <tspan fill="#8a8d92" font-size="20">PM</tspan></text>
   <text x="200" y="125" text-anchor="middle" fill="#8a8d92" font-size="14">Monday, July 13</text>
-  <rect x="120" y="140" width="160" height="28" rx="14" fill="#17191c"/>
-  <ellipse cx="150" cy="154" rx="7" ry="5" fill="#d6d7d9"/><ellipse cx="158" cy="151" rx="8" ry="6" fill="#d6d7d9"/><ellipse cx="167" cy="155" rx="5" ry="4" fill="#d6d7d9"/>
-  <text x="205" y="159" text-anchor="middle" fill="#d6d7d9" font-size="13" font-weight="bold">Cloudy, 68&#176;F</text>
-  <path d="M 262 150 L 268 154 L 262 158" fill="none" stroke="#6b6e73" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-  <rect x="128" y="180" width="144" height="26" rx="13" fill="#3a1f1c"/>
-  <circle cx="145" cy="193" r="4" fill="#e2574c"/>
-  <text x="205" y="197" text-anchor="middle" fill="#e2574c" font-size="12">On-peak &#183; $0.38/kWh</text>
+  <rect x="98" y="140" width="214" height="28" rx="14" fill="#17191c"/>
+  <ellipse cx="122" cy="154" rx="7" ry="5" fill="#d6d7d9"/><ellipse cx="130" cy="151" rx="8" ry="6" fill="#d6d7d9"/><ellipse cx="139" cy="155" rx="5" ry="4" fill="#d6d7d9"/>
+  <text x="150" y="159" text-anchor="start" fill="#d6d7d9" font-size="13" font-weight="bold">Cloudy, 68&#176;F</text>
+  <path d="M 296 150 L 302 154 L 296 158" fill="none" stroke="#6b6e73" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="88" y="180" width="234" height="26" rx="13" fill="#3a1f1c"/>
+  <circle cx="110" cy="193" r="4" fill="#e2574c"/>
+  <text x="124" y="197" text-anchor="start" fill="#e2574c" font-size="12">On-peak &#183; $0.38/kWh</text>
 
   <circle cx="600" cy="95" r="5" fill="#39d98a"/>
   <text x="614" y="100" fill="#d6d7d9" font-size="17">Connected</text>
@@ -23,8 +23,8 @@
     <circle cx="200" cy="355" r="42" fill="none" stroke="#3fd6c8" stroke-width="10" stroke-linecap="round" stroke-dasharray="263.9" stroke-dashoffset="47.5"/>
   </g>
   <text x="285" y="345" text-anchor="middle" fill="#f2f2f0" font-size="30" font-weight="400">82<tspan fill="#8a8d92" font-size="16">%</tspan></text>
-  <path d="M 260 365 L 267 365 L 263.5 372 Z" fill="#e8a53d"/>
-  <text x="300" y="373" text-anchor="middle" fill="#e8a53d" font-size="13">Discharging 763W</text>
+  <path d="M 235 365 L 242 365 L 238.5 372 Z" fill="#e8a53d"/>
+  <text x="252" y="373" text-anchor="start" fill="#e8a53d" font-size="13">Discharging 763W</text>
 
   <path d="M 560 388 A 40 40 0 0 1 597 340" fill="none" stroke="#3a2f1c" stroke-width="8" stroke-linecap="round"/>
   <path d="M 597 340 A 40 40 0 0 1 604 340" fill="none" stroke="#2c3a2a" stroke-width="8" stroke-linecap="round"/>

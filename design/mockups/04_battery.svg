@@ -9,8 +9,8 @@
     <circle cx="300" cy="110" r="42" fill="none" stroke="#3fd6c8" stroke-width="10" stroke-linecap="round" stroke-dasharray="263.9" stroke-dashoffset="50.1"/>
   </g>
   <text x="385" y="100" text-anchor="middle" fill="#f2f2f0" font-size="32" font-weight="400">82<tspan fill="#8a8d92" font-size="17">%</tspan></text>
-  <path d="M 358 122 L 366 122 L 362 130 Z" fill="#e8a53d"/>
-  <text x="400" y="131" text-anchor="middle" fill="#e8a53d" font-size="14">Discharging 763W</text>
+  <path d="M 328 122 L 336 122 L 332 130 Z" fill="#e8a53d"/>
+  <text x="346" y="131" text-anchor="start" fill="#e8a53d" font-size="14">Discharging 763W</text>
 
   <text x="400" y="185" text-anchor="middle" fill="#6b6e73" font-size="13">Yesterday (Sun, Jul 12), 12 AM &#8211; 6:07 PM</text>
 
