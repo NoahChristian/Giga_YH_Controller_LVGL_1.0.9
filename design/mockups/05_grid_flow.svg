@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" font-family="Arial, Helvetica, sans-serif">
+  <rect width="800" height="480" fill="#0b0c0e"/>
+
+  <path d="M 40 30 L 33 37 L 40 44" fill="none" stroke="#8a8d92" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="48" y="42" fill="#8a8d92" font-size="15">Home</text>
+
+  <path d="M 335 180 A 65 65 0 0 1 394.33 115.25" fill="none" stroke="#3a2f1c" stroke-width="12" stroke-linecap="round"/>
+  <path d="M 394.33 115.25 A 65 65 0 0 1 405.66 115.25" fill="none" stroke="#2c3a2a" stroke-width="12" stroke-linecap="round"/>
+  <path d="M 405.66 115.25 A 65 65 0 0 1 465 180" fill="none" stroke="#3a2f1c" stroke-width="12" stroke-linecap="round"/>
+  <line x1="400" y1="180" x2="413.8" y2="126.8" stroke="#e8a53d" stroke-width="4" stroke-linecap="round"/>
+  <circle cx="400" cy="180" r="6" fill="#e8a53d"/>
+
+  <text x="400" y="228" text-anchor="middle" fill="#f2f2f0" font-size="30" font-weight="400">145 W</text>
+  <text x="400" y="252" text-anchor="middle" fill="#e8a53d" font-size="15">Importing</text>
+
+  <g text-anchor="middle">
+    <text x="280" y="310" fill="#f2f2f0" font-size="20">236 W</text>
+    <text x="280" y="330" fill="#6b6e73" font-size="13">L1</text>
+    <text x="400" y="310" fill="#f2f2f0" font-size="20">234 W</text>
+    <text x="400" y="330" fill="#6b6e73" font-size="13">L2</text>
+    <text x="520" y="310" fill="#39d98a" font-size="20">$4.20</text>
+    <text x="520" y="330" fill="#6b6e73" font-size="13">Saved today</text>
+  </g>
+
+  <line x1="200" y1="400" x2="600" y2="400" stroke="#242629" stroke-width="1"/>
+  <polyline points="200,403.3 260,396.7 320,406.7 380,393.3 440,405 500,395 600,400" fill="none" stroke="#e8a53d" stroke-width="3"/>
+</svg>

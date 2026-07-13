@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 480" font-family="Arial, Helvetica, sans-serif">
+  <rect width="800" height="480" fill="#0b0c0e"/>
+
+  <path d="M 40 30 L 33 37 L 40 44" fill="none" stroke="#8a8d92" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="48" y="42" fill="#8a8d92" font-size="15">Home</text>
+
+  <circle cx="345" cy="95" r="6" fill="#39d98a"/>
+  <text x="360" y="101" fill="#d6d7d9" font-size="20">Connected</text>
+
+  <g font-size="15">
+    <text x="220" y="160" fill="#8a8d92">SSID</text><text x="580" y="160" text-anchor="end" fill="#d6d7d9">HomeNet-5G</text>
+    <text x="220" y="196" fill="#8a8d92">Signal</text><text x="580" y="196" text-anchor="end" fill="#d6d7d9">-52 dBm</text>
+    <text x="220" y="232" fill="#8a8d92">IP address</text><text x="580" y="232" text-anchor="end" fill="#d6d7d9">192.168.1.42</text>
+    <text x="220" y="268" fill="#8a8d92">MQTT broker</text><text x="580" y="268" text-anchor="end" fill="#39d98a">Connected</text>
+    <text x="220" y="304" fill="#8a8d92">Line1Set</text><text x="580" y="304" text-anchor="end" fill="#d6d7d9">8s ago</text>
+    <text x="220" y="340" fill="#8a8d92">Line2Set</text><text x="580" y="340" text-anchor="end" fill="#d6d7d9">11s ago</text>
+    <text x="220" y="376" fill="#8a8d92">Battery/SoC</text><text x="580" y="376" text-anchor="end" fill="#d6d7d9">14s ago</text>
+    <text x="220" y="412" fill="#8a8d92">Firmware</text><text x="580" y="412" text-anchor="end" fill="#d6d7d9">V1.0.10</text>
+  </g>
+  <line x1="220" y1="130" x2="580" y2="130" stroke="#1c1e21" stroke-width="1"/>
+</svg>
