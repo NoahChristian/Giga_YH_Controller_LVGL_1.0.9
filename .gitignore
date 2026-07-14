@@ -21,6 +21,12 @@ arduino_secrets.h
 __pycache__/
 *.pyc
 
+# Screen exporter output -- regenerable via tools/capture_all.py, not
+# tracked; the captures/ directory and the exporter scripts themselves
+# still are.
+Giga_YH_Dashboard_Unit2/tools/captures/*.png
+Giga_YH_Dashboard_Unit2/tools/captures/*.csv
+
 # System specific junk files
 .DS_Store
 Thumbs.db
