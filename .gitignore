@@ -17,6 +17,10 @@ arduino_secrets.h
 .piolibdeps/
 .vscode/
 
+# Python bytecode cache (tools/ screen exporter scripts)
+__pycache__/
+*.pyc
+
 # System specific junk files
 .DS_Store
 Thumbs.db

@@ -224,3 +224,70 @@ compete with that loop for cycle time the way the sibling
 - `VERSION_POWER` (shown on-screen) is kept in sync with the file's own
   changelog (currently `"1.0.10"`) — bump both together going forward so
   the on-screen version reflects the running build.
+
+## Unit 2 — remote display dashboard (sibling sketch)
+
+`Giga_YH_Dashboard_Unit2/Giga_YH_Dashboard_Unit2.ino` (own header comment
+has full current scope/spiral status — this section only holds what
+isn't already there). Second physical Giga board, `UNIT_NUMBER 2`:
+subscribe-only, no RS485, no publish, no control authority. Safe to
+iterate on freely without touching Unit 1's control loop. `VERSION_DASHBOARD`
+tracks its own changelog independently of `VERSION_POWER` above.
+
+Real data wired in (all display-only, no control path): TOU rates/schedule
+(On-peak $0.65410/kWh 4pm–9pm daily; Off-peak $0.43492/kWh; Super
+off-peak $0.09469/kWh weekdays 12am–6am+10am–2pm, weekends/holidays
+12am–2pm; 8 hardcoded 2026 holiday dates), NOAA tide predictions for
+La Jolla (station 9410230, `tide_data_2026.h`, regenerate via
+`tools/tide_data/convert_tide_data.py` if a future year is needed), and
+real per-line grid power via `Line1Set`/`Line2Set` MQTT topics.
+
+**`Line1Set`/`Line2Set` are independent signed per-line grid readings**,
+not a duplicated whole-household value — confirmed via HIL testing
+2026-07-13. One line can import while the other exports; true net
+household consumption is their sum. This directly contradicts a comment
+in Unit 1's own file (see "Fixed oscillation incident" above, which
+assumed they were duplicates) — **Unit 1's oscillation-fix halving logic
+needs re-verification against this corrected understanding** (flagged,
+not yet done — check before trusting the existing halving calibration).
+
+Screen exporter tool (`tools/dump_screen.py` + `tools/capture_all.py`):
+dumps the live LVGL framebuffer over serial (trigger byte `'D'`) and
+reconstructs real PNGs on the PC side — use this to verify actual
+rendered layout instead of guessing from source; `tools/captures/`
+holds the current reference screenshot per screen plus
+`capture_log.csv` as a running audit log (append-only; prune old
+per-screen PNGs periodically, keep the CSV).
+
+**Arduino auto-prototype-generation + custom types**: the build system
+inserts function prototypes near the top of the translation unit, before
+any custom struct/enum defined later in the file. Any function taking a
+custom type as a parameter/return will fail to compile unless that type
+is defined before the insertion point — keep all custom struct/enum
+definitions (`TouTier`, `TouStatus`, `TidePoint`, etc.) in a block
+immediately after the `#include`s at the top of the file, not inline
+near first use.
+
+**LVGL default-theme padding**: a plain `lv_obj_create()` container gets
+non-zero padding from the active theme unless explicitly zeroed with
+`lv_obj_set_style_pad_all(obj, 0, 0)`. Unzeroed padding silently shrinks
+the real content area and shifts children, which looks exactly like a
+sizing bug on the *child* when the real cause is the *parent*. Zero
+padding explicitly on every new container.
+
+**Text clipping that matches the background color is invisible to
+simple pixel-band scanning** — a clipped glyph can still show a clean
+gap between text blocks if the clipped pixels happen to match the
+background. Verify new/resized text containers via zoomed (4–6x) crops
+of the actual glyph shapes from a real capture, not just an ink-vs-gap
+scan, and confirm real pixel clearance rather than eyeballing a
+thumbnail.
+
+**Open tickets (parked, not yet implemented)**:
+- Almanac screen's weather/moon-phase/sun-rise-set data is still fully
+  fake. HA's Moon integration gives phase as a discrete state (no
+  illumination % without a custom template sensor); HA's Sun integration
+  gives sunrise/sunset easily; moonrise/moonset has no HA built-in —
+  would need a custom sensor or the same NOAA-precomputed-table approach
+  used for tide data.
+- Unit 1 oscillation-fix halving logic re-check (see above).
