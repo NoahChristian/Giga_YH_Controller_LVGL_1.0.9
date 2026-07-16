@@ -68,6 +68,7 @@
 #include "mbed.h"
 #include <mbed_mktime.h>
 #include <math.h>
+#include "kvstore_global_api.h"
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -123,7 +124,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.45"
+#define VERSION_DASHBOARD "1.0.47"
 //version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
 //                Connection screen live (SSID/RSSI/broker state), everything
 //                else placeholder. Did not compile (LVGL v8-style input
@@ -567,16 +568,107 @@ uint32_t dsi_getDisplayYSize(void);
 //                 source as the Grid screen's L1/L2 Feeder columns).
 //                 Plain text, no data dependency, so it shows
 //                 regardless of whether Unit 1 is currently publishing.
+//version 1.0.46 - First pieces of the planned WiFi setup flow (network
+//                 select + on-screen keyboard UI comes in a later
+//                 version): (1) mbed KVStore (QSPI-backed, physically
+//                 separate from program flash so it survives a sketch
+//                 reflash, not just a reboot) for persisting a
+//                 manually-entered WiFi network across firmware
+//                 updates -- saveWifiCredentials()/loadWifiCredentials(),
+//                 verified round-trip AND reflash-survival on real
+//                 hardware via a temporary 'K' serial test command;
+//                 (2) connectToWiFi() no longer retries forever with a
+//                 single credential source -- bounded 3x15s attempts
+//                 against secrets.h, then 3x15s against stored KVStore
+//                 credentials if that fails, returning false if both do
+//                 (setup() currently just retries this pair indefinitely
+//                 since the manual setup screens that should take over
+//                 at that point don't exist yet -- next version); (3)
+//                 ssid[]/password[] grew from secrets.h-exact-length to
+//                 fixed 33/64-byte buffers (real WiFi SSID/WPA2 maximums)
+//                 so a runtime-entered network can actually fit.
+//version 1.0.47 - Manual WiFi setup flow completed and verified end-to-end
+//                 on real hardware: network-scan list screen and
+//                 lv_keyboard-based password entry screen, both wired into
+//                 the fallback chain from 1.0.46. Also extracted the
+//                 serial dev-command handling (screen dump/nav/sim-touch)
+//                 into a standalone serviceDevCommands(), called from both
+//                 loop() and setup()'s manual-setup wait loop -- previously
+//                 those dev tools only worked from loop(), so they were
+//                 unusable during exactly the blocking flow they're most
+//                 needed for. Removed the temporary 'K' KVStore test
+//                 command now that the real flow exercises save/load for
+//                 real. Three real bugs found and fixed via screen-dump
+//                 captures during testing: (1) scan-list rows were sized
+//                 equal to their list container's *outer* width, overflowing
+//                 past the container's own side padding -- combined with
+//                 the "Secured"/"Open" label, this clipped text against the
+//                 physical 800px screen edge (rendered as "Secure" with the
+//                 trailing "d" cut off); rows now use lv_pct(100), and the
+//                 label was shortened to "Lock"/"Open" and right-aligned
+//                 via makeRowLabel() to fit the narrow gap next to the
+//                 signal-strength bars; (2) hidden/non-broadcasting
+//                 networks surfaced as scan results with an empty SSID,
+//                 rendering as dead, unlabeled, still-tappable rows -- now
+//                 skipped; (3) lv_keyboard_create()'s own constructor
+//                 bottom-docks the keyboard via a *sticky* LV_ALIGN_BOTTOM_MID
+//                 (LVGL re-applies it on later internal layout passes),
+//                 which fired against a stale intermediate height and left
+//                 the keyboard positioned at y=440 instead of y=220 --
+//                 only its top ~40px row (of four) was visible above the
+//                 480px screen bottom, making three of the four keyboard
+//                 rows completely unusable. Fixed by re-asserting the
+//                 bottom alignment as the last setup step instead of
+//                 fighting it with a fixed lv_obj_set_pos. Confirmed on
+//                 real hardware: tapped a real scanned network ("Oscar"),
+//                 typed its real password via the on-screen keyboard,
+//                 connected, and -- on a completely fresh reflash with
+//                 secrets.h still pointed at a bogus test network -- the
+//                 board fell through to the just-saved KVStore credentials
+//                 and connected using those, proving the manual-entry ->
+//                 KVStore-save -> KVStore-load round trip is real, not
+//                 just the earlier synthetic test.
 
 uint8_t verbosity = 255;
 bool trace = true;
 
 int timezone = -7; //GMT -7, Pacific Time -- same convention as Unit 1
 
-char ssid[] = SECRET_SSID;
-char password[] = SECRET_PASS;
+//Fixed, generous buffers (33 = 32-char WiFi SSID max + null; 64 = 63-char
+//WPA2 passphrase max + null) instead of char[]=SECRET_SSID's exact-fit
+//sizing -- those two only needed to hold the compile-time secrets.h
+//string, but a runtime-entered network (scanned SSID + typed password)
+//can be longer than whatever's in secrets.h.
+char ssid[33];
+char password[64];
 
 int wifiStatus = WL_IDLE_STATUS;
+
+//---- WiFi credential persistence (mbed KVStore, QSPI-backed) ----
+//Physically separate flash from the program flash the .ino gets written
+//to, so this survives a sketch reflash, not just a reboot -- per
+//request, so a manually-configured network doesn't need re-entering
+//after every firmware update. Default mbed KVStore mount point is
+//"/kv/"; keys can't contain '/' etc. per kv_set()'s own doc comment, so
+//"wifi_ssid"/"wifi_pass" (no further slashes) are used directly under it.
+#define KV_KEY_WIFI_SSID "/kv/wifi_ssid"
+#define KV_KEY_WIFI_PASS "/kv/wifi_pass"
+
+bool saveWifiCredentials(const char* s, const char* p) {
+  int rc1 = kv_set(KV_KEY_WIFI_SSID, s, strlen(s) + 1, 0);
+  int rc2 = kv_set(KV_KEY_WIFI_PASS, p, strlen(p) + 1, 0);
+  return rc1 == 0 && rc2 == 0;
+}
+
+//Returns true only if BOTH keys were found and fit within the given
+//buffers -- a partial save (e.g. power loss mid-write) should not be
+//treated as a usable stored credential.
+bool loadWifiCredentials(char* sOut, size_t sCap, char* pOut, size_t pCap) {
+  size_t actualS = 0, actualP = 0;
+  int rc1 = kv_get(KV_KEY_WIFI_SSID, sOut, sCap, &actualS);
+  int rc2 = kv_get(KV_KEY_WIFI_PASS, pOut, pCap, &actualP);
+  return rc1 == 0 && rc2 == 0 && actualS > 0 && actualP > 0;
+}
 WiFiUDP Udp;
 unsigned int localPort = 2391; //different from Unit 1's 2390 in case both run on the same LAN segment during bring-up
 constexpr auto timeServer{ "pool.ntp.org" };
@@ -895,6 +987,31 @@ lv_obj_t* scr_connection;
 lv_obj_t* scr_battery;
 lv_obj_t* scr_grid;
 lv_obj_t* scr_almanac;
+lv_obj_t* scr_wifi_scan;
+lv_obj_t* scr_wifi_password;
+
+//---- WiFi setup flow state ----
+#define MAX_WIFI_SCAN_RESULTS 20
+char g_wifiScanSsid[MAX_WIFI_SCAN_RESULTS][33];
+bool g_wifiScanSecure[MAX_WIFI_SCAN_RESULTS];
+int32_t g_wifiScanRssi[MAX_WIFI_SCAN_RESULTS];
+int g_wifiScanCount = 0;
+
+char g_selectedWifiSsid[33] = "";
+bool g_selectedWifiSecure = false;
+
+//set true by setup() when it's blocked waiting on the manual setup flow
+//(both bounded connect attempts failed) -- the wait loop that checks
+//this lives in setup() itself, right where the fallback triggers, not
+//in the normal loop() tick.
+bool g_awaitingManualWifiSetup = false;
+
+lv_obj_t* wifiScanList;
+lv_obj_t* wifiScanStatusLbl;
+lv_obj_t* wifiPasswordSsidLbl;
+lv_obj_t* wifiPasswordTextarea;
+lv_obj_t* wifiKeyboard;
+lv_obj_t* wifiConnectStatusLbl;
 
 //labels/widgets that need periodic/live updates after screen build
 lv_obj_t* lbl_home_clock;
@@ -1007,8 +1124,38 @@ void setNtpTime() {
   parseNtpPacket();
 }
 
-//---- WiFi (same shape as Unit 1's connectToWiFi) ----
-void connectToWiFi(void) {
+//---- WiFi ----
+//Bounded attempt helper -- tries WiFi.begin() up to maxAttempts times,
+//attemptDelayMs apart, returns as soon as one succeeds. Replaces the
+//old unconditional infinite retry loop, which had no way to ever fall
+//through to a fallback credential source.
+bool tryConnectWiFi(const char* s, const char* p, int maxAttempts, unsigned long attemptDelayMs) {
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (verbosity > 0) {
+      Serial.print("Attempting to connect to SSID: ");
+      Serial.print(s);
+      Serial.print(" (attempt ");
+      Serial.print(attempt);
+      Serial.print("/");
+      Serial.print(maxAttempts);
+      Serial.println(")");
+    }
+    wifiStatus = WiFi.begin(s, p);
+    if (wifiStatus == WL_CONNECTED) return true;
+    delay(attemptDelayMs);
+    if (wifiStatus == WL_CONNECTED) return true;  //WiFi.begin() itself may block long enough to settle during the call above; re-check before waiting out a full extra delay
+  }
+  return false;
+}
+
+//Boot-time connect: secrets.h baseline first (3x15s), then the
+//KVStore-stored credentials from a previous manual setup if that fails
+//(3x15s) -- per request, so a manually-configured network survives a
+//cold boot or reflash without needing re-entry, while secrets.h stays
+//the primary default. Returns false if both fail; the manual
+//network-selection/keyboard setup flow (not yet wired in here) is what
+//should run next when that happens.
+bool connectToWiFi(void) {
   if (WiFi.status() == WL_NO_MODULE) {
     if (verbosity > 0) Serial.println("Communication with WiFi module failed!");
     while (true);
@@ -1017,16 +1164,34 @@ void connectToWiFi(void) {
     if (verbosity > 0) Serial.println("Communication with WiFi module failed!");
     while (true);
   }
-  while (wifiStatus != WL_CONNECTED) {
-    if (verbosity > 0) {
-      Serial.print("Attempting to connect to SSID: ");
-      Serial.println(ssid);
-    }
-    wifiStatus = WiFi.begin(ssid, password);
-    delay(10000);
+
+  strncpy(ssid, SECRET_SSID, sizeof(ssid) - 1);
+  ssid[sizeof(ssid) - 1] = '\0';
+  strncpy(password, SECRET_PASS, sizeof(password) - 1);
+  password[sizeof(password) - 1] = '\0';
+  if (tryConnectWiFi(ssid, password, 3, 15000)) {
+    setNtpTime();
+    if (verbosity > 0) Serial.println("Connected to WiFi (secrets.h)");
+    return true;
   }
-  setNtpTime();
-  if (verbosity > 0) Serial.println("Connected to WiFi");
+
+  char storedSsid[33], storedPass[64];
+  if (loadWifiCredentials(storedSsid, sizeof(storedSsid), storedPass, sizeof(storedPass))) {
+    if (verbosity > 0) Serial.println("secrets.h network not reachable -- trying stored credentials");
+    if (tryConnectWiFi(storedSsid, storedPass, 3, 15000)) {
+      strncpy(ssid, storedSsid, sizeof(ssid) - 1);
+      ssid[sizeof(ssid) - 1] = '\0';
+      strncpy(password, storedPass, sizeof(password) - 1);
+      password[sizeof(password) - 1] = '\0';
+      setNtpTime();
+      if (verbosity > 0) Serial.println("Connected to WiFi (stored credentials)");
+      return true;
+    }
+  } else if (verbosity > 0) {
+    Serial.println("secrets.h network not reachable, no stored credentials to fall back to");
+  }
+
+  return false;
 }
 
 //---- touch input driver ----
@@ -1500,6 +1665,217 @@ void makeBackButton(lv_obj_t* parent) {
   lv_obj_set_pos(back, 40, 30);
   lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(back, navHome, LV_EVENT_CLICKED, NULL);
+}
+
+//---- WiFi manual setup: network scan + password/keyboard ----
+//Reached only when both bounded connectToWiFi() attempts (secrets.h,
+//then stored KVStore credentials) fail, or via the Connection screen's
+//"Reset network" button. Blocking connect attempts here (tryConnectWiFi
+//inside attemptWifiConnectFromSetup) are deliberate -- this is a rare,
+//user-attended setup flow, not a hot path, and every other WiFi attempt
+//in this sketch already blocks for the same reason.
+
+void navWifiScanRescan(lv_event_t* e) {
+  populateWifiScanList();
+  lv_scr_load(scr_wifi_scan);
+}
+
+void attemptWifiConnectFromSetup(const char* s, const char* p) {
+  lv_obj_clear_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_text(wifiConnectStatusLbl, "Connecting...");
+  lv_obj_set_style_text_color(wifiConnectStatusLbl, COLOR_AMBER, 0);
+  lv_scr_load(scr_wifi_password);  //open-network path can call this straight from the scan screen -- show the status somewhere it'll be seen
+  lv_timer_handler();              //paint "Connecting..." before the blocking attempt below
+
+  if (tryConnectWiFi(s, p, 3, 15000)) {
+    strncpy(ssid, s, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    strncpy(password, p, sizeof(password) - 1);
+    password[sizeof(password) - 1] = '\0';
+    saveWifiCredentials(s, p);
+    setNtpTime();
+    g_awaitingManualWifiSetup = false;
+    lv_scr_load(scr_home);
+  } else {
+    lv_label_set_text(wifiConnectStatusLbl, "Couldn't connect. Check the password and try again.");
+    lv_obj_set_style_text_color(wifiConnectStatusLbl, COLOR_RED, 0);
+  }
+}
+
+void onWifiPasswordSubmit(lv_event_t* e) {
+  const char* pw = lv_textarea_get_text(wifiPasswordTextarea);
+  attemptWifiConnectFromSetup(g_selectedWifiSsid, pw);
+}
+
+void onWifiNetworkSelected(lv_event_t* e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  strncpy(g_selectedWifiSsid, g_wifiScanSsid[idx], sizeof(g_selectedWifiSsid) - 1);
+  g_selectedWifiSsid[sizeof(g_selectedWifiSsid) - 1] = '\0';
+  g_selectedWifiSecure = g_wifiScanSecure[idx];
+
+  if (g_selectedWifiSecure) {
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "Enter password for %s", g_selectedWifiSsid);
+    lv_label_set_text(wifiPasswordSsidLbl, hdr);
+    lv_textarea_set_text(wifiPasswordTextarea, "");
+    lv_obj_add_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+    lv_scr_load(scr_wifi_password);
+  } else {
+    attemptWifiConnectFromSetup(g_selectedWifiSsid, "");
+  }
+}
+
+//Clears and rebuilds the scrollable row list from a fresh
+//WiFi.scanNetworks() -- called on entry to the scan screen and every
+//time the user backs into it, since results go stale (networks
+//appear/disappear, signal changes) and there's no reason to cache them
+//across a rare, user-attended setup flow.
+void populateWifiScanList() {
+  lv_obj_clean(wifiScanList);
+  lv_obj_clear_flag(wifiScanStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_text(wifiScanStatusLbl, "Scanning...");
+  lv_obj_set_style_text_color(wifiScanStatusLbl, COLOR_TEXT_MUTED, 0);
+  lv_timer_handler();  //paint "Scanning..." before the blocking scan below
+
+  int n = WiFi.scanNetworks();
+  g_wifiScanCount = (n > 0) ? min(n, MAX_WIFI_SCAN_RESULTS) : 0;
+
+  if (g_wifiScanCount == 0) {
+    lv_label_set_text(wifiScanStatusLbl, "No networks found. Tap Cancel and back in to rescan.");
+    return;
+  }
+  lv_obj_add_flag(wifiScanStatusLbl, LV_OBJ_FLAG_HIDDEN);
+
+  for (int i = 0; i < g_wifiScanCount; i++) {
+    String s = WiFi.SSID(i);
+    //hidden/non-broadcasting networks surface as a scan result with an
+    //empty SSID -- skip building a row for them, since there's nothing
+    //meaningful to tap (this manual-setup flow doesn't support typing an
+    //SSID by hand for a hidden network). g_wifiScanSsid[i] stays
+    //zeroed/unused for this slot, so it can never be selected.
+    if (s.length() == 0) continue;
+    s.toCharArray(g_wifiScanSsid[i], sizeof(g_wifiScanSsid[i]));
+    g_wifiScanSecure[i] = WiFi.encryptionType(i) != ENC_TYPE_NONE;
+    g_wifiScanRssi[i] = WiFi.RSSI(i);
+
+    lv_obj_t* row = lv_obj_create(wifiScanList);
+    //width lv_pct(100) of the list's own content area, not a hardcoded
+    //720 -- a hardcoded row width equal to the *list's outer* width
+    //overflowed past the list's 4px side padding, which combined with the
+    //"Secured"/"Open" label below pushed text past the physical 800px
+    //screen edge (caught by a real screen-dump capture, text rendered as
+    //"Secure" with the trailing "d" clipped off).
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, 60);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x17191c), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_radius(row, 8, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, onWifiNetworkSelected, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+
+    makeLabel(row, g_wifiScanSsid[i], COLOR_TEXT, 20, 18);
+
+    //signal bars: 4 small rects, increasing height, lit up to the
+    //RSSI-derived level -- matches the mockup's design, built from plain
+    //lv_obj rects rather than an icon font, same convention as the rest
+    //of this sketch.
+    int level = g_wifiScanRssi[i] > -50 ? 4 : g_wifiScanRssi[i] > -60 ? 3 : g_wifiScanRssi[i] > -70 ? 2 : 1;
+    for (int b = 0; b < 4; b++) {
+      lv_coord_t barH = 6 + b * 3;
+      lv_obj_t* bar = lv_obj_create(row);
+      lv_obj_set_size(bar, 5, barH);
+      lv_obj_set_pos(bar, 560 + b * 9, 30 - barH);
+      lv_obj_set_style_bg_color(bar, b < level ? COLOR_TEAL : COLOR_TRACK, 0);
+      lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+      lv_obj_set_style_border_width(bar, 0, 0);
+      lv_obj_set_style_radius(bar, 1, 0);
+      lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    //"Secured"/"Open" shortened to "Lock"/"Open" -- both words need to fit
+    //in the narrow gap between the signal bars (ending at row-relative
+    //x=592) and the row's own right edge (~712 at this row width), and
+    //"Secured" (7 chars) doesn't fit that gap at this sketch's font size
+    //(confirmed: it clipped). makeRowLabel's right-aligned fixed-width box
+    //(same pattern used on the Connection screen) keeps the text's right
+    //edge pinned regardless of exact glyph width.
+    makeRowLabel(row, g_wifiScanSecure[i] ? "Lock" : "Open", 702, 18, 95);
+  }
+}
+
+void buildWifiScanScreen() {
+  scr_wifi_scan = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_wifi_scan);
+  lv_label_set_text(back, "< Cancel");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 30);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navConnection, LV_EVENT_CLICKED, NULL);
+
+  makeLabel(scr_wifi_scan, "Select WiFi network", COLOR_TEXT_MUTED, 40, 70);
+
+  wifiScanStatusLbl = makeLabel(scr_wifi_scan, "", COLOR_TEXT_MUTED, 40, 110);
+  lv_obj_add_flag(wifiScanStatusLbl, LV_OBJ_FLAG_HIDDEN);
+
+  wifiScanList = lv_obj_create(scr_wifi_scan);
+  lv_obj_set_pos(wifiScanList, 40, 110);
+  lv_obj_set_size(wifiScanList, 720, 340);
+  lv_obj_set_style_bg_opa(wifiScanList, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(wifiScanList, 0, 0);
+  lv_obj_set_style_pad_all(wifiScanList, 4, 0);
+  lv_obj_set_style_pad_row(wifiScanList, 10, 0);
+  lv_obj_set_flex_flow(wifiScanList, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(wifiScanList, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+}
+
+void buildWifiPasswordScreen() {
+  scr_wifi_password = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_wifi_password);
+  lv_label_set_text(back, "< Back");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 18);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navWifiScanRescan, LV_EVENT_CLICKED, NULL);
+
+  wifiPasswordSsidLbl = makeLabel(scr_wifi_password, "Enter password for", COLOR_TEXT_MUTED, 40, 50);
+
+  wifiPasswordTextarea = lv_textarea_create(scr_wifi_password);
+  lv_obj_set_size(wifiPasswordTextarea, 720, 46);
+  lv_obj_set_pos(wifiPasswordTextarea, 40, 82);
+  lv_textarea_set_password_mode(wifiPasswordTextarea, true);
+  lv_textarea_set_one_line(wifiPasswordTextarea, true);
+  lv_textarea_set_max_length(wifiPasswordTextarea, 63);
+  //fires on the keyboard's OK/checkmark key AND on Enter typed directly
+  //(lv_keyboard.c sends LV_EVENT_READY to the bound textarea in both
+  //cases) -- one attachment point covers both.
+  lv_obj_add_event_cb(wifiPasswordTextarea, onWifiPasswordSubmit, LV_EVENT_READY, NULL);
+
+  wifiConnectStatusLbl = makeLabel(scr_wifi_password, "", COLOR_RED, 40, 137);
+  lv_obj_add_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+
+  wifiKeyboard = lv_keyboard_create(scr_wifi_password);
+  lv_obj_set_size(wifiKeyboard, 800, 260);
+  lv_keyboard_set_textarea(wifiKeyboard, wifiPasswordTextarea);
+  //lv_keyboard_create()'s own constructor bottom-docks the keyboard via
+  //lv_obj_align(BOTTOM_MID) against its *default* 50%-height size, before
+  //this call ever resizes it to 260px. That alignment is sticky (LVGL
+  //re-applies it on later internal layout passes, e.g. inside
+  //lv_keyboard_set_textarea()'s own row/font recalculation) and was
+  //observed re-firing against a stale intermediate height, landing the
+  //keyboard at y=440 instead of y=220 -- only its first ~40px row was
+  //then visible above the physical 480px screen bottom, with the other
+  //three rows rendered off-screen (confirmed via lv_obj_get_y() reading
+  //440 despite lv_obj_get_height() correctly reading 260, and via a
+  //screen-dump capture showing only one keyboard row). Re-asserting the
+  //bottom alignment here, after every size/textarea call that could have
+  //perturbed it, forces one final recalculation against the real 260px
+  //height instead of fighting the widget's own docking behavior with a
+  //fixed lv_obj_set_pos.
+  lv_obj_align(wifiKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
 }
 
 //---- Home screen ----
@@ -2135,10 +2511,27 @@ void setup() {
   buildBatteryScreen();
   buildGridScreen();
   buildAlmanacScreen();
+  buildWifiScanScreen();
+  buildWifiPasswordScreen();
   lv_scr_load(scr_home);
   lv_timer_handler(); //don't leave the screen dark while WiFi connects
 
-  connectToWiFi();
+  //Manual setup flow: shown only if both bounded attempts above (secrets.h,
+  //then stored KVStore credentials) fail. attemptWifiConnectFromSetup()
+  //(fired from a network-row tap or the keyboard's OK key) sets
+  //g_awaitingManualWifiSetup = false and lv_scr_load(scr_home) on success --
+  //this loop just keeps the UI alive and responsive to touch until then.
+  if (!connectToWiFi()) {
+    if (verbosity > 0) Serial.println("Both secrets.h and stored WiFi credentials failed -- showing manual setup");
+    g_awaitingManualWifiSetup = true;
+    populateWifiScanList();
+    lv_scr_load(scr_wifi_scan);
+    while (g_awaitingManualWifiSetup) {
+      lv_timer_handler();
+      serviceDevCommands();  //keep 'D' screen-dump / 'P' sim-touch working during setup too
+      delay(5);
+    }
+  }
 
   //Real dates need real (NTP-synced) time, so this has to happen after
   //connectToWiFi() above, not alongside the other screen-building calls.
@@ -2189,32 +2582,22 @@ void setup() {
   }
 }
 
-unsigned long lastClockUpdate = 0;
-unsigned long lastTideUpdate = 0;
-
-void loop() {
-  lv_timer_handler();
-  mqttClient.poll();
-
-  //Tide data only changes once a day; re-checking every minute (not
-  //every second, like the clock/TOU tick below) is plenty to catch a
-  //midnight rollover without doing this relatively heavier computation
-  //needlessly often.
-  unsigned long nowTide = millis();
-  if (nowTide - lastTideUpdate >= 60000) {
-    lastTideUpdate = nowTide;
-    rebuildTideCurve();
-  }
-
-  //Serial dev/debug commands: 'D' dumps the current screen (see
-  //dumpFramebufferToSerial() above); 'H'/'T'/'C'/'B'/'G'/'M' force-navigate
-  //to Home/Time/Connection/Battery/Grid/alManac without touching the
-  //screen, so every screen can be captured by the exporter from a PC
-  //script without needing physical access to the board; 'P' + 6 ASCII
-  //digits (3-digit x, 3-digit y, zero-padded -- e.g. "P402242" for
-  //x=402,y=242) simulates a real tap at that point via the sim touch
-  //indev above, auto-releasing ~80ms later so LVGL sees a normal
-  //press-then-release click cycle.
+//Serial dev/debug commands: 'D' dumps the current screen (see
+//dumpFramebufferToSerial() above); 'H'/'T'/'C'/'B'/'G'/'M' force-navigate
+//to Home/Time/Connection/Battery/Grid/alManac without touching the
+//screen, so every screen can be captured by the exporter from a PC
+//script without needing physical access to the board; 'P' + 6 ASCII
+//digits (3-digit x, 3-digit y, zero-padded -- e.g. "P402242" for
+//x=402,y=242) simulates a real tap at that point via the sim touch
+//indev above, auto-releasing ~80ms later so LVGL sees a normal
+//press-then-release click cycle.
+//
+//Factored out of loop() and also called from setup()'s manual WiFi
+//setup wait loop -- the screen-dump/sim-touch dev tools need to keep
+//working during that flow too (that's exactly the flow they're most
+//useful for testing), not just once the dashboard's normal loop() is
+//running.
+void serviceDevCommands() {
   if (Serial.available()) {
     switch (Serial.read()) {
       case 'D': dumpFramebufferToSerial(); break;
@@ -2240,13 +2623,33 @@ void loop() {
     }
   }
 
-  //Release the simulated tap ~80ms after it started -- checked every loop
-  //iteration (not just the 1-second tick below) so the press-release
-  //cycle stays short enough for LVGL to register it as a click, not a
-  //long-press or drag.
+  //Release the simulated tap ~80ms after it started -- checked every
+  //call (not gated behind any tick) so the press-release cycle stays
+  //short enough for LVGL to register it as a click, not a long-press
+  //or drag.
   if (g_simTouchDown && millis() >= g_simTouchReleaseAt) {
     g_simTouchDown = false;
   }
+}
+
+unsigned long lastClockUpdate = 0;
+unsigned long lastTideUpdate = 0;
+
+void loop() {
+  lv_timer_handler();
+  mqttClient.poll();
+
+  //Tide data only changes once a day; re-checking every minute (not
+  //every second, like the clock/TOU tick below) is plenty to catch a
+  //midnight rollover without doing this relatively heavier computation
+  //needlessly often.
+  unsigned long nowTide = millis();
+  if (nowTide - lastTideUpdate >= 60000) {
+    lastTideUpdate = nowTide;
+    rebuildTideCurve();
+  }
+
+  serviceDevCommands();
 
   unsigned long now = millis();
   if (now - lastClockUpdate >= 1000) {
