@@ -128,7 +128,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.48"
+#define VERSION_DASHBOARD "1.0.50"
 //version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
 //                Connection screen live (SSID/RSSI/broker state), everything
 //                else placeholder. Did not compile (LVGL v8-style input
@@ -667,6 +667,77 @@ uint32_t dsi_getDisplayYSize(void);
 //                 captures across different boot attempts, including one
 //                 after the forcePaint fix, came back byte-for-byte
 //                 identical, which a live redraw could never produce).
+//version 1.0.49 - Real-hardware feedback batch on the WiFi feature:
+//                 (1) Connecting now shows no dot, just two-line amber
+//                 "Attempting\nto Connect" text (previously a dot +
+//                 single-line "Connecting"); Connected/Not connected keep
+//                 the dot. (2) Password entry no longer masks with dots
+//                 -- shows the typed password in plain text, so it can be
+//                 checked directly against the real network password
+//                 instead of trusting a character count. (3) Renamed/
+//                 repositioned the Connection screen's network-switch
+//                 button from "Reset network" (bottom-right) to "Change
+//                 WiFi" (bottom-left, two lines, taller for an easier
+//                 touch target); simplified its behavior to not
+//                 pre-emptively disconnect or clear the stored credential
+//                 -- it just opens the scan screen, a successful new
+//                 connection overwrites the stored credential itself, and
+//                 canceling out now genuinely exits back to normal
+//                 operation (previously Cancel only changed the visible
+//                 screen while silently remaining blocked, harmless for
+//                 boot-time setup where nothing exists to cancel back to,
+//                 but not appropriate for a live already-connected
+//                 device -- see g_manualSetupIsRuntimeChange). (4) Fixed
+//                 a real clipping bug the "Attempting to Connect" text
+//                 surfaced: the Home quadrant's and Connection screen's
+//                 status row was only 30px tall, clipping the new
+//                 two-line text against its own bottom edge -- grown to
+//                 60px on both (harmless for the single-line Connected/
+//                 Not-connected states). (5) Home quadrant's clock/date/
+//                 weather/TOU-rate group is now replaced by a single
+//                 "--:--:--\nGetting Time, Date,\nand Status" message
+//                 (amber) while connecting, since the clock/date are
+//                 NTP-derived and meaningless before a connection exists;
+//                 swaps back once resolved. (6) The Home quadrant's SSID
+//                 line is hidden while connecting (nothing meaningful to
+//                 show yet) and shown again once Connected/Not connected,
+//                 rather than either always-visible or removed outright.
+//version 1.0.50 - Fixed two real, board-freezing hangs found testing the
+//                 "Change WiFi" button on real hardware, both the same
+//                 root cause at different call depths: running this
+//                 flow's blocking lv_timer_handler() wait loop directly
+//                 inside an LVGL click-event callback re-enters LVGL's
+//                 own timer/event dispatch, since the callback is itself
+//                 already running *inside* an active lv_timer_handler()
+//                 call. (1) The button's own click handler used to start
+//                 the whole flow immediately -- froze instantly on tap,
+//                 before "Scanning..." even rendered. Trying
+//                 lv_async_call() to defer it did NOT help (it's just a
+//                 zero-delay LVGL timer, still serviced BY
+//                 lv_timer_handler(), not genuinely outside it) -- fixed
+//                 by having the click handler only set a flag
+//                 (g_wifiChangeRequested), checked and acted on directly
+//                 in loop() itself, which calls lv_timer_handler() rather
+//                 than ever being called by it. (2) One level deeper:
+//                 attemptWifiConnectFromSetup() (via forcePaint()) was
+//                 still being called directly from onWifiPasswordSubmit()/
+//                 onWifiNetworkSelected(), themselves event callbacks
+//                 nested inside the wait loop's own lv_timer_handler()
+//                 call -- froze on the password screen after tapping
+//                 submit. Same fix, one level in: those callbacks now
+//                 only record which network/password to try
+//                 (g_pendingWifiAttempt), and the wait loop itself (both
+//                 copies, in setup() and startChangeWifiFlow()) makes the
+//                 actual attempt.
+//                 A same-day investigation into occasional double
+//                 presses/slow input on the real (not simulated)
+//                 on-screen keyboard tried several debounce approaches
+//                 and a coordinate-rotation "fix" -- all made things
+//                 worse or didn't help, including a mistaken rotation
+//                 transform confirmed to double-rotate coordinates that
+//                 LVGL's own display rotation already handles correctly
+//                 (touchpad_read() is back to its untouched original
+//                 form). Not resolved -- tracked as GitHub issue #1.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -1044,6 +1115,45 @@ bool g_selectedWifiSecure = false;
 //this lives in setup() itself, right where the fallback triggers, not
 //in the normal loop() tick.
 bool g_awaitingManualWifiSetup = false;
+//true only when the manual setup flow was entered via the Connection
+//screen's "Change WiFi" button (a working connection already exists in
+//that case) rather than setup()'s own boot-time fallback (no working
+//connection exists yet). Gates whether the scan screen's "< Cancel"
+//button actually exits the wait loop -- during boot-time setup there's
+//nothing valid to cancel back to, so Cancel there just changes the
+//visible screen as before; during a live "Change WiFi", the user already
+//has a real connection and Cancel should genuinely abandon the change.
+bool g_manualSetupIsRuntimeChange = false;
+//Set by onChangeWifiClicked() (a click-event callback), checked and
+//cleared by loop() itself. The actual scan/connect flow blocks inside
+//its own lv_timer_handler() wait loop, which is only safe to call from a
+//context that ISN'T already nested inside a call to lv_timer_handler() --
+//loop() is what CALLS lv_timer_handler() each iteration, never the
+//reverse, so running the flow from there (instead of directly inside the
+//click callback, which IS already nested inside an active
+//lv_timer_handler() call dispatching that very click) avoids re-entering
+//LVGL's own timer/event dispatch. Confirmed on real hardware: running it
+//directly in the click callback froze the board instantly on tap, and
+//deferring via lv_async_call() didn't help either -- LVGL's async
+//mechanism is itself just a zero-delay timer serviced by
+//lv_timer_handler(), so the deferred call was still nested inside
+//lv_timer_handler() one way or another, not genuinely outside it.
+bool g_wifiChangeRequested = false;
+
+//Same class of problem, one level deeper: onWifiNetworkSelected() (open
+//networks) and onWifiPasswordSubmit() (secured networks) are themselves
+//click/ready-event callbacks -- already nested inside the manual-setup
+//wait loop's own lv_timer_handler() call -- and used to call
+//attemptWifiConnectFromSetup() directly, which calls forcePaint() (more
+//lv_timer_handler() calls) before its own blocking connect attempt.
+//Confirmed on real hardware: froze on the password screen after tapping
+//submit. Same fix as g_wifiChangeRequested -- the event callbacks below
+//only record which network/password to try; the wait loop itself (see
+//both copies, in setup() and startChangeWifiFlow()) checks this flag and
+//makes the actual attempt from a non-nested context.
+bool g_pendingWifiAttempt = false;
+char g_pendingAttemptSsid[33];
+char g_pendingAttemptPassword[64];
 
 lv_obj_t* wifiScanList;
 lv_obj_t* wifiScanStatusLbl;
@@ -1055,7 +1165,15 @@ lv_obj_t* wifiConnectStatusLbl;
 //labels/widgets that need periodic/live updates after screen build
 lv_obj_t* lbl_home_clock;
 lv_obj_t* lbl_home_date;
-lv_obj_t* lbl_home_ssid;
+lv_obj_t* weather_pill;
+//Shown instead of the real clock/date/weather/TOU pill while
+//WIFI_UI_CONNECTING is active -- those all depend on either NTP (clock/
+//date) or a value that's still meaningless before a connection exists
+//(weather's static regardless, but showing it standalone while the
+//other three are replaced would look broken), so swapping the whole
+//quadrant for one clear status message reads better than four
+//independently-stale placeholders. See setConnStatusIndicator().
+lv_obj_t* lbl_home_boot_status;
 //connection status dot+label pair, once each on the Home quadrant and the
 //Connection screen -- both used to be built once with a hardcoded green
 //dot and "Connected" text (never touched again after screen build), so
@@ -1065,6 +1183,9 @@ lv_obj_t* dot_home_conn;
 lv_obj_t* lbl_home_connState;
 lv_obj_t* dot_scr_conn;
 lv_obj_t* lbl_scr_connState;
+//shown/hidden together with the dot above it -- no SSID to show while
+//still attempting to connect, per request.
+lv_obj_t* lbl_home_ssid;
 lv_obj_t* lbl_conn_ssid;
 lv_obj_t* lbl_conn_rssi;
 lv_obj_t* lbl_conn_broker;
@@ -1248,6 +1369,18 @@ bool connectToWiFi(void) {
 //if touch doesn't register on real hardware, this is the first thing to check.
 //LVGL 9 API (the old lv_indev_drv_t struct-based registration from v8 was
 //removed -- confirmed by an actual compile against the installed lvgl 9.5.0).
+//No coordinate transform here -- the touch controller already reports
+//raw panel-space coordinates, which LVGL's own configured display
+//rotation converts to logical coordinates automatically (see
+//simTouchReadCb() below, which has to hand-invert that same rotation
+//for its own already-logical serial input, precisely because this
+//function must NOT do so itself). A same-day detour tried adding a
+//manual rotation here anyway, on a mistaken theory that raw coordinates
+//were never being converted -- confirmed on real hardware to make things
+//worse (double-rotated coordinates only accidentally landed correctly
+//near screen center, explaining why just one middle-of-keyboard key kept
+//working while everything else didn't). Reverted back to this, the
+//actual previously-working version.
 void touchpad_read(lv_indev_t* indev, lv_indev_data_t* data) {
   GDTpoint_t points[5];
   uint8_t contacts = TouchDetector.getTouchPoints(points);
@@ -1453,13 +1586,47 @@ void forcePaint() {
   }
 }
 
+//Connecting has no dot -- just two-line amber "Attempting\nto Connect"
+//text, per request. Connected/Not connected keep the dot + single-line
+//text as before.
 void setConnStatusIndicator(WifiUiState state) {
-  lv_color_t color = state == WIFI_UI_CONNECTED ? COLOR_STATUS_OK : state == WIFI_UI_CONNECTING ? COLOR_AMBER : COLOR_RED;
-  const char* text = state == WIFI_UI_CONNECTED ? "Connected" : state == WIFI_UI_CONNECTING ? "Connecting" : "Not connected";
-  lv_obj_set_style_bg_color(dot_home_conn, color, 0);
+  const char* text = state == WIFI_UI_CONNECTED ? "Connected" : state == WIFI_UI_CONNECTING ? "Attempting\nto Connect" : "Not connected";
+  lv_color_t textColor = state == WIFI_UI_CONNECTING ? COLOR_AMBER : COLOR_TEXT;
   lv_label_set_text(lbl_home_connState, text);
-  lv_obj_set_style_bg_color(dot_scr_conn, color, 0);
+  lv_obj_set_style_text_color(lbl_home_connState, textColor, 0);
   lv_label_set_text(lbl_scr_connState, text);
+  lv_obj_set_style_text_color(lbl_scr_connState, textColor, 0);
+
+  if (state == WIFI_UI_CONNECTING) {
+    lv_obj_add_flag(dot_home_conn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(dot_scr_conn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_home_ssid, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_color_t dotColor = state == WIFI_UI_CONNECTED ? COLOR_STATUS_OK : COLOR_RED;
+    lv_obj_clear_flag(dot_home_conn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(dot_scr_conn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_color(dot_home_conn, dotColor, 0);
+    lv_obj_set_style_bg_color(dot_scr_conn, dotColor, 0);
+    lv_obj_clear_flag(lbl_home_ssid, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  //Top-left quadrant: swap the whole clock/date/weather/TOU group for one
+  //"Getting Time, Date, and Status" message while connecting, since the
+  //clock/date depend on NTP (meaningless before a connection exists) --
+  //see lbl_home_boot_status's own comment.
+  if (state == WIFI_UI_CONNECTING) {
+    lv_obj_clear_flag(lbl_home_boot_status, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_home_clock, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_home_date, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(weather_pill, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(pill_home_tou, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(lbl_home_boot_status, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(lbl_home_clock, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(lbl_home_date, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(weather_pill, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(pill_home_tou, LV_OBJ_FLAG_HIDDEN);
+  }
 }
 
 //---- small widget helpers ----
@@ -1572,6 +1739,10 @@ lv_obj_t* makeAutoPill(lv_obj_t* parent, lv_color_t bg, lv_color_t textColor, co
   lv_obj_set_style_border_width(pill, 0, 0);
   lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
   lv_obj_t* lbl = makeLabel(pill, text, textColor);
+  //Only matters for multi-line text (a literal \n) -- a shorter second
+  //line would otherwise default to left-aligned under a wider first line
+  //instead of centered under it. No effect on ordinary single-line pills.
+  lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_center(lbl);
   return pill;
 }
@@ -1740,7 +1911,17 @@ void makeMoonIcon(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t d) {
 //navigate by loading a different pre-built screen; called from touch event callbacks
 void navHome(lv_event_t* e) { lv_scr_load(scr_home); }
 void navTime(lv_event_t* e) { lv_scr_load(scr_time); }
-void navConnection(lv_event_t* e) { lv_scr_load(scr_connection); }
+void navConnection(lv_event_t* e) {
+  //Also used as the WiFi scan screen's "< Cancel" button -- see
+  //g_manualSetupIsRuntimeChange's own comment for why this only exits
+  //the manual-setup wait loop during a live "Change WiFi", not during
+  //setup()'s boot-time fallback.
+  if (g_manualSetupIsRuntimeChange) {
+    g_manualSetupIsRuntimeChange = false;
+    g_awaitingManualWifiSetup = false;
+  }
+  lv_scr_load(scr_connection);
+}
 void navBattery(lv_event_t* e) { lv_scr_load(scr_battery); }
 void navGrid(lv_event_t* e) { lv_scr_load(scr_grid); }
 void navAlmanac(lv_event_t* e) { lv_scr_load(scr_almanac); }
@@ -1757,7 +1938,7 @@ void makeBackButton(lv_obj_t* parent) {
 //---- WiFi manual setup: network scan + password/keyboard ----
 //Reached only when both bounded connectToWiFi() attempts (secrets.h,
 //then stored KVStore credentials) fail, or via the Connection screen's
-//"Reset network" button. Blocking connect attempts here (tryConnectWiFi
+//"Change WiFi" button. Blocking connect attempts here (tryConnectWiFi
 //inside attemptWifiConnectFromSetup) are deliberate -- this is a rare,
 //user-attended setup flow, not a hot path, and every other WiFi attempt
 //in this sketch already blocks for the same reason.
@@ -1767,37 +1948,65 @@ void navWifiScanRescan(lv_event_t* e) {
   lv_scr_load(scr_wifi_scan);
 }
 
-//Connection screen's "Reset network" button. Clears the stored KVStore
-//credentials and re-enters this same manual setup flow right away --
-//doesn't touch secrets.h, so if that's still a valid network a later
-//reboot/reflash will just reconnect to it immediately; this button exists
-//for switching to a DIFFERENT network without one. Reuses the identical
-//blocking wait-loop pattern setup() falls into when both credential
-//sources fail (see there for why blocking here is fine): attemptWifi-
-//ConnectFromSetup() flips g_awaitingManualWifiSetup back to false and
-//navigates to scr_home itself once a new connection succeeds.
-void onResetNetworkClicked(lv_event_t* e) {
-  kv_remove(KV_KEY_WIFI_SSID);
-  kv_remove(KV_KEY_WIFI_PASS);
-  WiFi.disconnect();
-  setConnStatusIndicator(WIFI_UI_NOT_CONNECTED);
+//Connection screen's "Change WiFi" button. Doesn't touch the current
+//connection or its stored KVStore credentials up front -- just opens the
+//same network-scan/password flow used at boot. A successful new
+//connection overwrites the stored credentials itself (see
+//attemptWifiConnectFromSetup below), and canceling out (the scan
+//screen's "< Cancel", which actually exits this wait loop here -- see
+//g_manualSetupIsRuntimeChange) leaves the existing connection untouched.
+//
+//This flow's blocking wait loop (lv_timer_handler() in a while loop) is
+//only safe to run from a context that ISN'T already nested inside a call
+//to lv_timer_handler(). Confirmed on real hardware, twice: running it
+//directly in the click event callback froze the board instantly on tap
+//(the callback is itself already running *inside* lv_timer_handler(),
+//since LVGL dispatches click events as part of its own timer/refresh
+//cycle, so calling lv_timer_handler() again from within it re-enters
+//LVGL's own dispatch while it's still on the call stack); deferring via
+//lv_async_call() didn't help either, since that's just a zero-delay LVGL
+//timer serviced BY lv_timer_handler(), not something that actually runs
+//outside of it. setup()'s identical while-loop pattern is only safe
+//because it runs before loop() -- and hence before any event dispatch --
+//ever starts. The actual fix: the click handler below only sets a flag;
+//loop() itself (which calls lv_timer_handler(), never the reverse) is
+//what checks the flag and runs the real flow, from a genuinely top-level
+//context.
+void startChangeWifiFlow() {
+  g_manualSetupIsRuntimeChange = true;
   g_awaitingManualWifiSetup = true;
   populateWifiScanList();
   lv_scr_load(scr_wifi_scan);
   while (g_awaitingManualWifiSetup) {
     lv_timer_handler();
     serviceDevCommands();
+    if (g_pendingWifiAttempt) {
+      g_pendingWifiAttempt = false;
+      attemptWifiConnectFromSetup(g_pendingAttemptSsid, g_pendingAttemptPassword);
+    }
     delay(5);
   }
-  setConnStatusIndicator(WIFI_UI_CONNECTED);
+  //Reflects whatever's actually true now rather than assuming success --
+  //covers both a genuinely new connection and a cancel-out (old
+  //connection still intact, never touched above).
+  setConnStatusIndicator(WiFi.status() == WL_CONNECTED ? WIFI_UI_CONNECTED : WIFI_UI_NOT_CONNECTED);
 }
 
+void onChangeWifiClicked(lv_event_t* e) {
+  g_wifiChangeRequested = true;
+}
+
+//Called only from the manual-setup wait loop itself (see
+//g_pendingWifiAttempt), never directly from an event callback anymore --
+//forcePaint() here is safe again now that the call site itself isn't
+//nested inside an active lv_timer_handler()/event dispatch (same
+//nesting depth as the wait loop's own lv_timer_handler() calls).
 void attemptWifiConnectFromSetup(const char* s, const char* p) {
   lv_obj_clear_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
   lv_label_set_text(wifiConnectStatusLbl, "Connecting...");
   lv_obj_set_style_text_color(wifiConnectStatusLbl, COLOR_AMBER, 0);
   lv_scr_load(scr_wifi_password);  //open-network path can call this straight from the scan screen -- show the status somewhere it'll be seen
-  forcePaint();                     //paint "Connecting..." before the blocking attempt below
+  forcePaint();                    //paint "Connecting..." before the blocking attempt below
 
   if (tryConnectWiFi(s, p, 3, 15000)) {
     strncpy(ssid, s, sizeof(ssid) - 1);
@@ -1814,9 +2023,15 @@ void attemptWifiConnectFromSetup(const char* s, const char* p) {
   }
 }
 
+//Only records what to try -- see g_pendingWifiAttempt's comment for why
+//this can't call attemptWifiConnectFromSetup() directly anymore.
 void onWifiPasswordSubmit(lv_event_t* e) {
   const char* pw = lv_textarea_get_text(wifiPasswordTextarea);
-  attemptWifiConnectFromSetup(g_selectedWifiSsid, pw);
+  strncpy(g_pendingAttemptSsid, g_selectedWifiSsid, sizeof(g_pendingAttemptSsid) - 1);
+  g_pendingAttemptSsid[sizeof(g_pendingAttemptSsid) - 1] = '\0';
+  strncpy(g_pendingAttemptPassword, pw, sizeof(g_pendingAttemptPassword) - 1);
+  g_pendingAttemptPassword[sizeof(g_pendingAttemptPassword) - 1] = '\0';
+  g_pendingWifiAttempt = true;
 }
 
 void onWifiNetworkSelected(lv_event_t* e) {
@@ -1833,7 +2048,12 @@ void onWifiNetworkSelected(lv_event_t* e) {
     lv_obj_add_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
     lv_scr_load(scr_wifi_password);
   } else {
-    attemptWifiConnectFromSetup(g_selectedWifiSsid, "");
+    //Open network -- no password screen, but still deferred to the wait
+    //loop rather than called directly (see g_pendingWifiAttempt).
+    strncpy(g_pendingAttemptSsid, g_selectedWifiSsid, sizeof(g_pendingAttemptSsid) - 1);
+    g_pendingAttemptSsid[sizeof(g_pendingAttemptSsid) - 1] = '\0';
+    g_pendingAttemptPassword[0] = '\0';
+    g_pendingWifiAttempt = true;
   }
 }
 
@@ -1849,6 +2069,19 @@ void populateWifiScanList() {
   lv_obj_set_style_text_color(wifiScanStatusLbl, COLOR_TEXT_MUTED, 0);
   forcePaint();  //paint "Scanning..." before the blocking scan below
 
+  //Confirmed on real hardware: calling WiFi.scanNetworks() while still
+  //associated to an AP (only possible via the Connection screen's
+  //"Change WiFi" button -- every boot-time call here happens before any
+  //connection exists) hung the board completely, with no way to recover
+  //short of a physical reset. Adding WiFi.disconnect() alone did NOT fix
+  //it -- still hung, confirmed on real hardware a second time -- because
+  //scanNetworks() was called immediately after, before the module's
+  //firmware had actually finished tearing down the old association. This
+  //radio needs real wall-clock settling time after a disconnect before
+  //it can scan cleanly. A no-op delay when already disconnected, so safe
+  //for every caller.
+  WiFi.disconnect();
+  delay(1000);
   int n = WiFi.scanNetworks();
   g_wifiScanCount = (n > 0) ? min(n, MAX_WIFI_SCAN_RESULTS) : 0;
 
@@ -1958,7 +2191,9 @@ void buildWifiPasswordScreen() {
   wifiPasswordTextarea = lv_textarea_create(scr_wifi_password);
   lv_obj_set_size(wifiPasswordTextarea, 720, 46);
   lv_obj_set_pos(wifiPasswordTextarea, 40, 82);
-  lv_textarea_set_password_mode(wifiPasswordTextarea, true);
+  //Plain text, not password-masked -- per request, so what's typed on
+  //the on-screen keyboard is directly checkable against the real network
+  //password instead of trusting a dot count.
   lv_textarea_set_one_line(wifiPasswordTextarea, true);
   lv_textarea_set_max_length(wifiPasswordTextarea, 63);
   //fires on the keyboard's OK/checkmark key AND on Enter typed directly
@@ -2014,7 +2249,7 @@ void buildHomeScreen() {
 
   //pushed down from 122 -- the date label above has descenders (the 'y' in
   //"Monday"/"July") that this pill's opaque background was clipping into
-  lv_obj_t* weather_pill = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_TEXT, "Cloudy, 68F >", 16, 40);
+  weather_pill = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_TEXT, "Cloudy, 68F >", 16, 40);
   lv_obj_align(weather_pill, LV_ALIGN_TOP_MID, 0, 134);
   lv_obj_add_flag(weather_pill, LV_OBJ_FLAG_CLICKABLE);
   //LVGL doesn't bubble click events to parents unless LV_OBJ_FLAG_EVENT_BUBBLE
@@ -2044,6 +2279,20 @@ void buildHomeScreen() {
   pill_home_tou = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_RED, "$0.65/kWh", 16, 40);
   lv_obj_align(pill_home_tou, LV_ALIGN_TOP_MID, 0, 190);
 
+  //Hidden by default -- setConnStatusIndicator(WIFI_UI_CONNECTING), called
+  //very early in setup() right after this screen is built, shows this and
+  //hides the four widgets above instead. Kept hidden here (rather than
+  //relying solely on that first call) so there's no frame where the
+  //build-time placeholder text ("6:07 PM" etc.) could flash briefly.
+  lbl_home_boot_status = makeLabel(q_time, "--:--:--\nGetting Time, Date,\nand Status", COLOR_AMBER);
+  lv_obj_set_style_text_align(lbl_home_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(lbl_home_boot_status, LV_ALIGN_TOP_MID, 0, 55);
+  lv_obj_add_flag(lbl_home_boot_status, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(lbl_home_clock, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(lbl_home_date, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(weather_pill, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(pill_home_tou, LV_OBJ_FLAG_HIDDEN);
+
   //top-right quadrant: connection -- tap navigates to Connection screen
   lv_obj_t* q_conn = lv_obj_create(scr_home);
   lv_obj_set_size(q_conn, 396, 236);
@@ -2054,13 +2303,23 @@ void buildHomeScreen() {
   lv_obj_add_flag(q_conn, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(q_conn, navConnection, LV_EVENT_CLICKED, NULL);
 
-  lv_obj_t* conn_row = makeFlexRow(q_conn, 0, 78, 396, 30, 10);
+  //Height 60, not 30 -- tall enough for the two-line "Attempting\nto
+  //Connect" text (see setConnStatusIndicator) without it clipping against
+  //the row's own bottom edge; a real capture caught exactly that
+  //clipping at the old 30px height. Harmless for the single-line
+  //Connected/Not-connected states, which just end up with a bit more
+  //vertical centering room.
+  lv_obj_t* conn_row = makeFlexRow(q_conn, 0, 78, 396, 60, 10);
   lv_obj_set_style_bg_opa(conn_row, LV_OPA_TRANSP, 0);
   dot_home_conn = makeDot(conn_row, COLOR_STATUS_OK, 0, 0, 10);
   lbl_home_connState = makeLabel(conn_row, "Connected", COLOR_TEXT);
 
+  //Hidden by default, shown/hidden together with the dot above (see
+  //setConnStatusIndicator) -- no SSID worth showing while still
+  //attempting to connect.
   lbl_home_ssid = makeLabel(q_conn, "---", COLOR_TEXT_MUTED);
-  lv_obj_align(lbl_home_ssid, LV_ALIGN_TOP_MID, 0, 115);
+  lv_obj_align(lbl_home_ssid, LV_ALIGN_TOP_MID, 0, 145);
+  lv_obj_add_flag(lbl_home_ssid, LV_OBJ_FLAG_HIDDEN);
 
   //bottom-left quadrant: battery -- tap navigates to Battery screen
   lv_obj_t* q_batt = lv_obj_create(scr_home);
@@ -2202,7 +2461,10 @@ void buildConnectionScreen() {
   scr_connection = makeScreenRoot();
   makeBackButton(scr_connection);
 
-  lv_obj_t* conn_row = makeFlexRow(scr_connection, 0, 82, 800, 30, 10);
+  //Height 60, not 30 -- see the identical comment on the Home quadrant's
+  //conn_row for why (fits the two-line "Attempting\nto Connect" text
+  //without clipping).
+  lv_obj_t* conn_row = makeFlexRow(scr_connection, 0, 82, 800, 60, 10);
   dot_scr_conn = makeDot(conn_row, COLOR_STATUS_OK, 0, 0, 12);
   lbl_scr_connState = makeLabel(conn_row, "Connected", COLOR_TEXT);
 
@@ -2245,14 +2507,15 @@ void buildConnectionScreen() {
   makeRowLabel(scr_connection, "Firmware", rightLabelRight, 308, rightLabelW);
   makeLabel(scr_connection, "V" VERSION_DASHBOARD, COLOR_TEXT, rightValueX, 308);
 
-  //Clears the stored KVStore credentials and re-enters the manual
-  //network-select flow immediately -- for switching to a different
-  //network without a full reflash. Doesn't touch secrets.h, so if that's
-  //still a valid network it'll just reconnect to it on the next boot.
-  lv_obj_t* resetPill = makeAutoPill(scr_connection, lv_color_hex(0x17191c), COLOR_TEXT_MUTED, "Reset network", 20, 40);
-  lv_obj_align(resetPill, LV_ALIGN_BOTTOM_RIGHT, -40, -30);
-  lv_obj_add_flag(resetPill, LV_OBJ_FLAG_CLICKABLE);
-  lv_obj_add_event_cb(resetPill, onResetNetworkClicked, LV_EVENT_CLICKED, NULL);
+  //Opens the manual network-select flow immediately -- for switching to a
+  //different network without a full reflash. Two-line label, so the pill
+  //already needs more height than the single-line pills elsewhere;
+  //sized generously past the text's own minimum per request, for a
+  //bigger, easier-to-hit touch target.
+  lv_obj_t* changeWifiPill = makeAutoPill(scr_connection, lv_color_hex(0x17191c), COLOR_TEXT_MUTED, "Change\nWiFi", 20, 90);
+  lv_obj_align(changeWifiPill, LV_ALIGN_BOTTOM_LEFT, 40, -30);
+  lv_obj_add_flag(changeWifiPill, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(changeWifiPill, onChangeWifiClicked, LV_EVENT_CLICKED, NULL);
 }
 
 //---- Battery screen ----
@@ -2658,6 +2921,10 @@ void setup() {
     while (g_awaitingManualWifiSetup) {
       lv_timer_handler();
       serviceDevCommands();  //keep 'D' screen-dump / 'P' sim-touch working during setup too
+      if (g_pendingWifiAttempt) {
+        g_pendingWifiAttempt = false;
+        attemptWifiConnectFromSetup(g_pendingAttemptSsid, g_pendingAttemptPassword);
+      }
       delay(5);
     }
   }
@@ -2771,6 +3038,17 @@ unsigned long lastTideUpdate = 0;
 void loop() {
   lv_timer_handler();
   mqttClient.poll();
+
+  //Runs the "Change WiFi" flow here, not in the button's own click
+  //callback -- see startChangeWifiFlow()'s comment for why running its
+  //blocking lv_timer_handler() wait loop from inside a click callback
+  //(itself dispatched by lv_timer_handler()) froze the board. This is a
+  //genuinely top-level call site, not nested inside lv_timer_handler(),
+  //so it's safe here.
+  if (g_wifiChangeRequested) {
+    g_wifiChangeRequested = false;
+    startChangeWifiFlow();
+  }
 
   //Tide data only changes once a day; re-checking every minute (not
   //every second, like the clock/TOU tick below) is plenty to catch a
