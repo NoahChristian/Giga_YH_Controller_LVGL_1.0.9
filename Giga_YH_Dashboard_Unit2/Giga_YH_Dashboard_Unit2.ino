@@ -67,6 +67,7 @@
 
 #include "mbed.h"
 #include <mbed_mktime.h>
+#include <math.h>
 
 #include <WiFi.h>
 #include <WiFiUdp.h>
@@ -96,6 +97,16 @@ struct TouStatus {
 struct TouSegment { int startHour; int endHour; lv_color_t color; };
 struct TouWindow { int startHour; int endHour; TouTier tier; };
 struct TidePoint { int minuteOfDay; float heightFeet; bool isHigh; };
+//orbit center/radius + tracked angle for the SoC ring's charge/discharge
+//dot -- see updateOrbitDot() for why the angle is tracked as a float
+//here instead of read back from LVGL.
+struct OrbitDot {
+  lv_obj_t* dot;
+  int16_t cx, cy, r;
+  float currentAngleDeg;
+  int lastDirection;
+  float lastPercent;
+};
 
 //These three are implemented in Arduino_H7_Video's own dsi.cpp (part of this
 //same library, already linked in because Arduino_H7_Video.cpp itself calls
@@ -112,7 +123,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.42"
+#define VERSION_DASHBOARD "1.0.45"
 //version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
 //                Connection screen live (SSID/RSSI/broker state), everything
 //                else placeholder. Did not compile (LVGL v8-style input
@@ -508,6 +519,54 @@ uint32_t dsi_getDisplayYSize(void);
 //                 same function for the whole-day case), so the blended
 //                 rate is stable all day and always strictly between
 //                 $0.43492 and $0.65410.
+//version 1.0.43 - Added an orbiting charge/discharge dot to the SoC
+//                 ring (both the Home quadrant and the Battery detail
+//                 screen), planned and mocked up interactively before
+//                 writing any of this. The ring itself is unchanged
+//                 (still teal, still starts east) except its track is
+//                 now red instead of neutral gray, per request. The dot
+//                 layers two more independent signals on top: color +
+//                 spin direction from g_batteryState (yellow/clockwise
+//                 while charging, amethyst/counter-clockwise while
+//                 discharging, matching the physical ESP32 FastLED fuel
+//                 gauge's own traveling-highlight colors exactly), and
+//                 spin rate from real power (up to 1 full rotation/sec
+//                 at 100%) -- feeder power (L1+L2) over MAX_BATTERY_POWER
+//                 while discharging, grid total power via a two-point
+//                 calibrated line (50W->10%, 7000W->100%) while charging
+//                 as a temporary stand-in until a real charge-power MQTT
+//                 topic exists. Idle never spins. Implemented as a plain
+//                 lv_obj dot repositioned every animation tick via
+//                 cos/sin from a tracked float angle (not an lv_arc
+//                 rotation), so a mid-spin direction/rate change restarts
+//                 from the dot's current position instead of snapping
+//                 back to the east starting point. Also fixed the same
+//                 click-through bug as makeColumn() (v1.0.39) in the
+//                 pre-existing makeDot() helper -- lv_obj_create() is
+//                 clickable by default and the orbiting dot moves around
+//                 clickable quadrants/screens, so this needed to be
+//                 correct even though the existing static legend dots
+//                 never surfaced it in practice.
+//version 1.0.44 - Real-hardware bug batch: (1) the SoC ring's Charging/
+//                 Discharging/Idle state text could show a false "Idle"
+//                 indefinitely -- g_batteryState defaults to 0 (Idle) at
+//                 boot, there's no MQTT staleness timeout by design, and
+//                 the Battery/Action topic's publisher likely doesn't
+//                 retain it, so a freshly booted/reflashed Unit 2 has no
+//                 way to learn the CURRENT state until the next real
+//                 transition. Now gated on g_lastBatteryActionMs (only
+//                 ever set inside the Action handler) so it shows
+//                 nothing until a real reading has actually arrived,
+//                 instead of a guess; (2) added seconds back to the
+//                 clock (getLocaltime(), shared by Home and Time
+//                 screens); (3) Home quadrant's "Batt" label spelled
+//                 out to "Battery" -- fits fine in the 185px column.
+//version 1.0.45 - Added a static "Feeder" caption below the Home
+//                 quadrant's Battery label, centered, per request --
+//                 clarifies that ring measures feeder power (same
+//                 source as the Grid screen's L1/L2 Feeder columns).
+//                 Plain text, no data dependency, so it shows
+//                 regardless of whether Unit 1 is currently publishing.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -595,6 +654,13 @@ unsigned long g_lastLine2GridMs = 0;
 #define COLOR_PILL_AMBER  lv_color_hex(0x3a1f1c)
 #define COLOR_BLUE_TIDE   lv_color_hex(0x5dc8e8)
 #define COLOR_MOON_GRAY   lv_color_hex(0xc9cace)
+
+//Orbiting charge/discharge dot colors -- matched exactly to the physical
+//ESP32 FastLED fuel gauge strip's own traveling-highlight colors
+//(CRGB::Yellow / CRGB::Amethyst in ESP32_Fuel_Gauge.ino), so the two
+//devices read consistently if you're looking at both.
+#define COLOR_ORBIT_CHARGING     lv_color_hex(0xFFFF00)
+#define COLOR_ORBIT_DISCHARGING  lv_color_hex(0x9966CC)
 
 //battery-state color mapping (Idle=green, Discharging=blue, Charging=red --
 //deliberately different from the mockups' original green/amber scheme, per
@@ -842,9 +908,11 @@ lv_obj_t* lbl_conn_ip;
 lv_obj_t* lbl_time_clock;
 lv_obj_t* lbl_time_date;
 lv_obj_t* ring_home_battery;
+lv_obj_t* dot_home_battery;
 lv_obj_t* lbl_home_battery_pct;
 lv_obj_t* lbl_home_battery_state;
 lv_obj_t* ring_batt_screen;
+lv_obj_t* dot_batt_screen;
 lv_obj_t* lbl_batt_pct;
 lv_obj_t* lbl_batt_state;
 lv_obj_t* ring_home_grid;
@@ -882,7 +950,7 @@ lv_obj_t* lbl_tide_right;
 char* getLocaltime(char buffer[]) {
   tm t;
   _rtc_localtime(time(NULL), &t, RTC_FULL_LEAP_YEAR_SUPPORT);
-  strftime(buffer, 32, "%I:%M %p", &t);
+  strftime(buffer, 32, "%I:%M:%S %p", &t);
   return buffer;
 }
 
@@ -1204,6 +1272,11 @@ lv_obj_t* makeDot(lv_obj_t* parent, lv_color_t color, lv_coord_t x, lv_coord_t y
   lv_obj_set_style_bg_color(dot, color, 0);
   lv_obj_set_style_border_width(dot, 0, 0);
   lv_obj_set_pos(dot, x, y);
+  //Same click-through bug as makeColumn() (see its comment): lv_obj_create()
+  //is clickable by default. Harmless in practice for the existing static
+  //legend/status dots (tiny hit targets), but the new orbiting dot below
+  //moves around a clickable quadrant/screen, so this needs to be correct.
+  lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
   return dot;
 }
 
@@ -1268,6 +1341,68 @@ lv_obj_t* makeRing(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t d, i
   lv_obj_set_style_pad_all(arc, 0, LV_PART_KNOB);
   lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
   return arc;
+}
+
+//---- orbiting charge/discharge indicator dot ----
+//A small dot that orbits the SoC ring (ring_home_battery / ring_batt_screen),
+//layered on top without touching the ring's own SoC-driven arc length or
+//color -- the ring stays exactly as it was (teal, starts at the east/
+//3-o'clock position). The dot alone carries two additional, independent
+//pieces of information the ring doesn't: which direction power is
+//currently flowing (color + spin direction) and how fast (spin rate).
+//Angle is tracked as a float here rather than read back from LVGL, so a
+//mid-spin direction/rate change can restart smoothly from wherever the
+//dot currently is instead of snapping back to the east starting point
+//every time real data updates.
+//lastDirection: -2 = uninitialized (forces the first update through),
+//0 = idle, 1 = charging (CW), -1 = discharging (CCW).
+OrbitDot orbitHomeBattery = { nullptr, 0, 0, 0, 0.0f, -2, -1.0f };
+OrbitDot orbitBattScreen = { nullptr, 0, 0, 0, 0.0f, -2, -1.0f };
+
+void orbitDotExecCb(void* var, int32_t angleTenths) {
+  OrbitDot* o = (OrbitDot*)var;
+  o->currentAngleDeg = angleTenths / 10.0f;
+  float rad = o->currentAngleDeg * (float)M_PI / 180.0f;
+  lv_coord_t diam = lv_obj_get_width(o->dot);
+  lv_obj_set_pos(o->dot, o->cx + (int)(o->r * cosf(rad)) - diam / 2,
+                  o->cy + (int)(o->r * sinf(rad)) - diam / 2);
+}
+
+//direction: 1 = charging (yellow, clockwise), -1 = discharging (amethyst,
+//counter-clockwise), 0 = idle (hidden, not spinning). percent: 0-100,
+//maps to spin rate, 100% = one full rotation/second. Only touches the
+//running animation when direction or percent actually changed, so the
+//1-second tick doesn't restart (and visually stutter) a spin that's
+//already correct.
+void updateOrbitDot(OrbitDot* o, int direction, float percent) {
+  bool directionChanged = (direction != o->lastDirection);
+  bool percentChanged = fabs(percent - o->lastPercent) > 1.0;
+  if (!directionChanged && !percentChanged) return;
+  o->lastDirection = direction;
+  o->lastPercent = percent;
+
+  lv_anim_delete(o, orbitDotExecCb);
+
+  if (direction == 0 || percent <= 0) {
+    lv_obj_add_flag(o->dot, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_clear_flag(o->dot, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_style_bg_color(o->dot, direction == 1 ? COLOR_ORBIT_CHARGING : COLOR_ORBIT_DISCHARGING, 0);
+
+  float hz = constrain(percent, 0.0, 100.0) / 100.0;
+  float fromAngle = o->currentAngleDeg;
+  float toAngle = fromAngle + (direction == 1 ? 360.0f : -360.0f);
+
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, o);
+  lv_anim_set_exec_cb(&a, orbitDotExecCb);
+  lv_anim_set_values(&a, (int32_t)(fromAngle * 10), (int32_t)(toAngle * 10));
+  lv_anim_set_duration(&a, (uint32_t)(1000.0 / hz));
+  lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_set_path_cb(&a, lv_anim_path_linear);
+  lv_anim_start(&a);
 }
 
 //plain container for group layout -- no background/border of its own, used
@@ -1450,6 +1585,19 @@ void buildHomeScreen() {
   lv_obj_add_event_cb(q_batt, navBattery, LV_EVENT_CLICKED, NULL);
 
   ring_home_battery = makeRing(q_batt, 90, 55, 84, 0, 0, COLOR_TEAL); //angle set live once a reading arrives
+  //Track color per request -- red instead of the default neutral dark
+  //gray, purely cosmetic, doesn't affect the teal SoC arc drawn on top.
+  lv_obj_set_style_arc_color(ring_home_battery, COLOR_RED, LV_PART_MAIN);
+  //Orbiting charge/discharge dot, hidden until real state data arrives.
+  //Orbit center/radius derived from the ring's own x/y/diameter above
+  //(90,55,84): center = (90+42, 55+42), radius = 42 - half the ring's
+  //8px arc width, so the dot rides the arc's own centerline.
+  dot_home_battery = makeDot(q_batt, COLOR_ORBIT_CHARGING, 0, 0, 10);
+  lv_obj_add_flag(dot_home_battery, LV_OBJ_FLAG_HIDDEN);
+  orbitHomeBattery.dot = dot_home_battery;
+  orbitHomeBattery.cx = 132;
+  orbitHomeBattery.cy = 97;
+  orbitHomeBattery.r = 38;
   //pct and state share the same X (left-justified at "the 100% position"),
   //per feedback -- these are NOT centered, unlike the connection/grid text.
   lbl_home_battery_pct = makeLabel(q_batt, "--", COLOR_TEXT, 195, 75);
@@ -1482,8 +1630,15 @@ void buildHomeScreen() {
   ring_home_batt_power = makeRing(col_home_batt, (hColW - hRingD) / 2, 0, hRingD, 0, 0, COLOR_TEAL);  //angle set live once battery data arrives
   lbl_home_batt_watts = makeLabel(col_home_batt, "-- W", COLOR_TEXT);
   lv_obj_align(lbl_home_batt_watts, LV_ALIGN_TOP_MID, 0, 78);
-  lbl_home_batt_label = makeLabel(col_home_batt, "Batt", COLOR_TEXT_MUTED);
+  lbl_home_batt_label = makeLabel(col_home_batt, "Battery", COLOR_TEXT_MUTED);
   lv_obj_align(lbl_home_batt_label, LV_ALIGN_TOP_MID, 0, 118);
+  //Static caption clarifying what this ring measures (feeder power, same
+  //source as the Grid screen's L1/L2 Feeder columns) -- plain text, no
+  //data dependency, so it always shows regardless of whether Unit 1 is
+  //currently publishing. Same +40px rhythm as the ring->watts->label
+  //spacing above it.
+  lv_obj_t* feederCaption = makeLabel(col_home_batt, "Feeder", COLOR_TEXT_DIM);
+  lv_obj_align(feederCaption, LV_ALIGN_TOP_MID, 0, 158);
 
   lv_obj_t* col_home_grid = makeColumn(q_grid, 200, 15, hColW, 190);
   ring_home_grid = makeRing(col_home_grid, (hColW - hRingD) / 2, 0, hRingD, 60, 120, COLOR_BLUE_TIDE); //placeholder angle; real needle gauge is a later spiral
@@ -1626,6 +1781,19 @@ void buildBatteryScreen() {
   makeBackButton(scr_battery);
 
   ring_batt_screen = makeRing(scr_battery, 260, 60, 120, 0, 0, COLOR_TEAL); //angle set live once a reading arrives
+  //Track color per request -- red instead of the default neutral dark
+  //gray, purely cosmetic, doesn't affect the teal SoC arc drawn on top.
+  lv_obj_set_style_arc_color(ring_batt_screen, COLOR_RED, LV_PART_MAIN);
+  //Orbiting charge/discharge dot, hidden until real state data arrives.
+  //Orbit center/radius derived from the ring's own x/y/diameter above
+  //(260,60,120): center = (260+60, 60+60), radius = 60 - half the
+  //ring's 8px arc width, so the dot rides the arc's own centerline.
+  dot_batt_screen = makeDot(scr_battery, COLOR_ORBIT_CHARGING, 0, 0, 14);
+  lv_obj_add_flag(dot_batt_screen, LV_OBJ_FLAG_HIDDEN);
+  orbitBattScreen.dot = dot_batt_screen;
+  orbitBattScreen.cx = 320;
+  orbitBattScreen.cy = 120;
+  orbitBattScreen.r = 56;
   //pct and state share the same X (left-justified), per feedback
   lbl_batt_pct = makeLabel(scr_battery, "--", COLOR_TEXT, 400, 95);
   lbl_batt_state = makeLabel(scr_battery, "Waiting for data", COLOR_TEXT_MUTED, 400, 125);
@@ -2169,12 +2337,24 @@ void loop() {
       lv_arc_set_angles(ring_home_battery, 0, angle);
       lv_arc_set_angles(ring_batt_screen, 0, angle);
 
-      const char* stateText = batteryStateText(g_batteryState);
-      lv_color_t stateColor = batteryStateColor(g_batteryState);
-      lv_label_set_text(lbl_home_battery_state, stateText);
-      lv_obj_set_style_text_color(lbl_home_battery_state, stateColor, 0);
-      lv_label_set_text(lbl_batt_state, stateText);
-      lv_obj_set_style_text_color(lbl_batt_state, stateColor, 0);
+      //g_batteryState defaults to 0 (Idle) at boot and there's no MQTT
+      //staleness/failsafe timeout on this device by design (see
+      //CLAUDE.md) -- so if the Battery/Action topic isn't retained by
+      //its publisher, a freshly booted/reflashed Unit 2 has no way to
+      //learn the CURRENT state until the next real transition, and
+      //shows a false "Idle" the whole time. g_lastBatteryActionMs (only
+      //ever set inside the Action MQTT handler) doubles as a has-data
+      //flag here, same "-1/0 means never received" convention used
+      //elsewhere in this file, so it shows an honest "waiting for
+      //data" instead of a guess.
+      if (g_lastBatteryActionMs > 0) {
+        const char* stateText = batteryStateText(g_batteryState);
+        lv_color_t stateColor = batteryStateColor(g_batteryState);
+        lv_label_set_text(lbl_home_battery_state, stateText);
+        lv_obj_set_style_text_color(lbl_home_battery_state, stateColor, 0);
+        lv_label_set_text(lbl_batt_state, stateText);
+        lv_obj_set_style_text_color(lbl_batt_state, stateColor, 0);
+      }
     }
 
     //L1/L2 Feeder -- Unit 1's own output readback (unchanged source,
@@ -2263,6 +2443,32 @@ void loop() {
       int16_t gridAngle = (int16_t)constrain(fabs(totalGrid) / MAX_GRID_POWER * 360.0, 0, 360);
       lv_arc_set_angles(ring_home_grid, 0, gridAngle);
       lv_arc_set_angles(ring_grid_grid, 0, gridAngle);
+    }
+
+    //Orbiting charge/discharge dot on the SoC ring (see updateOrbitDot()
+    //above): direction/color from g_batteryState, spin rate from real
+    //power -- feeder power (L1+L2) while discharging (1800W = 100%, same
+    //MAX_BATTERY_POWER ceiling as the Battery ring above), grid power
+    //while charging (a temporary stand-in until a real charge-power MQTT
+    //topic exists, per request: a two-point calibrated line, 50W->10%,
+    //7000W->100%, so even a trickle still shows a faint, visible spin
+    //rather than looking dead). Idle never spins, regardless of data; if
+    //the state says charging/discharging but that state's own power data
+    //hasn't arrived yet, the dot stays hidden rather than guessing.
+    {
+      int orbitDirection = 0;
+      float orbitPercent = 0;
+      if (g_batteryState == -1 && g_line1Power >= 0 && g_line2Power >= 0) {
+        orbitDirection = -1;
+        float feederPower = fabs(g_line1Power + g_line2Power);
+        orbitPercent = constrain(feederPower / MAX_BATTERY_POWER * 100.0, 0.0, 100.0);
+      } else if (g_batteryState == 1 && g_hasLine1GridPower && g_hasLine2GridPower) {
+        orbitDirection = 1;
+        float gridPower = fabs(g_line1GridPower + g_line2GridPower);
+        orbitPercent = constrain(10.0 + (gridPower - 50.0) * (90.0 / 6950.0), 0.0, 100.0);
+      }
+      updateOrbitDot(&orbitHomeBattery, orbitDirection, orbitPercent);
+      updateOrbitDot(&orbitBattScreen, orbitDirection, orbitPercent);
     }
 
     //Saved Today -- grounded in real state of charge instead of a single
