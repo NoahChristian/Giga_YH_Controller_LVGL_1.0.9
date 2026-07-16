@@ -98,6 +98,10 @@ struct TouStatus {
 struct TouSegment { int startHour; int endHour; lv_color_t color; };
 struct TouWindow { int startHour; int endHour; TouTier tier; };
 struct TidePoint { int minuteOfDay; float heightFeet; bool isHigh; };
+//see setConnStatusIndicator() -- drives the Home quadrant's and Connection
+//screen's dot+label, replacing what used to be a build-time-only
+//hardcoded green "Connected" dot.
+enum WifiUiState { WIFI_UI_CONNECTING, WIFI_UI_CONNECTED, WIFI_UI_NOT_CONNECTED };
 //orbit center/radius + tracked angle for the SoC ring's charge/discharge
 //dot -- see updateOrbitDot() for why the angle is tracked as a float
 //here instead of read back from LVGL.
@@ -124,7 +128,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.47"
+#define VERSION_DASHBOARD "1.0.48"
 //version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
 //                Connection screen live (SSID/RSSI/broker state), everything
 //                else placeholder. Did not compile (LVGL v8-style input
@@ -628,6 +632,41 @@ uint32_t dsi_getDisplayYSize(void);
 //                 and connected using those, proving the manual-entry ->
 //                 KVStore-save -> KVStore-load round trip is real, not
 //                 just the earlier synthetic test.
+//version 1.0.48 - Replaced the Home quadrant's and Connection screen's
+//                 hardcoded-green "Connected" dot/label (set once at
+//                 screen-build time, never touched again) with a real
+//                 three-state indicator (Connecting/Connected/Not
+//                 connected) via setConnStatusIndicator(), called at
+//                 every real WiFi state transition: before the first
+//                 connect attempt, after it resolves (either source, or
+//                 falling through to manual setup), after a successful
+//                 manual/Reset-network round trip, and once per second
+//                 from loop()'s existing update tick (this sketch has no
+//                 active reconnect loop, so a runtime drop correctly
+//                 shows "Not connected" instead of a stale "Connected").
+//                 Also added the Connection screen's "Reset network"
+//                 button -- clears the stored KVStore credentials and
+//                 re-enters the same manual setup flow immediately,
+//                 without touching secrets.h, for switching networks
+//                 without a reflash. Along the way, found and fixed a
+//                 second real bug: a single lv_timer_handler() call
+//                 before a blocking WiFi call doesn't guarantee the
+//                 frame has actually reached the panel by the time
+//                 execution continues -- added forcePaint() (several
+//                 ticks with a short real delay between them) and used
+//                 it everywhere a state needs to be visibly painted
+//                 before blocking. Verified the indicator itself is
+//                 correct via a temporary debug print reading the live
+//                 LVGL label text directly (confirmed "Connecting" during
+//                 a forced-failure test) after a screen-dump capture
+//                 taken at that same instant misleadingly still showed
+//                 the previous "Connected" state -- traced to the
+//                 screen-dump tool itself reading stale DRAM content
+//                 that survives a soft reset during the display's own
+//                 cold-boot window, not a firmware bug (three separate
+//                 captures across different boot attempts, including one
+//                 after the forcePaint fix, came back byte-for-byte
+//                 identical, which a live redraw could never produce).
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -1017,6 +1056,15 @@ lv_obj_t* wifiConnectStatusLbl;
 lv_obj_t* lbl_home_clock;
 lv_obj_t* lbl_home_date;
 lv_obj_t* lbl_home_ssid;
+//connection status dot+label pair, once each on the Home quadrant and the
+//Connection screen -- both used to be built once with a hardcoded green
+//dot and "Connected" text (never touched again after screen build), so
+//the UI claimed a live connection even while connectToWiFi() was still
+//mid-retry or had already given up. See setConnStatusIndicator().
+lv_obj_t* dot_home_conn;
+lv_obj_t* lbl_home_connState;
+lv_obj_t* dot_scr_conn;
+lv_obj_t* lbl_scr_connState;
 lv_obj_t* lbl_conn_ssid;
 lv_obj_t* lbl_conn_rssi;
 lv_obj_t* lbl_conn_broker;
@@ -1375,6 +1423,45 @@ void onMqttMessage(int messageSize) {
   }
 }
 
+//Drives the Home quadrant's and Connection screen's dot+label pair. Both
+//used to be built once at screen-construction time with a hardcoded
+//green dot and "Connected" text, so the UI claimed a live connection even
+//during connectToWiFi()'s multi-attempt retries (which run with scr_home
+//already loaded and visible, per setup()'s own flow) or after a
+//connection was never established at all. Called at every real state
+//transition instead -- before the first connect attempt, after each
+//attempt resolves, after a successful manual setup or Reset-network
+//round trip, and once per second from loop()'s existing periodic update
+//tick (this sketch has no active WiFi reconnect loop, so a runtime drop
+//correctly stays "Not connected" until the user acts, rather than being
+//silently missed).
+//A single lv_timer_handler() call queues a redraw but doesn't guarantee
+//it's actually reached the panel by the time execution continues into a
+//blocking call right after it -- confirmed on real hardware via a
+//screen-dump capture taken the instant a serial log line proved the
+//Arduino-side code had already executed past the state-change call: the
+//physical screen still showed the previous state. Several ticks with a
+//short real delay between them gives the display pipeline (this sketch
+//renders through a software 270-degree rotation, per dump_screen.py's
+//own docstring) actual wall-clock time to finish, not just queue, the
+//frame. Used anywhere a state needs to be visibly painted before a
+//blocking WiFi call -- "Connecting"/"Scanning..." etc.
+void forcePaint() {
+  for (int i = 0; i < 5; i++) {
+    lv_timer_handler();
+    delay(15);
+  }
+}
+
+void setConnStatusIndicator(WifiUiState state) {
+  lv_color_t color = state == WIFI_UI_CONNECTED ? COLOR_STATUS_OK : state == WIFI_UI_CONNECTING ? COLOR_AMBER : COLOR_RED;
+  const char* text = state == WIFI_UI_CONNECTED ? "Connected" : state == WIFI_UI_CONNECTING ? "Connecting" : "Not connected";
+  lv_obj_set_style_bg_color(dot_home_conn, color, 0);
+  lv_label_set_text(lbl_home_connState, text);
+  lv_obj_set_style_bg_color(dot_scr_conn, color, 0);
+  lv_label_set_text(lbl_scr_connState, text);
+}
+
 //---- small widget helpers ----
 lv_obj_t* makeScreenRoot() {
   lv_obj_t* scr = lv_obj_create(NULL);
@@ -1680,12 +1767,37 @@ void navWifiScanRescan(lv_event_t* e) {
   lv_scr_load(scr_wifi_scan);
 }
 
+//Connection screen's "Reset network" button. Clears the stored KVStore
+//credentials and re-enters this same manual setup flow right away --
+//doesn't touch secrets.h, so if that's still a valid network a later
+//reboot/reflash will just reconnect to it immediately; this button exists
+//for switching to a DIFFERENT network without one. Reuses the identical
+//blocking wait-loop pattern setup() falls into when both credential
+//sources fail (see there for why blocking here is fine): attemptWifi-
+//ConnectFromSetup() flips g_awaitingManualWifiSetup back to false and
+//navigates to scr_home itself once a new connection succeeds.
+void onResetNetworkClicked(lv_event_t* e) {
+  kv_remove(KV_KEY_WIFI_SSID);
+  kv_remove(KV_KEY_WIFI_PASS);
+  WiFi.disconnect();
+  setConnStatusIndicator(WIFI_UI_NOT_CONNECTED);
+  g_awaitingManualWifiSetup = true;
+  populateWifiScanList();
+  lv_scr_load(scr_wifi_scan);
+  while (g_awaitingManualWifiSetup) {
+    lv_timer_handler();
+    serviceDevCommands();
+    delay(5);
+  }
+  setConnStatusIndicator(WIFI_UI_CONNECTED);
+}
+
 void attemptWifiConnectFromSetup(const char* s, const char* p) {
   lv_obj_clear_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
   lv_label_set_text(wifiConnectStatusLbl, "Connecting...");
   lv_obj_set_style_text_color(wifiConnectStatusLbl, COLOR_AMBER, 0);
   lv_scr_load(scr_wifi_password);  //open-network path can call this straight from the scan screen -- show the status somewhere it'll be seen
-  lv_timer_handler();              //paint "Connecting..." before the blocking attempt below
+  forcePaint();                     //paint "Connecting..." before the blocking attempt below
 
   if (tryConnectWiFi(s, p, 3, 15000)) {
     strncpy(ssid, s, sizeof(ssid) - 1);
@@ -1735,7 +1847,7 @@ void populateWifiScanList() {
   lv_obj_clear_flag(wifiScanStatusLbl, LV_OBJ_FLAG_HIDDEN);
   lv_label_set_text(wifiScanStatusLbl, "Scanning...");
   lv_obj_set_style_text_color(wifiScanStatusLbl, COLOR_TEXT_MUTED, 0);
-  lv_timer_handler();  //paint "Scanning..." before the blocking scan below
+  forcePaint();  //paint "Scanning..." before the blocking scan below
 
   int n = WiFi.scanNetworks();
   g_wifiScanCount = (n > 0) ? min(n, MAX_WIFI_SCAN_RESULTS) : 0;
@@ -1944,8 +2056,8 @@ void buildHomeScreen() {
 
   lv_obj_t* conn_row = makeFlexRow(q_conn, 0, 78, 396, 30, 10);
   lv_obj_set_style_bg_opa(conn_row, LV_OPA_TRANSP, 0);
-  makeDot(conn_row, COLOR_STATUS_OK, 0, 0, 10);
-  makeLabel(conn_row, "Connected", COLOR_TEXT);
+  dot_home_conn = makeDot(conn_row, COLOR_STATUS_OK, 0, 0, 10);
+  lbl_home_connState = makeLabel(conn_row, "Connected", COLOR_TEXT);
 
   lbl_home_ssid = makeLabel(q_conn, "---", COLOR_TEXT_MUTED);
   lv_obj_align(lbl_home_ssid, LV_ALIGN_TOP_MID, 0, 115);
@@ -2091,8 +2203,8 @@ void buildConnectionScreen() {
   makeBackButton(scr_connection);
 
   lv_obj_t* conn_row = makeFlexRow(scr_connection, 0, 82, 800, 30, 10);
-  makeDot(conn_row, COLOR_STATUS_OK, 0, 0, 12);
-  makeLabel(conn_row, "Connected", COLOR_TEXT);
+  dot_scr_conn = makeDot(conn_row, COLOR_STATUS_OK, 0, 0, 12);
+  lbl_scr_connState = makeLabel(conn_row, "Connected", COLOR_TEXT);
 
   //two side-by-side column regions instead of one cramped vertical list --
   //left column: what network we're on; right column: broker/addressing.
@@ -2132,6 +2244,15 @@ void buildConnectionScreen() {
 
   makeRowLabel(scr_connection, "Firmware", rightLabelRight, 308, rightLabelW);
   makeLabel(scr_connection, "V" VERSION_DASHBOARD, COLOR_TEXT, rightValueX, 308);
+
+  //Clears the stored KVStore credentials and re-enters the manual
+  //network-select flow immediately -- for switching to a different
+  //network without a full reflash. Doesn't touch secrets.h, so if that's
+  //still a valid network it'll just reconnect to it on the next boot.
+  lv_obj_t* resetPill = makeAutoPill(scr_connection, lv_color_hex(0x17191c), COLOR_TEXT_MUTED, "Reset network", 20, 40);
+  lv_obj_align(resetPill, LV_ALIGN_BOTTOM_RIGHT, -40, -30);
+  lv_obj_add_flag(resetPill, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(resetPill, onResetNetworkClicked, LV_EVENT_CLICKED, NULL);
 }
 
 //---- Battery screen ----
@@ -2515,6 +2636,13 @@ void setup() {
   buildWifiPasswordScreen();
   lv_scr_load(scr_home);
   lv_timer_handler(); //don't leave the screen dark while WiFi connects
+  //Home is already visible at this point, so the dot/label would still
+  //show whatever build-time text/color the screen was constructed with
+  //(previously a hardcoded green "Connected", even though nothing has
+  //connected yet) for the entire multi-attempt retry window below unless
+  //set explicitly here first.
+  setConnStatusIndicator(WIFI_UI_CONNECTING);
+  forcePaint(); //paint "Connecting" before the blocking attempts below
 
   //Manual setup flow: shown only if both bounded attempts above (secrets.h,
   //then stored KVStore credentials) fail. attemptWifiConnectFromSetup()
@@ -2523,6 +2651,7 @@ void setup() {
   //this loop just keeps the UI alive and responsive to touch until then.
   if (!connectToWiFi()) {
     if (verbosity > 0) Serial.println("Both secrets.h and stored WiFi credentials failed -- showing manual setup");
+    setConnStatusIndicator(WIFI_UI_NOT_CONNECTED);
     g_awaitingManualWifiSetup = true;
     populateWifiScanList();
     lv_scr_load(scr_wifi_scan);
@@ -2532,6 +2661,10 @@ void setup() {
       delay(5);
     }
   }
+  //Reachable only once actually connected -- either connectToWiFi() above
+  //succeeded directly, or the wait loop only exits via a successful
+  //attemptWifiConnectFromSetup().
+  setConnStatusIndicator(WIFI_UI_CONNECTED);
 
   //Real dates need real (NTP-synced) time, so this has to happen after
   //connectToWiFi() above, not alongside the other screen-building calls.
@@ -2718,6 +2851,13 @@ void loop() {
 
     lv_label_set_text(lbl_home_ssid, WiFi.SSID());
     lv_label_set_text(lbl_conn_ssid, WiFi.SSID());
+    //This sketch has no active WiFi reconnect loop, so a real runtime drop
+    //(router reboot, moved out of range) has nothing retrying it -- WiFi.
+    //status() will just sit at whatever it dropped to. Reflecting that
+    //here means the dot/label correctly show "Not connected" instead of a
+    //stale "Connected" left over from setup(), the same class of bug this
+    //whole indicator was added to fix.
+    setConnStatusIndicator(WiFi.status() == WL_CONNECTED ? WIFI_UI_CONNECTED : WIFI_UI_NOT_CONNECTED);
 
     char rssiBuf[16];
     sprintf(rssiBuf, "%ld dBm", WiFi.RSSI());
