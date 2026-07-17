@@ -128,7 +128,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.50"
+#define VERSION_DASHBOARD "1.0.52"
 //version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
 //                Connection screen live (SSID/RSSI/broker state), everything
 //                else placeholder. Did not compile (LVGL v8-style input
@@ -738,6 +738,53 @@ uint32_t dsi_getDisplayYSize(void);
 //                 LVGL's own display rotation already handles correctly
 //                 (touchpad_read() is back to its untouched original
 //                 form). Not resolved -- tracked as GitHub issue #1.
+//version 1.0.51 - Battery screen's chart is now real: subscribes to a
+//                 new HA-side topic (V1.0/Home/Battery/DaySOC, published
+//                 by a new pyscript automation --
+//                 homeassistant/pyscript/battery_day_curve.py -- rebuilt
+//                 from HA's own recorder history every 30 minutes) and
+//                 replaces the old static two-polyline mockup placeholder
+//                 with a real multi-segment curve. Renders as up to 8
+//                 lv_line segments (real margin for realistic cycle
+//                 counts), splitting into a new segment on every
+//                 Charging/Idle-vs-Discharging change, so any number of
+//                 real charge/discharge cycles in a day renders
+//                 correctly -- the old placeholder assumed exactly one
+//                 charge-then-discharge arc, which silently doesn't hold
+//                 on a system with two independent TOU-driven cycles.
+//                 Two-color per explicit request (deliberately the
+//                 OPPOSITE of this app's usual Charging=red/
+//                 Discharging=blue convention used elsewhere): Charging
+//                 and Idle both render blue, Discharging renders red.
+//                 Chart redraws when the screen is navigated to, and
+//                 when fresh data arrives while it's already the visible
+//                 screen -- not unconditionally in the background, since
+//                 nobody's looking at a hidden screen's chart. The old
+//                 fixed "now" dot/label (pinned to the placeholder's own
+//                 fixed example endpoint) is removed rather than ported
+//                 forward wrong. Saved Today's own known multi-cycle bug
+//                 (see next version) is NOT fixed yet in this version --
+//                 this is the curve-rendering half only, by design, to
+//                 verify on real hardware before layering the savings
+//                 math revision on top.
+//version 1.0.52 - Saved Today's multi-cycle bug (flagged in 1.0.51) is
+//                 fixed: it now walks the real g_daySoc* curve and sums
+//                 every discharging segment's SoC drop, each priced at
+//                 the ACTUAL historical TOU tier for that segment's own
+//                 bucket -- so a second cycle no longer silently
+//                 disappears if the battery recharged to 100% in
+//                 between. If NO discharge has happened yet today (only
+//                 charging so far, e.g. an early-morning super off-peak
+//                 charge), net charged energy is valued at today's
+//                 full-day blended rate instead, as a forward estimate
+//                 of what it'll be worth once discharged -- the moment
+//                 real discharge data exists, that estimate is dropped
+//                 entirely in favor of exact TOU pricing, not blended
+//                 with it. Also added a "Saved yesterday" column next to
+//                 it on the Grid screen, static "$5.55" placeholder text
+//                 for now -- Unit 2 doesn't retain SoC history across a
+//                 day rollover, so a real prior-day total needs a
+//                 pyscript-side computation (deferred).
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -817,6 +864,25 @@ const char subtopicLine2[] = "V1.0/Home/PowerFeeder/Line2";
 //calibration (tracked separately, not touched here).
 const char subtopicLine1Grid[] = "V1.0/Home/PowerFeeder/Line1Set";
 const char subtopicLine2Grid[] = "V1.0/Home/PowerFeeder/Line2Set";
+//Published by a pyscript automation on the HA side (not Unit 1), rebuilt
+//from HA's own recorder history every 30 minutes: today's battery SoC +
+//Charging/Discharging/Idle curve so far, as a compact retained CSV blob
+//("bucket:soc:state,bucket:soc:state,..." -- bucket = 15-minute index
+//since midnight 0-95, state = 0 Idle/1 Charging/2 Discharging, matching
+//g_batteryState's own encoding). See
+//homeassistant/pyscript/battery_day_curve.py for the HA-side half of
+//this. Feeds both the Battery screen's real chart (replacing the old
+//static two-polyline mockup placeholder) and the Saved Today calc, which
+//needs the same full-day data to correctly sum multiple discharge cycles
+//in one day instead of just comparing current SoC to 100%.
+const char subtopicBatteryDaySoc[] = "V1.0/Home/Battery/DaySOC";
+
+#define MAX_DAYSOC_POINTS 96 //one point per 15-min bucket, full 24h day
+uint8_t g_daySocBucket[MAX_DAYSOC_POINTS];
+uint8_t g_daySocValue[MAX_DAYSOC_POINTS];   //SoC 0-100
+uint8_t g_daySocState[MAX_DAYSOC_POINTS];   //0 Idle, 1 Charging, 2 Discharging
+int g_daySocCount = 0;
+bool g_daySocDirty = false; //set on new MQTT data, cleared once the chart's been rebuilt from it
 
 float g_batterySoC = -1.0; //-1 = no reading received yet
 int g_batteryState = 0;    //1 = Charging, -1 = Discharging, 0 = Idle/unknown
@@ -1470,7 +1536,12 @@ void dumpFramebufferToSerial() {
 
 //---- MQTT message handler (subscribe-only -- this never publishes) ----
 void onMqttMessage(int messageSize) {
-  char tbuf[256] = "";
+  //1024, not the 256 every other topic here has gotten away with -- the
+  //DaySOC payload (see subtopicBatteryDaySoc) can run up to ~900 bytes
+  //for a full day at 15-min resolution ("bucket:soc:state," per point),
+  //comfortably fits with real margin. Shared across every branch below,
+  //same as before -- trivial stack cost on this board either way.
+  char tbuf[1024] = "";
   int size = 0;
   String topic = mqttClient.messageTopic();
 
@@ -1553,6 +1624,38 @@ void onMqttMessage(int messageSize) {
     g_hasLine2GridPower = true;
     g_lastLine2GridMs = millis();
     if (trace) { Serial.print("Line2 grid = "); Serial.println(g_line2GridPower, 0); }
+
+  } else if (topic.equals(subtopicBatteryDaySoc)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    //Manual parse, not strtok -- strtok's shared static state doesn't
+    //nest safely against anything else on this board that might also
+    //parse a string between calls, and this format ("bucket:soc:state,"
+    //repeated) is simple enough that hand-walking it is barely more code.
+    g_daySocCount = 0;
+    const char* p = tbuf;
+    while (*p && g_daySocCount < MAX_DAYSOC_POINTS) {
+      int bucket = atoi(p);
+      const char* colon1 = strchr(p, ':');
+      if (!colon1) break;
+      int soc = atoi(colon1 + 1);
+      const char* colon2 = strchr(colon1 + 1, ':');
+      if (!colon2) break;
+      int state = atoi(colon2 + 1);
+      g_daySocBucket[g_daySocCount] = (uint8_t)constrain(bucket, 0, 95);
+      g_daySocValue[g_daySocCount] = (uint8_t)constrain(soc, 0, 100);
+      g_daySocState[g_daySocCount] = (uint8_t)constrain(state, 0, 2);
+      g_daySocCount++;
+      const char* comma = strchr(colon2, ',');
+      if (!comma) break;
+      p = comma + 1;
+    }
+    g_daySocDirty = true;
+    if (trace) { Serial.print("Battery DaySOC points = "); Serial.println(g_daySocCount); }
   }
 }
 
@@ -1922,7 +2025,11 @@ void navConnection(lv_event_t* e) {
   }
   lv_scr_load(scr_connection);
 }
-void navBattery(lv_event_t* e) { lv_scr_load(scr_battery); }
+void navBattery(lv_event_t* e) {
+  lv_scr_load(scr_battery);
+  rebuildBatteryDayCurve(); //always fresh on entry, same reasoning as populateWifiScanList()
+  g_daySocDirty = false;
+}
 void navGrid(lv_event_t* e) { lv_scr_load(scr_grid); }
 void navAlmanac(lv_event_t* e) { lv_scr_load(scr_almanac); }
 
@@ -2519,22 +2626,27 @@ void buildConnectionScreen() {
 }
 
 //---- Battery screen ----
-//chart point data reused verbatim (same 800x480 canvas as this display) from
-//design/mockups/04_battery.svg's two polylines, just recolored to the
-//Charging=red/Discharging=blue scheme instead of the mockup's original
-//green/amber.
-static const lv_point_precise_t BATT_CHART_CHARGING[] = {
-  { 100, 395 }, { 113, 394 }, { 125, 359 }, { 137, 313 }, { 150, 282 },
-  { 162, 264 }, { 175, 268 }, { 188, 268 }, { 200, 268 }, { 213, 268 },
-  { 225, 268 }, { 237, 268 }, { 250, 268 }, { 263, 269 }, { 275, 269 },
-  { 287, 269 }, { 300, 269 }, { 312, 269 }, { 325, 269 }, { 338, 269 },
-  { 350, 269 }, { 363, 269 }, { 375, 269 }, { 387, 269 }, { 400, 269 },
-  { 413, 269 }, { 425, 269 }, { 437, 269 }, { 450, 270 }
-};
-static const lv_point_precise_t BATT_CHART_DISCHARGING[] = {
-  { 450, 270 }, { 462, 281 }, { 475, 285 }, { 488, 288 }, { 500, 291 },
-  { 513, 295 }, { 525, 298 }, { 537, 304 }, { 550, 310 }, { 553, 311 }
-};
+//Real per-15-minute-bucket curve, replacing the old static two-polyline
+//mockup placeholder (design/mockups/04_battery.svg's example data) --
+//see g_daySocBucket/Value/State and subtopicBatteryDaySoc. Chart bounds
+//chosen to closely match the old placeholder's own visual proportions
+//(it used roughly x=100-553, y=264-395 for its fixed example curve) but
+//widened to genuinely span the full 24h day (bucket 0-95), not just
+//stop wherever that one static example happened to end.
+#define BATT_CHART_X0 100   //bucket 0  (12 AM)
+#define BATT_CHART_X1 700   //bucket 95 (~11:45 PM)
+#define BATT_CHART_Y_SOC0 400   //pixel Y for 0% SoC (bottom)
+#define BATT_CHART_Y_SOC100 260 //pixel Y for 100% SoC (top)
+//At most ~2 charge cycles/day in practice (charge/idle/discharge per
+//cycle, plus real margin) -- see the discussion that settled on this,
+//not a hard protocol limit.
+#define MAX_BATT_CHART_SEGMENTS 8
+lv_obj_t* battDaySegment[MAX_BATT_CHART_SEGMENTS];
+//Each segment needs its OWN persistent point buffer -- lv_line_set_points()
+//stores a pointer, it does not copy the data, so a shared/temporary buffer
+//would have every segment silently pointing at whatever the LAST segment
+//built happened to leave behind.
+lv_point_precise_t battDaySegmentPoints[MAX_BATT_CHART_SEGMENTS][MAX_DAYSOC_POINTS];
 
 void buildBatteryScreen() {
   scr_battery = makeScreenRoot();
@@ -2561,34 +2673,40 @@ void buildBatteryScreen() {
   //plain ASCII hyphen, not a Unicode en-dash -- a screen-exporter capture
   //showed the en-dash rendering as a missing-glyph box, since the default
   //LVGL font here doesn't include it
-  lv_obj_t* caption = makeLabel(scr_battery, "Yesterday (Sun, Jul 12)\n12 AM - 6:07 PM", COLOR_TEXT_DIM);
+  lv_obj_t* caption = makeLabel(scr_battery, "Today", COLOR_TEXT_DIM);
   lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, 0);
   lv_obj_align(caption, LV_ALIGN_TOP_MID, 0, 178);
 
-  lv_obj_t* chart_charging = lv_line_create(scr_battery);
-  lv_line_set_points(chart_charging, BATT_CHART_CHARGING, sizeof(BATT_CHART_CHARGING) / sizeof(BATT_CHART_CHARGING[0]));
-  lv_obj_set_style_line_color(chart_charging, COLOR_STATE_CHARGING, 0);
-  lv_obj_set_style_line_width(chart_charging, 3, 0);
-  lv_obj_set_style_line_rounded(chart_charging, true, 0);
+  //Pre-created hidden, populated/shown/hidden per real data by
+  //rebuildBatteryDayCurve() -- no static example points here anymore.
+  for (int i = 0; i < MAX_BATT_CHART_SEGMENTS; i++) {
+    battDaySegment[i] = lv_line_create(scr_battery);
+    lv_obj_set_style_line_width(battDaySegment[i], 3, 0);
+    lv_obj_set_style_line_rounded(battDaySegment[i], true, 0);
+    lv_obj_add_flag(battDaySegment[i], LV_OBJ_FLAG_HIDDEN);
+  }
 
-  lv_obj_t* chart_discharging = lv_line_create(scr_battery);
-  lv_line_set_points(chart_discharging, BATT_CHART_DISCHARGING, sizeof(BATT_CHART_DISCHARGING) / sizeof(BATT_CHART_DISCHARGING[0]));
-  lv_obj_set_style_line_color(chart_discharging, COLOR_STATE_DISCHARGING, 0);
-  lv_obj_set_style_line_width(chart_discharging, 3, 0);
-  lv_obj_set_style_line_rounded(chart_discharging, true, 0);
-
-  makeDot(scr_battery, COLOR_TEXT, 548, 306, 10); //"now" marker, matches mockup
-
+  //No fixed "now" dot/label anymore -- the old one was pinned to the
+  //static placeholder's own fixed end-of-data point (x=548, "Now" label
+  //at x=660), which would just be silently wrong once this axis spans a
+  //real, continuously-growing full day instead of one fixed example.
   makeLabel(scr_battery, "12 AM", COLOR_TEXT_DIM, 100, 405);
-  lv_obj_t* now_lbl = makeLabel(scr_battery, "Now", COLOR_TEXT_DIM);
-  lv_obj_set_pos(now_lbl, 660, 405);
+  lv_obj_t* midnight_lbl = makeLabel(scr_battery, "Midnight", COLOR_TEXT_DIM);
+  lv_obj_set_pos(midnight_lbl, 640, 405);
 
+  //Per request: Charging Blue, Discharging Red -- deliberately the
+  //OPPOSITE of this app's usual Charging=red/Discharging=blue convention
+  //used everywhere else (Battery/Grid screens' state text and rings) --
+  //so this uses the raw color constants directly rather than the
+  //semantically-named COLOR_STATE_CHARGING/DISCHARGING (which would read
+  //backwards here). Idle segments share the same blue as Charging (not a
+  //3rd color) -- deliberate simplification, per request.
   //height widened from 30 to 40 and nudged up from y=445 to keep it within
   //the 480px screen -- same class of bug as the Almanac fixes above: 30px
   //was clipping the bottom of "Charging (super off-peak)"/"Discharging".
   lv_obj_t* legend = makeFlexRow(scr_battery, 0, 436, 800, 40, 40);
-  makeLegendItem(legend, COLOR_STATE_CHARGING, "Charging (super off-peak)");
-  makeLegendItem(legend, COLOR_STATE_DISCHARGING, "Discharging");
+  makeLegendItem(legend, COLOR_BLUE_TIDE, "Charging");
+  makeLegendItem(legend, COLOR_RED, "Discharging");
 }
 
 //---- Grid flow screen ("the consumption page") ----
@@ -2657,14 +2775,26 @@ void buildGridScreen() {
   lv_obj_t* l2g_lbl = makeLabel(col_l2g, "L2 Grid", COLOR_TEXT_DIM);
   lv_obj_align(l2g_lbl, LV_ALIGN_TOP_MID, 0, 34);
 
-  //Saved Today -- now a real computed value (time-averaged discharge
-  //power x elapsed on/off-peak hours today x their rates), not the old
-  //hardcoded "$4.20". See the Saved Today calc in loop().
-  lv_obj_t* col_saved = makeColumn(scr_grid, 250, 350, 300, 68);  //nudged from 340 to keep a clear gap from the stat row above
+  //Saved Today -- walks the real g_daySoc* curve now (see the calc in
+  //loop()) instead of a single instantaneous snapshot, so multiple
+  //charge/discharge cycles in one day all correctly contribute. Column
+  //narrowed/moved left (was centered at 250,300) to make room for Saved
+  //Yesterday alongside it.
+  lv_obj_t* col_saved = makeColumn(scr_grid, 100, 350, 280, 68);
   lbl_grid_saved = makeLabel(col_saved, "$0.00", COLOR_STATUS_OK);
   lv_obj_align(lbl_grid_saved, LV_ALIGN_TOP_MID, 0, 0);
   lv_obj_t* saved_lbl = makeLabel(col_saved, "Saved today", COLOR_TEXT_DIM);
   lv_obj_align(saved_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+  //Saved Yesterday -- static placeholder per request until pyscript is
+  //extended to compute and publish a real prior-day total (HA has the
+  //full day's history already; Unit 2 doesn't compute or store it once
+  //the day rolls over, so there's nothing real to show here yet).
+  lv_obj_t* col_saved_yesterday = makeColumn(scr_grid, 420, 350, 280, 68);
+  lv_obj_t* lbl_saved_yesterday = makeLabel(col_saved_yesterday, "$5.55", COLOR_STATUS_OK);
+  lv_obj_align(lbl_saved_yesterday, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_t* saved_yesterday_lbl = makeLabel(col_saved_yesterday, "Saved yesterday", COLOR_TEXT_DIM);
+  lv_obj_align(saved_yesterday_lbl, LV_ALIGN_TOP_MID, 0, 34);
 }
 
 //---- Almanac screen ----
@@ -2800,6 +2930,60 @@ void rebuildTideCurve() {
     lv_label_set_text(lbl_tide_left, highBuf);
   } else if (lowIdx >= 0) {
     lv_label_set_text(lbl_tide_left, lowBuf);
+  }
+}
+
+//Rebuilds the Battery screen's real per-15-min-bucket curve from the
+//latest g_daySoc arrays (see subtopicBatteryDaySoc/onMqttMessage above).
+//Walks the parsed points in order, splitting into a new lv_line segment
+//every time the Charging/Idle-vs-Discharging classification changes (see
+//buildBatteryScreen()'s comment on the deliberate 2-color scheme) -- so
+//any number of real charge/discharge cycles in a day renders correctly,
+//not just one fixed arc like the old placeholder assumed. Consecutive
+//segments share their boundary point so the rendered curve has no visual
+//gap at a color change.
+void rebuildBatteryDayCurve() {
+  for (int i = 0; i < MAX_BATT_CHART_SEGMENTS; i++) {
+    lv_obj_add_flag(battDaySegment[i], LV_OBJ_FLAG_HIDDEN);
+  }
+  if (g_daySocCount == 0) return;
+
+  int segIdx = 0;
+  int ptIdx = 1;
+  bool segIsDischarging = (g_daySocState[0] == 2);
+  battDaySegmentPoints[0][0].x = BATT_CHART_X0 + (int)((float)g_daySocBucket[0] / 95.0 * (BATT_CHART_X1 - BATT_CHART_X0));
+  battDaySegmentPoints[0][0].y = BATT_CHART_Y_SOC0 - (int)((float)g_daySocValue[0] / 100.0 * (BATT_CHART_Y_SOC0 - BATT_CHART_Y_SOC100));
+
+  for (int i = 1; i < g_daySocCount; i++) {
+    bool isDischarging = (g_daySocState[i] == 2);
+    int x = BATT_CHART_X0 + (int)((float)g_daySocBucket[i] / 95.0 * (BATT_CHART_X1 - BATT_CHART_X0));
+    int y = BATT_CHART_Y_SOC0 - (int)((float)g_daySocValue[i] / 100.0 * (BATT_CHART_Y_SOC0 - BATT_CHART_Y_SOC100));
+
+    if (isDischarging != segIsDischarging) {
+      if (segIdx < MAX_BATT_CHART_SEGMENTS) {
+        lv_line_set_points(battDaySegment[segIdx], battDaySegmentPoints[segIdx], ptIdx);
+        lv_obj_set_style_line_color(battDaySegment[segIdx], segIsDischarging ? COLOR_RED : COLOR_BLUE_TIDE, 0);
+        lv_obj_clear_flag(battDaySegment[segIdx], LV_OBJ_FLAG_HIDDEN);
+      }
+      int prevSegIdx = segIdx;
+      int prevLastPt = ptIdx - 1;
+      segIdx++;
+      if (segIdx >= MAX_BATT_CHART_SEGMENTS) break; //past the segment cap -- stop rather than overflow
+      segIsDischarging = isDischarging;
+      battDaySegmentPoints[segIdx][0] = battDaySegmentPoints[prevSegIdx][prevLastPt]; //shared boundary point
+      ptIdx = 1;
+    }
+
+    if (ptIdx < MAX_DAYSOC_POINTS) {
+      battDaySegmentPoints[segIdx][ptIdx].x = x;
+      battDaySegmentPoints[segIdx][ptIdx].y = y;
+      ptIdx++;
+    }
+  }
+  if (segIdx < MAX_BATT_CHART_SEGMENTS) {
+    lv_line_set_points(battDaySegment[segIdx], battDaySegmentPoints[segIdx], ptIdx);
+    lv_obj_set_style_line_color(battDaySegment[segIdx], segIsDischarging ? COLOR_RED : COLOR_BLUE_TIDE, 0);
+    lv_obj_clear_flag(battDaySegment[segIdx], LV_OBJ_FLAG_HIDDEN);
   }
 }
 
@@ -2977,6 +3161,9 @@ void setup() {
 
     if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine2Grid); }
     mqttClient.subscribe(subtopicLine2Grid);
+
+    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryDaySoc); }
+    mqttClient.subscribe(subtopicBatteryDaySoc);
     //Subscribe-only -- no mqttClient.beginMessage()/publish anywhere in this
     //sketch, on any topic. Unit 2 has no publish authority, by design.
   }
@@ -3048,6 +3235,16 @@ void loop() {
   if (g_wifiChangeRequested) {
     g_wifiChangeRequested = false;
     startChangeWifiFlow();
+  }
+
+  //Rebuild the Battery screen's curve when fresh data arrives WHILE
+  //already looking at that screen -- navBattery() handles the "just
+  //navigated there" case itself, so this only needs to cover staying on
+  //the screen as a new 30-min HA update comes in. Per request: no need
+  //to redraw a screen nobody's currently looking at.
+  if (g_daySocDirty && lv_scr_act() == scr_battery) {
+    g_daySocDirty = false;
+    rebuildBatteryDayCurve();
   }
 
   //Tide data only changes once a day; re-checking every minute (not
@@ -3292,28 +3489,54 @@ void loop() {
       updateOrbitDot(&orbitBattScreen, orbitDirection, orbitPercent);
     }
 
-    //Saved Today -- grounded in real state of charge instead of a single
-    //instantaneous discharge-power sample: energy actually withdrawn from
-    //the battery is (1 - SoC) x the real 18kWh pack capacity, so a fully
-    //charged battery always reads $0.00 saved, rising as it draws down.
-    //That energy is valued at a time-blended rate: today's fixed on-peak
-    //and off-peak hour totals (per request -- NOT hours elapsed so far,
-    //which would read as a pure 0.43492 off-peak rate all morning before
-    //the first on-peak window even starts) weighted by their real rates,
-    //so the blended rate always sits between $0.43492 and $0.65410,
-    //never pinned to either endpoint. Super off-peak hours still
-    //contribute nothing to the blend (that's charging, an expense, not a
-    //saving), and with no SoC reading yet (g_batterySoC == -1) this
-    //reads $0.
-    float dailyOnPeakHours, dailyOffPeakHours;
-    computeElapsedTierHours(tou.weekendOrHoliday, 24.0, &dailyOnPeakHours, &dailyOffPeakHours);
+    //Saved Today -- walks today's real g_daySoc* curve instead of a
+    //single instantaneous snapshot, so multiple charge/discharge cycles
+    //in one day all correctly contribute (a snapshot only ever sees the
+    //LAST cycle's state, silently losing an earlier cycle's savings if
+    //the battery recharged back to 100% in between).
+    //
+    //Each discharging segment's SoC drop is priced at the ACTUAL
+    //historical TOU tier for that segment's bucket (via
+    //computeTouStatus() on that bucket's own hour, today's real
+    //wday/month/day) -- we know exactly when it happened, so there's no
+    //need to estimate.
+    //
+    //Only when NO discharge has occurred yet today (e.g. early morning,
+    //battery has only charged so far during a super off-peak window) is
+    //there nothing "actual" to price yet: that net charged energy is
+    //valued at today's full-day blended rate instead, as a forward-
+    //looking estimate of what it'll be worth once it's eventually
+    //discharged. The moment even one real discharging segment shows up,
+    //that estimate is no longer needed at all -- exact TOU pricing
+    //supersedes it entirely, per request, rather than blending the two.
+    //hadRealDischargeDrop is determined by an actual measured SoC drop,
+    //not merely a bucket carrying the "Discharging" state label -- the
+    //day's very first bucket can be labeled Discharging (a momentary
+    //current reading below the threshold right at midnight) with no
+    //prior point to diff against, which would otherwise wrongly block
+    //the charge-estimate fallback below despite zero real savings ever
+    //being summed.
     float savedToday = 0;
-    if (g_batterySoC >= 0) {
-      float energyUsedKwh = (1.0 - g_batterySoC / 100.0) * BATTERY_CAPACITY_KWH;
-      float dailyHours = dailyOnPeakHours + dailyOffPeakHours;
-      if (dailyHours > 0) {
-        float blendedRate = (dailyOnPeakHours * RATE_ON_PEAK + dailyOffPeakHours * RATE_OFF_PEAK) / dailyHours;
-        savedToday = energyUsedKwh * blendedRate;
+    bool hadRealDischargeDrop = false;
+    for (int i = 1; i < g_daySocCount; i++) {
+      if (g_daySocState[i] != 2) continue;
+      int drop = (int)g_daySocValue[i - 1] - (int)g_daySocValue[i];
+      if (drop <= 0) continue;
+      hadRealDischargeDrop = true;
+      int bucketHour = constrain(g_daySocBucket[i] / 4, 0, 23);
+      TouStatus bucketTou = computeTouStatus(bucketHour, localTm.tm_wday, localTm.tm_mon + 1, localTm.tm_mday);
+      savedToday += (drop / 100.0) * BATTERY_CAPACITY_KWH * bucketTou.rate;
+    }
+    if (!hadRealDischargeDrop && g_daySocCount > 0) {
+      int netCharged = (int)g_daySocValue[g_daySocCount - 1] - (int)g_daySocValue[0];
+      if (netCharged > 0) {
+        float dailyOnPeakHours, dailyOffPeakHours;
+        computeElapsedTierHours(tou.weekendOrHoliday, 24.0, &dailyOnPeakHours, &dailyOffPeakHours);
+        float dailyHours = dailyOnPeakHours + dailyOffPeakHours;
+        if (dailyHours > 0) {
+          float blendedRate = (dailyOnPeakHours * RATE_ON_PEAK + dailyOffPeakHours * RATE_OFF_PEAK) / dailyHours;
+          savedToday = (netCharged / 100.0) * BATTERY_CAPACITY_KWH * blendedRate;
+        }
       }
     }
     char savedBuf[16];
