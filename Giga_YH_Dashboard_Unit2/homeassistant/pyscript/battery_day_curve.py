@@ -1,6 +1,9 @@
-# pyscript: publishes today's battery SoC + Charging/Discharging/Idle curve
-# to MQTT (retained), for the Giga YH Unit 2 dashboard's Battery screen
-# chart.
+# pyscript: publishes today's AND yesterday's battery SoC +
+# Charging/Discharging/Idle curve to MQTT (retained), for the Giga YH
+# Unit 2 dashboard's Battery screen chart and its Saved Today/Saved
+# Yesterday figures (the Arduino side prices each curve's discharging
+# segments against the real historical TOU tier -- see
+# computeSavedFromSocCurve() in Giga_YH_Dashboard_Unit2.ino).
 #
 # Entities: edit SOC_ENTITY/CHARGING_ENTITY/CURRENT_ENTITY below to match
 # your own BMS's actual entity IDs before running this -- the placeholders
@@ -41,6 +44,7 @@ CURRENT_ENTITY = "sensor.YOUR_BATTERY_CURRENT_ENTITY"
 DISCHARGE_CURRENT_THRESHOLD = -1.0  # Amps -- matches the existing condition's "below: -1"
 BUCKET_MINUTES = 15
 MQTT_TOPIC = "V1.0/Home/Battery/DaySOC"
+MQTT_TOPIC_YESTERDAY = "V1.0/Home/Battery/YesterdaySOC"
 
 STATE_IDLE = "0"
 STATE_CHARGING = "1"
@@ -63,25 +67,15 @@ def _value_at_or_before(state_list, target_time, cast):
     return result
 
 
-@time_trigger("cron(*/10 * * * *)")  # every 10 min
-@service
-def publish_battery_day_curve():
-    now = dt_util.now()  # timezone-AWARE, matching s.last_changed's own convention -- plain
-                          # datetime.datetime.now() is naive and can't be compared against it
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    soc_hist = task.executor(history.state_changes_during_period, hass, start, now, SOC_ENTITY)
-    charging_hist = task.executor(history.state_changes_during_period, hass, start, now, CHARGING_ENTITY)
-    current_hist = task.executor(history.state_changes_during_period, hass, start, now, CURRENT_ENTITY)
-
-    soc_states = soc_hist.get(SOC_ENTITY, [])
-    charging_states = charging_hist.get(CHARGING_ENTITY, [])
-    current_states = current_hist.get(CURRENT_ENTITY, [])
-
+def _build_soc_curve(start, end_inclusive, soc_states, charging_states, current_states):
+    # Walks [start, end_inclusive] in BUCKET_MINUTES steps, returning the
+    # "bucket:soc:state,..." payload string for that range. Shared by
+    # today's (end_inclusive=now, a partial day) and yesterday's
+    # (end_inclusive=23:45, the last bucket of a full closed day) curves.
     points = []
     t = start
     bucket = 0
-    while t <= now:
+    while t <= end_inclusive:
         soc = _value_at_or_before(soc_states, t, lambda v: round(float(v)))
         is_charging = _value_at_or_before(charging_states, t, lambda v: v == "on")
         current = _value_at_or_before(current_states, t, float)
@@ -99,5 +93,31 @@ def publish_battery_day_curve():
         t += datetime.timedelta(minutes=BUCKET_MINUTES)
         bucket += 1
 
-    payload = ",".join(points)
-    mqtt.publish(topic=MQTT_TOPIC, payload=payload, retain=True)
+    return ",".join(points)
+
+
+@time_trigger("cron(*/10 * * * *)")  # every 10 min
+@service
+def publish_battery_day_curve():
+    now = dt_util.now()  # timezone-AWARE, matching s.last_changed's own convention -- plain
+                          # datetime.datetime.now() is naive and can't be compared against it
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - datetime.timedelta(days=1)
+    yesterday_end = today_start - datetime.timedelta(minutes=BUCKET_MINUTES)  # yesterday's 23:45 bucket
+
+    # One history query spanning both days, rather than two separate
+    # queries -- _build_soc_curve() just needs a state list to search
+    # within, it doesn't care which day a given target_time falls on.
+    soc_hist = task.executor(history.state_changes_during_period, hass, yesterday_start, now, SOC_ENTITY)
+    charging_hist = task.executor(history.state_changes_during_period, hass, yesterday_start, now, CHARGING_ENTITY)
+    current_hist = task.executor(history.state_changes_during_period, hass, yesterday_start, now, CURRENT_ENTITY)
+
+    soc_states = soc_hist.get(SOC_ENTITY, [])
+    charging_states = charging_hist.get(CHARGING_ENTITY, [])
+    current_states = current_hist.get(CURRENT_ENTITY, [])
+
+    today_payload = _build_soc_curve(today_start, now, soc_states, charging_states, current_states)
+    yesterday_payload = _build_soc_curve(yesterday_start, yesterday_end, soc_states, charging_states, current_states)
+
+    mqtt.publish(topic=MQTT_TOPIC, payload=today_payload, retain=True)
+    mqtt.publish(topic=MQTT_TOPIC_YESTERDAY, payload=yesterday_payload, retain=True)

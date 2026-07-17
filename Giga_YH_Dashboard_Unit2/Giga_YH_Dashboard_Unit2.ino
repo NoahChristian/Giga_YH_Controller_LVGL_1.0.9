@@ -128,7 +128,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.52"
+#define VERSION_DASHBOARD "1.0.53"
 //version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
 //                Connection screen live (SSID/RSSI/broker state), everything
 //                else placeholder. Did not compile (LVGL v8-style input
@@ -785,6 +785,22 @@ uint32_t dsi_getDisplayYSize(void);
 //                 for now -- Unit 2 doesn't retain SoC history across a
 //                 day rollover, so a real prior-day total needs a
 //                 pyscript-side computation (deferred).
+//version 1.0.53 - Saved Yesterday's placeholder ("$5.55") is now real:
+//                 the framework used for today's curve is extended to
+//                 also publish yesterday's full-day curve
+//                 (V1.0/Home/Battery/YesterdaySOC, same pyscript
+//                 automation, same bucket:soc:state encoding) and the
+//                 Saved Today calc is factored out into
+//                 computeSavedFromSocCurve() so Saved Yesterday can
+//                 reuse the exact same discharge-segment/TOU-pricing
+//                 logic against g_yesterdaySoc* instead of g_daySoc*.
+//                 Priced using YESTERDAY's real wday/month/day (see new
+//                 getYesterdayLocalTm(), epoch-based so month/year
+//                 rollovers are handled correctly), not today's, since
+//                 the TOU schedule/holiday status can differ day to
+//                 day. onMqttMessage()'s DaySOC parsing logic is now
+//                 shared via parseSocCurvePayload() rather than
+//                 duplicated for the new topic.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -877,12 +893,22 @@ const char subtopicLine2Grid[] = "V1.0/Home/PowerFeeder/Line2Set";
 //in one day instead of just comparing current SoC to 100%.
 const char subtopicBatteryDaySoc[] = "V1.0/Home/Battery/DaySOC";
 
+//Yesterday's full-day curve, same encoding, published alongside today's
+//by the same pyscript automation (see battery_day_curve.py) -- used only
+//for the Saved Yesterday figure (see the calc in loop()), not charted.
+const char subtopicBatteryYesterdaySoc[] = "V1.0/Home/Battery/YesterdaySOC";
+
 #define MAX_DAYSOC_POINTS 96 //one point per 15-min bucket, full 24h day
 uint8_t g_daySocBucket[MAX_DAYSOC_POINTS];
 uint8_t g_daySocValue[MAX_DAYSOC_POINTS];   //SoC 0-100
 uint8_t g_daySocState[MAX_DAYSOC_POINTS];   //0 Idle, 1 Charging, 2 Discharging
 int g_daySocCount = 0;
 bool g_daySocDirty = false; //set on new MQTT data, cleared once the chart's been rebuilt from it
+
+uint8_t g_yesterdaySocBucket[MAX_DAYSOC_POINTS];
+uint8_t g_yesterdaySocValue[MAX_DAYSOC_POINTS];
+uint8_t g_yesterdaySocState[MAX_DAYSOC_POINTS];
+int g_yesterdaySocCount = 0;
 
 float g_batterySoC = -1.0; //-1 = no reading received yet
 int g_batteryState = 0;    //1 = Charging, -1 = Discharging, 0 = Idle/unknown
@@ -1106,6 +1132,44 @@ void computeElapsedTierHours(bool weekendOrHoliday, float uptoHour, float* outOn
   *outOffPeakHours = offPeak;
 }
 
+//Shared by Saved Today and Saved Yesterday (see the calcs in loop()):
+//walks a g_daySoc*-shaped curve and sums each discharging segment's SoC
+//drop, priced at the ACTUAL historical TOU tier for that segment's own
+//bucket -- so multiple charge/discharge cycles in one day all correctly
+//contribute (a single before/after snapshot only ever sees the LAST
+//cycle's state). If NO real discharge drop is found (only charging/idle
+//so far -- happens on a still-in-progress "today"; Saved Yesterday's
+//data is always a full closed day so this is extremely unlikely there),
+//falls back to valuing the net charged energy at the day's full blended
+//rate, as a forward-looking estimate of what it'll be worth once
+//discharged.
+float computeSavedFromSocCurve(uint8_t* bucketArr, uint8_t* valueArr, uint8_t* stateArr, int count, int wday, int month, int day, bool weekendOrHoliday) {
+  float saved = 0;
+  bool hadRealDischargeDrop = false;
+  for (int i = 1; i < count; i++) {
+    if (stateArr[i] != 2) continue;
+    int drop = (int)valueArr[i - 1] - (int)valueArr[i];
+    if (drop <= 0) continue;
+    hadRealDischargeDrop = true;
+    int bucketHour = constrain(bucketArr[i] / 4, 0, 23);
+    TouStatus bucketTou = computeTouStatus(bucketHour, wday, month, day);
+    saved += (drop / 100.0) * BATTERY_CAPACITY_KWH * bucketTou.rate;
+  }
+  if (!hadRealDischargeDrop && count > 0) {
+    int netCharged = (int)valueArr[count - 1] - (int)valueArr[0];
+    if (netCharged > 0) {
+      float onPeakHours, offPeakHours;
+      computeElapsedTierHours(weekendOrHoliday, 24.0, &onPeakHours, &offPeakHours);
+      float totalHours = onPeakHours + offPeakHours;
+      if (totalHours > 0) {
+        float blendedRate = (onPeakHours * RATE_ON_PEAK + offPeakHours * RATE_OFF_PEAK) / totalHours;
+        saved = (netCharged / 100.0) * BATTERY_CAPACITY_KWH * blendedRate;
+      }
+    }
+  }
+  return saved;
+}
+
 const char* touTierName(TouTier tier) {
   return tier == TOU_ON_PEAK ? "On-peak" : tier == TOU_SUPER_OFF_PEAK ? "Super off-peak" : "Off-peak";
 }
@@ -1289,6 +1353,7 @@ lv_obj_t* lbl_grid_l2_feeder;
 lv_obj_t* lbl_grid_l1_grid;
 lv_obj_t* lbl_grid_l2_grid;
 lv_obj_t* lbl_grid_saved;
+lv_obj_t* lbl_grid_saved_yesterday;
 lv_obj_t* pill_home_tou;
 lv_obj_t* pill_time_tou;
 lv_obj_t* pill_time_next;   //next-upcoming of the two other rates
@@ -1311,6 +1376,17 @@ char* getLocaltime(char buffer[]) {
 //string -- used for TOU tier computation and tide-table lookup.
 void getLocalTm(tm& t) {
   _rtc_localtime(time(NULL), &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+}
+
+//Yesterday's broken-down local time, for pricing the Saved Yesterday
+//curve's discharge segments at the TOU tier that actually applied on
+//that day (weekday/weekend and holiday status can differ from today's).
+//Subtracting a day from the epoch first (rather than subtracting 1 from
+//tm_mday by hand) means month/year rollovers are handled correctly by
+//_rtc_localtime() itself, not by fragile manual date arithmetic.
+void getYesterdayLocalTm(tm& t) {
+  time_t yesterday = time(NULL) - 86400;
+  _rtc_localtime(yesterday, &t, RTC_FULL_LEAP_YEAR_SUPPORT);
 }
 
 //"Tuesday, July 14" -- real weekday/date, replacing the old build-time
@@ -1534,6 +1610,35 @@ void dumpFramebufferToSerial() {
   Serial.println("FBEND");
 }
 
+//Shared parser for both subtopicBatteryDaySoc and subtopicBatteryYesterdaySoc
+//(same "bucket:soc:state,bucket:soc:state,..." encoding, see
+//battery_day_curve.py). Manual parse, not strtok -- strtok's shared
+//static state doesn't nest safely against anything else on this board
+//that might also parse a string between calls, and this format is
+//simple enough that hand-walking it is barely more code. Returns the
+//number of points parsed.
+int parseSocCurvePayload(const char* payload, uint8_t* bucketOut, uint8_t* valueOut, uint8_t* stateOut, int maxPoints) {
+  int count = 0;
+  const char* p = payload;
+  while (*p && count < maxPoints) {
+    int bucket = atoi(p);
+    const char* colon1 = strchr(p, ':');
+    if (!colon1) break;
+    int soc = atoi(colon1 + 1);
+    const char* colon2 = strchr(colon1 + 1, ':');
+    if (!colon2) break;
+    int state = atoi(colon2 + 1);
+    bucketOut[count] = (uint8_t)constrain(bucket, 0, 95);
+    valueOut[count] = (uint8_t)constrain(soc, 0, 100);
+    stateOut[count] = (uint8_t)constrain(state, 0, 2);
+    count++;
+    const char* comma = strchr(colon2, ',');
+    if (!comma) break;
+    p = comma + 1;
+  }
+  return count;
+}
+
 //---- MQTT message handler (subscribe-only -- this never publishes) ----
 void onMqttMessage(int messageSize) {
   //1024, not the 256 every other topic here has gotten away with -- the
@@ -1632,30 +1737,19 @@ void onMqttMessage(int messageSize) {
     }
     while (mqttClient.available()) mqttClient.read();
     tbuf[size] = '\0';
-    //Manual parse, not strtok -- strtok's shared static state doesn't
-    //nest safely against anything else on this board that might also
-    //parse a string between calls, and this format ("bucket:soc:state,"
-    //repeated) is simple enough that hand-walking it is barely more code.
-    g_daySocCount = 0;
-    const char* p = tbuf;
-    while (*p && g_daySocCount < MAX_DAYSOC_POINTS) {
-      int bucket = atoi(p);
-      const char* colon1 = strchr(p, ':');
-      if (!colon1) break;
-      int soc = atoi(colon1 + 1);
-      const char* colon2 = strchr(colon1 + 1, ':');
-      if (!colon2) break;
-      int state = atoi(colon2 + 1);
-      g_daySocBucket[g_daySocCount] = (uint8_t)constrain(bucket, 0, 95);
-      g_daySocValue[g_daySocCount] = (uint8_t)constrain(soc, 0, 100);
-      g_daySocState[g_daySocCount] = (uint8_t)constrain(state, 0, 2);
-      g_daySocCount++;
-      const char* comma = strchr(colon2, ',');
-      if (!comma) break;
-      p = comma + 1;
-    }
+    g_daySocCount = parseSocCurvePayload(tbuf, g_daySocBucket, g_daySocValue, g_daySocState, MAX_DAYSOC_POINTS);
     g_daySocDirty = true;
     if (trace) { Serial.print("Battery DaySOC points = "); Serial.println(g_daySocCount); }
+
+  } else if (topic.equals(subtopicBatteryYesterdaySoc)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    g_yesterdaySocCount = parseSocCurvePayload(tbuf, g_yesterdaySocBucket, g_yesterdaySocValue, g_yesterdaySocState, MAX_DAYSOC_POINTS);
+    if (trace) { Serial.print("Battery YesterdaySOC points = "); Serial.println(g_yesterdaySocCount); }
   }
 }
 
@@ -2786,13 +2880,14 @@ void buildGridScreen() {
   lv_obj_t* saved_lbl = makeLabel(col_saved, "Saved today", COLOR_TEXT_DIM);
   lv_obj_align(saved_lbl, LV_ALIGN_TOP_MID, 0, 34);
 
-  //Saved Yesterday -- static placeholder per request until pyscript is
-  //extended to compute and publish a real prior-day total (HA has the
-  //full day's history already; Unit 2 doesn't compute or store it once
-  //the day rolls over, so there's nothing real to show here yet).
+  //Saved Yesterday -- now a real computed value too (see the calc in
+  //loop()), walking g_yesterdaySoc* the same way Saved Today walks
+  //g_daySoc*, just against a full closed day instead of one still in
+  //progress. subtopicBatteryYesterdaySoc is published by the same
+  //pyscript automation as today's curve.
   lv_obj_t* col_saved_yesterday = makeColumn(scr_grid, 420, 350, 280, 68);
-  lv_obj_t* lbl_saved_yesterday = makeLabel(col_saved_yesterday, "$5.55", COLOR_STATUS_OK);
-  lv_obj_align(lbl_saved_yesterday, LV_ALIGN_TOP_MID, 0, 0);
+  lbl_grid_saved_yesterday = makeLabel(col_saved_yesterday, "$0.00", COLOR_STATUS_OK);
+  lv_obj_align(lbl_grid_saved_yesterday, LV_ALIGN_TOP_MID, 0, 0);
   lv_obj_t* saved_yesterday_lbl = makeLabel(col_saved_yesterday, "Saved yesterday", COLOR_TEXT_DIM);
   lv_obj_align(saved_yesterday_lbl, LV_ALIGN_TOP_MID, 0, 34);
 }
@@ -3164,6 +3259,9 @@ void setup() {
 
     if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryDaySoc); }
     mqttClient.subscribe(subtopicBatteryDaySoc);
+
+    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryYesterdaySoc); }
+    mqttClient.subscribe(subtopicBatteryYesterdaySoc);
     //Subscribe-only -- no mqttClient.beginMessage()/publish anywhere in this
     //sketch, on any topic. Unit 2 has no publish authority, by design.
   }
@@ -3493,54 +3591,27 @@ void loop() {
     //single instantaneous snapshot, so multiple charge/discharge cycles
     //in one day all correctly contribute (a snapshot only ever sees the
     //LAST cycle's state, silently losing an earlier cycle's savings if
-    //the battery recharged back to 100% in between).
-    //
-    //Each discharging segment's SoC drop is priced at the ACTUAL
-    //historical TOU tier for that segment's bucket (via
-    //computeTouStatus() on that bucket's own hour, today's real
-    //wday/month/day) -- we know exactly when it happened, so there's no
-    //need to estimate.
-    //
-    //Only when NO discharge has occurred yet today (e.g. early morning,
-    //battery has only charged so far during a super off-peak window) is
-    //there nothing "actual" to price yet: that net charged energy is
-    //valued at today's full-day blended rate instead, as a forward-
-    //looking estimate of what it'll be worth once it's eventually
-    //discharged. The moment even one real discharging segment shows up,
-    //that estimate is no longer needed at all -- exact TOU pricing
-    //supersedes it entirely, per request, rather than blending the two.
-    //hadRealDischargeDrop is determined by an actual measured SoC drop,
-    //not merely a bucket carrying the "Discharging" state label -- the
-    //day's very first bucket can be labeled Discharging (a momentary
-    //current reading below the threshold right at midnight) with no
-    //prior point to diff against, which would otherwise wrongly block
-    //the charge-estimate fallback below despite zero real savings ever
-    //being summed.
-    float savedToday = 0;
-    bool hadRealDischargeDrop = false;
-    for (int i = 1; i < g_daySocCount; i++) {
-      if (g_daySocState[i] != 2) continue;
-      int drop = (int)g_daySocValue[i - 1] - (int)g_daySocValue[i];
-      if (drop <= 0) continue;
-      hadRealDischargeDrop = true;
-      int bucketHour = constrain(g_daySocBucket[i] / 4, 0, 23);
-      TouStatus bucketTou = computeTouStatus(bucketHour, localTm.tm_wday, localTm.tm_mon + 1, localTm.tm_mday);
-      savedToday += (drop / 100.0) * BATTERY_CAPACITY_KWH * bucketTou.rate;
-    }
-    if (!hadRealDischargeDrop && g_daySocCount > 0) {
-      int netCharged = (int)g_daySocValue[g_daySocCount - 1] - (int)g_daySocValue[0];
-      if (netCharged > 0) {
-        float dailyOnPeakHours, dailyOffPeakHours;
-        computeElapsedTierHours(tou.weekendOrHoliday, 24.0, &dailyOnPeakHours, &dailyOffPeakHours);
-        float dailyHours = dailyOnPeakHours + dailyOffPeakHours;
-        if (dailyHours > 0) {
-          float blendedRate = (dailyOnPeakHours * RATE_ON_PEAK + dailyOffPeakHours * RATE_OFF_PEAK) / dailyHours;
-          savedToday = (netCharged / 100.0) * BATTERY_CAPACITY_KWH * blendedRate;
-        }
-      }
-    }
+    //the battery recharged back to 100% in between). See
+    //computeSavedFromSocCurve() for the shared logic (also used by Saved
+    //Yesterday below): each discharging segment is priced at the actual
+    //historical TOU tier for that segment's own bucket, falling back to
+    //today's blended rate only if no real discharge has happened yet.
+    float savedToday = computeSavedFromSocCurve(g_daySocBucket, g_daySocValue, g_daySocState, g_daySocCount, localTm.tm_wday, localTm.tm_mon + 1, localTm.tm_mday, tou.weekendOrHoliday);
     char savedBuf[16];
     sprintf(savedBuf, "$%.2f", savedToday);
     lv_label_set_text(lbl_grid_saved, savedBuf);
+
+    //Saved Yesterday -- same curve-walking calc as Saved Today, just
+    //against g_yesterdaySoc* (a full, already-closed day, published
+    //alongside today's curve by the same pyscript automation) and
+    //priced using YESTERDAY's real wday/month/day, not today's -- the
+    //TOU tier schedule and holiday status can differ day to day.
+    tm yesterdayTm;
+    getYesterdayLocalTm(yesterdayTm);
+    bool yesterdayWeekendOrHoliday = (yesterdayTm.tm_wday == 0 || yesterdayTm.tm_wday == 6) || isTouHoliday(yesterdayTm.tm_mon + 1, yesterdayTm.tm_mday);
+    float savedYesterday = computeSavedFromSocCurve(g_yesterdaySocBucket, g_yesterdaySocValue, g_yesterdaySocState, g_yesterdaySocCount, yesterdayTm.tm_wday, yesterdayTm.tm_mon + 1, yesterdayTm.tm_mday, yesterdayWeekendOrHoliday);
+    char savedYesterdayBuf[16];
+    sprintf(savedYesterdayBuf, "$%.2f", savedYesterday);
+    lv_label_set_text(lbl_grid_saved_yesterday, savedYesterdayBuf);
   }
 }
