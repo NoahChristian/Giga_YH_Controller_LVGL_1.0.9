@@ -128,7 +128,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.53"
+#define VERSION_DASHBOARD "1.0.54"
 //version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
 //                Connection screen live (SSID/RSSI/broker state), everything
 //                else placeholder. Did not compile (LVGL v8-style input
@@ -801,6 +801,43 @@ uint32_t dsi_getDisplayYSize(void);
 //                 day. onMqttMessage()'s DaySOC parsing logic is now
 //                 shared via parseSocCurvePayload() rather than
 //                 duplicated for the new topic.
+//version 1.0.54 - MQTT broker host/username/password are now runtime-
+//                 editable (were compile-time HOME_ASSISTANT_IP/
+//                 MQTT_USERNAME/MQTT_PASSWORD consts), same
+//                 architecture as the existing WiFi setup flow: KVStore
+//                 persistence, a bounded stored-then-secrets.h connect
+//                 attempt at boot, and a manual 3-screen setup flow
+//                 (host -> username -> password) reachable via a new
+//                 "Change MQTT" button on the Connection screen or
+//                 automatically if both boot-time attempts fail --
+//                 previously a failed MQTT connect just showed a
+//                 permanent, unfixable "Not connected" with no path to
+//                 recover without a reflash. The host screen uses a
+//                 numeric/phone-pad keyboard (LV_KEYBOARD_MODE_NUMBER)
+//                 instead of the full alphanumeric one, since a broker
+//                 IP is only ever digits and dots. Priority order is
+//                 deliberately reversed from WiFi's (stored settings
+//                 tried FIRST, secrets.h as fallback) since the
+//                 scenario this exists for is specifically "the
+//                 broker's IP moved and secrets.h is now stale."
+//                 Also fixed a real (pre-existing, now-shared) bug
+//                 caught by real-hardware testing this: makeLabel() sets
+//                 no width/wrap, so wifiConnectStatusLbl's "Couldn't
+//                 connect..." error text was silently running off the
+//                 screen's right edge with no wrapping -- never actually
+//                 visible before since the WiFi version's message just
+//                 barely fit, but mqttConnectStatusLbl's one-character-
+//                 longer message tipped it over into visible clipping.
+//                 Both labels now get an explicit width + WRAP long-mode.
+//                 Verified end-to-end on real hardware: wrong-IP entry
+//                 shows the (now-wrapped) error and allows retry;
+//                 correcting it connects, subscribes, and returns home;
+//                 a forced reflash afterward confirmed via serial log
+//                 ("Connected to MQTT broker (stored settings)") that
+//                 the KVStore-saved settings really do take priority
+//                 over secrets.h on the next boot, not just coincidentally
+//                 still working because both happen to hold the same
+//                 values.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -842,6 +879,31 @@ bool loadWifiCredentials(char* sOut, size_t sCap, char* pOut, size_t pCap) {
   int rc2 = kv_get(KV_KEY_WIFI_PASS, pOut, pCap, &actualP);
   return rc1 == 0 && rc2 == 0 && actualS > 0 && actualP > 0;
 }
+
+//Same pattern, for the MQTT broker's host/username/password -- lets a
+//moved broker IP or changed auth be corrected from the device itself
+//(Connection screen's "Change MQTT" button, or shown automatically if
+//boot-time connect fails) instead of needing a reflash with an updated
+//arduino_secrets.h.
+#define KV_KEY_MQTT_HOST "/kv/mqtt_host"
+#define KV_KEY_MQTT_USER "/kv/mqtt_user"
+#define KV_KEY_MQTT_PASS "/kv/mqtt_pass"
+
+bool saveMqttCredentials(const char* host, const char* user, const char* pass) {
+  int rc1 = kv_set(KV_KEY_MQTT_HOST, host, strlen(host) + 1, 0);
+  int rc2 = kv_set(KV_KEY_MQTT_USER, user, strlen(user) + 1, 0);
+  int rc3 = kv_set(KV_KEY_MQTT_PASS, pass, strlen(pass) + 1, 0);
+  return rc1 == 0 && rc2 == 0 && rc3 == 0;
+}
+
+bool loadMqttCredentials(char* hostOut, size_t hostCap, char* userOut, size_t userCap, char* passOut, size_t passCap) {
+  size_t actualH = 0, actualU = 0, actualP = 0;
+  int rc1 = kv_get(KV_KEY_MQTT_HOST, hostOut, hostCap, &actualH);
+  int rc2 = kv_get(KV_KEY_MQTT_USER, userOut, userCap, &actualU);
+  int rc3 = kv_get(KV_KEY_MQTT_PASS, passOut, passCap, &actualP);
+  return rc1 == 0 && rc2 == 0 && rc3 == 0 && actualH > 0 && actualU > 0 && actualP > 0;
+}
+
 WiFiUDP Udp;
 unsigned int localPort = 2391; //different from Unit 1's 2390 in case both run on the same LAN segment during bring-up
 constexpr auto timeServer{ "pool.ntp.org" };
@@ -853,7 +915,13 @@ Arduino_GigaDisplayTouch TouchDetector;
 
 WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
-const char broker[] = HOME_ASSISTANT_IP;
+//Runtime-editable now (was a compile-time HOME_ASSISTANT_IP const) -- see
+//connectToMqttBroker()/saveMqttCredentials() and the MQTT setup screens
+//below. Sized like the WiFi ssid/password buffers (64/33/64), generous
+//past secrets.h's own compile-time strings.
+char mqttHost[64];
+char mqttUserRuntime[33];
+char mqttPassRuntime[64];
 int port = 1883;
 
 //Subscribe-only, per UNIT_NUMBER 2 -- this device never publishes anything,
@@ -1229,6 +1297,9 @@ lv_obj_t* scr_grid;
 lv_obj_t* scr_almanac;
 lv_obj_t* scr_wifi_scan;
 lv_obj_t* scr_wifi_password;
+lv_obj_t* scr_mqtt_host;
+lv_obj_t* scr_mqtt_username;
+lv_obj_t* scr_mqtt_password;
 
 //---- WiFi setup flow state ----
 #define MAX_WIFI_SCAN_RESULTS 20
@@ -1291,6 +1362,31 @@ lv_obj_t* wifiPasswordSsidLbl;
 lv_obj_t* wifiPasswordTextarea;
 lv_obj_t* wifiKeyboard;
 lv_obj_t* wifiConnectStatusLbl;
+
+//---- MQTT setup flow state (same architecture as the WiFi flow above --
+//see its comments for why the reentrancy-safe flag-deferred pattern is
+//needed at all). Three sequential screens (host -> username -> password)
+//instead of WiFi's scan-list-then-password, since there's no equivalent
+//of "scan for networks" for a broker -- the host has to be typed.
+bool g_awaitingManualMqttSetup = false;
+//Same purpose as g_manualSetupIsRuntimeChange: gates whether the host
+//screen's "< Cancel" actually exits the wait loop (only meaningful
+//during a live "Change MQTT", where a working connection already
+//exists to cancel back to).
+bool g_mqttManualSetupIsRuntimeChange = false;
+bool g_mqttChangeRequested = false;
+bool g_pendingMqttAttempt = false;
+char g_pendingMqttHost[64];
+char g_pendingMqttUser[33];
+char g_pendingMqttPass[64];
+
+lv_obj_t* mqttHostTextarea;
+lv_obj_t* mqttHostKeyboard;
+lv_obj_t* mqttUsernameTextarea;
+lv_obj_t* mqttUsernameKeyboard;
+lv_obj_t* mqttPasswordTextarea;
+lv_obj_t* mqttPasswordKeyboard;
+lv_obj_t* mqttConnectStatusLbl;
 
 //labels/widgets that need periodic/live updates after screen build
 lv_obj_t* lbl_home_clock;
@@ -1502,6 +1598,78 @@ bool connectToWiFi(void) {
     Serial.println("secrets.h network not reachable, no stored credentials to fall back to");
   }
 
+  return false;
+}
+
+//Single attempt, no retry loop -- mqttClient.connect() already has its
+//own internal timeout, and unlike WiFi this doesn't need a multi-attempt
+//settle window.
+bool tryConnectMqtt(const char* host, const char* user, const char* pass) {
+  mqttClient.setId("GigaYH_Unit2");
+  mqttClient.setUsernamePassword(user, pass);
+  return mqttClient.connect(host, port);
+}
+
+//Shared by the boot-time path and the manual MQTT setup flow, so both
+//stay in sync with whatever topics this sketch actually subscribes to.
+void subscribeAllMqttTopics() {
+  mqttClient.onMessage(onMqttMessage);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatterySoC); }
+  mqttClient.subscribe(subtopicBatterySoC);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryAction); }
+  mqttClient.subscribe(subtopicBatteryAction);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine1); }
+  mqttClient.subscribe(subtopicLine1);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine2); }
+  mqttClient.subscribe(subtopicLine2);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine1Grid); }
+  mqttClient.subscribe(subtopicLine1Grid);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine2Grid); }
+  mqttClient.subscribe(subtopicLine2Grid);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryDaySoc); }
+  mqttClient.subscribe(subtopicBatteryDaySoc);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryYesterdaySoc); }
+  mqttClient.subscribe(subtopicBatteryYesterdaySoc);
+  //Subscribe-only -- no mqttClient.beginMessage()/publish anywhere in this
+  //sketch, on any topic. Unit 2 has no publish authority, by design.
+}
+
+//Boot-time MQTT connect. Deliberately the OPPOSITE priority order from
+//connectToWiFi(): tries the STORED (KVStore) broker settings FIRST,
+//falling back to secrets.h only if nothing's stored yet or the stored
+//settings fail. WiFi tries secrets.h first because a stale SSID just
+//means "try a different known network" -- but the scenario this exists
+//for is specifically "the broker's IP moved and secrets.h is now
+//stale," so a previously-corrected KVStore value should be trusted over
+//the compiled-in default, not the other way around.
+bool connectToMqttBroker(void) {
+  char storedHost[64], storedUser[33], storedPass[64];
+  if (loadMqttCredentials(storedHost, sizeof(storedHost), storedUser, sizeof(storedUser), storedPass, sizeof(storedPass))) {
+    if (tryConnectMqtt(storedHost, storedUser, storedPass)) {
+      strncpy(mqttHost, storedHost, sizeof(mqttHost) - 1); mqttHost[sizeof(mqttHost) - 1] = '\0';
+      strncpy(mqttUserRuntime, storedUser, sizeof(mqttUserRuntime) - 1); mqttUserRuntime[sizeof(mqttUserRuntime) - 1] = '\0';
+      strncpy(mqttPassRuntime, storedPass, sizeof(mqttPassRuntime) - 1); mqttPassRuntime[sizeof(mqttPassRuntime) - 1] = '\0';
+      if (verbosity > 0) Serial.println("Connected to MQTT broker (stored settings)");
+      return true;
+    }
+    if (verbosity > 0) Serial.println("Stored MQTT settings failed -- trying secrets.h");
+  }
+
+  strncpy(mqttHost, HOME_ASSISTANT_IP, sizeof(mqttHost) - 1); mqttHost[sizeof(mqttHost) - 1] = '\0';
+  strncpy(mqttUserRuntime, MQTT_USERNAME, sizeof(mqttUserRuntime) - 1); mqttUserRuntime[sizeof(mqttUserRuntime) - 1] = '\0';
+  strncpy(mqttPassRuntime, MQTT_PASSWORD, sizeof(mqttPassRuntime) - 1); mqttPassRuntime[sizeof(mqttPassRuntime) - 1] = '\0';
+  if (tryConnectMqtt(mqttHost, mqttUserRuntime, mqttPassRuntime)) {
+    if (verbosity > 0) Serial.println("Connected to MQTT broker (secrets.h)");
+    return true;
+  }
   return false;
 }
 
@@ -2117,6 +2285,11 @@ void navConnection(lv_event_t* e) {
     g_manualSetupIsRuntimeChange = false;
     g_awaitingManualWifiSetup = false;
   }
+  //Same pattern, for the MQTT host screen's "< Cancel" button.
+  if (g_mqttManualSetupIsRuntimeChange) {
+    g_mqttManualSetupIsRuntimeChange = false;
+    g_awaitingManualMqttSetup = false;
+  }
   lv_scr_load(scr_connection);
 }
 void navBattery(lv_event_t* e) {
@@ -2256,6 +2429,88 @@ void onWifiNetworkSelected(lv_event_t* e) {
     g_pendingAttemptPassword[0] = '\0';
     g_pendingWifiAttempt = true;
   }
+}
+
+//---- MQTT manual setup: host + username + password, three screens ----
+//Reached when connectToMqttBroker() fails both its attempts (stored
+//settings, then secrets.h), or via the Connection screen's "Change
+//MQTT" button. Same reentrancy-safe flag-deferred pattern as the WiFi
+//flow throughout -- see g_wifiChangeRequested's comment for why.
+
+void navMqttHostScreen(lv_event_t* e) { lv_scr_load(scr_mqtt_host); }
+void navMqttUsernameScreen(lv_event_t* e) { lv_scr_load(scr_mqtt_username); }
+
+void onChangeMqttClicked(lv_event_t* e) {
+  g_mqttChangeRequested = true;
+}
+
+//Connection screen's "Change MQTT" button, run from loop() (see the
+//g_mqttChangeRequested check there) -- never called directly from the
+//click callback itself, same reason as startChangeWifiFlow().
+void startChangeMqttFlow() {
+  g_mqttManualSetupIsRuntimeChange = true;
+  g_awaitingManualMqttSetup = true;
+  lv_textarea_set_text(mqttHostTextarea, mqttHost);  //prefill with the current value for editing
+  lv_scr_load(scr_mqtt_host);
+  while (g_awaitingManualMqttSetup) {
+    lv_timer_handler();
+    serviceDevCommands();
+    if (g_pendingMqttAttempt) {
+      g_pendingMqttAttempt = false;
+      attemptMqttConnectFromSetup(g_pendingMqttHost, g_pendingMqttUser, g_pendingMqttPass);
+    }
+    delay(5);
+  }
+}
+
+//Called only from the manual-setup wait loop itself (see
+//g_pendingMqttAttempt), never directly from an event callback -- same
+//nesting hazard as attemptWifiConnectFromSetup().
+void attemptMqttConnectFromSetup(const char* host, const char* user, const char* pass) {
+  lv_obj_clear_flag(mqttConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_text(mqttConnectStatusLbl, "Connecting...");
+  lv_obj_set_style_text_color(mqttConnectStatusLbl, COLOR_AMBER, 0);
+  lv_scr_load(scr_mqtt_password);  //status is shown wherever the flow ends up, same as the WiFi password screen
+  forcePaint();
+
+  if (tryConnectMqtt(host, user, pass)) {
+    strncpy(mqttHost, host, sizeof(mqttHost) - 1); mqttHost[sizeof(mqttHost) - 1] = '\0';
+    strncpy(mqttUserRuntime, user, sizeof(mqttUserRuntime) - 1); mqttUserRuntime[sizeof(mqttUserRuntime) - 1] = '\0';
+    strncpy(mqttPassRuntime, pass, sizeof(mqttPassRuntime) - 1); mqttPassRuntime[sizeof(mqttPassRuntime) - 1] = '\0';
+    saveMqttCredentials(host, user, pass);
+    subscribeAllMqttTopics();
+    g_awaitingManualMqttSetup = false;
+    lv_scr_load(scr_home);
+  } else {
+    lv_label_set_text(mqttConnectStatusLbl, "Couldn't connect. Check the broker IP and try again.");
+    lv_obj_set_style_text_color(mqttConnectStatusLbl, COLOR_RED, 0);
+  }
+}
+
+//Only records what to try -- see g_pendingMqttAttempt's comment for why
+//this can't call attemptMqttConnectFromSetup() directly.
+void onMqttHostSubmit(lv_event_t* e) {
+  const char* h = lv_textarea_get_text(mqttHostTextarea);
+  strncpy(g_pendingMqttHost, h, sizeof(g_pendingMqttHost) - 1);
+  g_pendingMqttHost[sizeof(g_pendingMqttHost) - 1] = '\0';
+  lv_textarea_set_text(mqttUsernameTextarea, mqttUserRuntime);  //prefill with the current value
+  lv_scr_load(scr_mqtt_username);
+}
+
+void onMqttUsernameSubmit(lv_event_t* e) {
+  const char* u = lv_textarea_get_text(mqttUsernameTextarea);
+  strncpy(g_pendingMqttUser, u, sizeof(g_pendingMqttUser) - 1);
+  g_pendingMqttUser[sizeof(g_pendingMqttUser) - 1] = '\0';
+  lv_textarea_set_text(mqttPasswordTextarea, mqttPassRuntime);  //prefill with the current value
+  lv_obj_add_flag(mqttConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  lv_scr_load(scr_mqtt_password);
+}
+
+void onMqttPasswordSubmit(lv_event_t* e) {
+  const char* p = lv_textarea_get_text(mqttPasswordTextarea);
+  strncpy(g_pendingMqttPass, p, sizeof(g_pendingMqttPass) - 1);
+  g_pendingMqttPass[sizeof(g_pendingMqttPass) - 1] = '\0';
+  g_pendingMqttAttempt = true;
 }
 
 //Clears and rebuilds the scrollable row list from a fresh
@@ -2403,6 +2658,13 @@ void buildWifiPasswordScreen() {
   lv_obj_add_event_cb(wifiPasswordTextarea, onWifiPasswordSubmit, LV_EVENT_READY, NULL);
 
   wifiConnectStatusLbl = makeLabel(scr_wifi_password, "", COLOR_RED, 40, 137);
+  //makeLabel() sets no width/wrap, so long status text (the "Couldn't
+  //connect..." error) was silently running off the 800px screen edge
+  //with no wrapping at all -- caught on real hardware testing the MQTT
+  //setup screens below, which share this exact pattern. Explicit width +
+  //wrap fixes both.
+  lv_obj_set_width(wifiConnectStatusLbl, 720);
+  lv_label_set_long_mode(wifiConnectStatusLbl, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_add_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
 
   wifiKeyboard = lv_keyboard_create(scr_wifi_password);
@@ -2424,6 +2686,97 @@ void buildWifiPasswordScreen() {
   //height instead of fighting the widget's own docking behavior with a
   //fixed lv_obj_set_pos.
   lv_obj_align(wifiKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+}
+
+//---- MQTT manual setup: host + username + password screens ----
+//Host uses a numeric/phone-pad keyboard (LV_KEYBOARD_MODE_NUMBER --
+//digits, ".", backspace, OK) instead of the full alphanumeric one,
+//since a broker IP is only ever digits and dots. accepted_chars is a
+//second layer on top of that (belt-and-suspenders against the
+//keyboard's own "ABC" mode-switch button).
+void buildMqttHostScreen() {
+  scr_mqtt_host = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_mqtt_host);
+  lv_label_set_text(back, "< Cancel");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 18);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navConnection, LV_EVENT_CLICKED, NULL);
+
+  makeLabel(scr_mqtt_host, "MQTT broker IP address", COLOR_TEXT_MUTED, 40, 50);
+
+  mqttHostTextarea = lv_textarea_create(scr_mqtt_host);
+  lv_obj_set_size(mqttHostTextarea, 720, 46);
+  lv_obj_set_pos(mqttHostTextarea, 40, 82);
+  lv_textarea_set_one_line(mqttHostTextarea, true);
+  lv_textarea_set_max_length(mqttHostTextarea, 63);
+  lv_textarea_set_accepted_chars(mqttHostTextarea, "0123456789.");
+  lv_obj_add_event_cb(mqttHostTextarea, onMqttHostSubmit, LV_EVENT_READY, NULL);
+
+  mqttHostKeyboard = lv_keyboard_create(scr_mqtt_host);
+  lv_obj_set_size(mqttHostKeyboard, 800, 260);
+  lv_keyboard_set_mode(mqttHostKeyboard, LV_KEYBOARD_MODE_NUMBER);
+  lv_keyboard_set_textarea(mqttHostKeyboard, mqttHostTextarea);
+  //Sticky-bottom-alignment fix -- see the identical comment on wifiKeyboard.
+  lv_obj_align(mqttHostKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+}
+
+void buildMqttUsernameScreen() {
+  scr_mqtt_username = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_mqtt_username);
+  lv_label_set_text(back, "< Back");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 18);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navMqttHostScreen, LV_EVENT_CLICKED, NULL);
+
+  makeLabel(scr_mqtt_username, "MQTT username", COLOR_TEXT_MUTED, 40, 50);
+
+  mqttUsernameTextarea = lv_textarea_create(scr_mqtt_username);
+  lv_obj_set_size(mqttUsernameTextarea, 720, 46);
+  lv_obj_set_pos(mqttUsernameTextarea, 40, 82);
+  lv_textarea_set_one_line(mqttUsernameTextarea, true);
+  lv_textarea_set_max_length(mqttUsernameTextarea, 32);
+  lv_obj_add_event_cb(mqttUsernameTextarea, onMqttUsernameSubmit, LV_EVENT_READY, NULL);
+
+  mqttUsernameKeyboard = lv_keyboard_create(scr_mqtt_username);
+  lv_obj_set_size(mqttUsernameKeyboard, 800, 260);
+  lv_keyboard_set_textarea(mqttUsernameKeyboard, mqttUsernameTextarea);
+  lv_obj_align(mqttUsernameKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+}
+
+void buildMqttPasswordScreen() {
+  scr_mqtt_password = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_mqtt_password);
+  lv_label_set_text(back, "< Back");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 18);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navMqttUsernameScreen, LV_EVENT_CLICKED, NULL);
+
+  makeLabel(scr_mqtt_password, "MQTT password", COLOR_TEXT_MUTED, 40, 50);
+
+  mqttPasswordTextarea = lv_textarea_create(scr_mqtt_password);
+  lv_obj_set_size(mqttPasswordTextarea, 720, 46);
+  lv_obj_set_pos(mqttPasswordTextarea, 40, 82);
+  //Plain text, not password-masked -- same rationale/precedent as the
+  //WiFi password field (see buildWifiPasswordScreen()'s comment).
+  lv_textarea_set_one_line(mqttPasswordTextarea, true);
+  lv_textarea_set_max_length(mqttPasswordTextarea, 63);
+  lv_obj_add_event_cb(mqttPasswordTextarea, onMqttPasswordSubmit, LV_EVENT_READY, NULL);
+
+  mqttConnectStatusLbl = makeLabel(scr_mqtt_password, "", COLOR_RED, 40, 137);
+  //See the identical fix/comment on wifiConnectStatusLbl -- makeLabel()
+  //sets no width/wrap, so this ran off the screen edge uncaught until a
+  //real-hardware capture showed it clipping mid-sentence.
+  lv_obj_set_width(mqttConnectStatusLbl, 720);
+  lv_label_set_long_mode(mqttConnectStatusLbl, LV_LABEL_LONG_MODE_WRAP);
+  lv_obj_add_flag(mqttConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+
+  mqttPasswordKeyboard = lv_keyboard_create(scr_mqtt_password);
+  lv_obj_set_size(mqttPasswordKeyboard, 800, 260);
+  lv_keyboard_set_textarea(mqttPasswordKeyboard, mqttPasswordTextarea);
+  lv_obj_align(mqttPasswordKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
 }
 
 //---- Home screen ----
@@ -2717,6 +3070,14 @@ void buildConnectionScreen() {
   lv_obj_align(changeWifiPill, LV_ALIGN_BOTTOM_LEFT, 40, -30);
   lv_obj_add_flag(changeWifiPill, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(changeWifiPill, onChangeWifiClicked, LV_EVENT_CLICKED, NULL);
+
+  //Same pattern, for correcting a moved broker IP or changed MQTT auth
+  //without a reflash -- placed bottom-right, mirroring Change WiFi's
+  //bottom-left position.
+  lv_obj_t* changeMqttPill = makeAutoPill(scr_connection, lv_color_hex(0x17191c), COLOR_TEXT_MUTED, "Change\nMQTT", 20, 90);
+  lv_obj_align(changeMqttPill, LV_ALIGN_BOTTOM_RIGHT, -40, -30);
+  lv_obj_add_flag(changeMqttPill, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(changeMqttPill, onChangeMqttClicked, LV_EVENT_CLICKED, NULL);
 }
 
 //---- Battery screen ----
@@ -3176,6 +3537,9 @@ void setup() {
   buildAlmanacScreen();
   buildWifiScanScreen();
   buildWifiPasswordScreen();
+  buildMqttHostScreen();
+  buildMqttUsernameScreen();
+  buildMqttPasswordScreen();
   lv_scr_load(scr_home);
   lv_timer_handler(); //don't leave the screen dark while WiFi connects
   //Home is already visible at this point, so the dot/label would still
@@ -3216,54 +3580,31 @@ void setup() {
   //connectToWiFi() above, not alongside the other screen-building calls.
   rebuildTideCurve();
 
-  if (verbosity > 0) {
-    Serial.print("Attempting to connect to the MQTT broker: ");
-    Serial.println(broker);
-  }
-  //Explicit client ID so this can never collide with whatever default ID
-  //Unit 1 (or anything else on the broker) is using -- cheap precaution,
-  //not a confirmed fix for anything observed so far.
-  mqttClient.setId("GigaYH_Unit2");
-  mqttClient.setUsernamePassword(MQTT_USERNAME, MQTT_PASSWORD);
-  if (!mqttClient.connect(broker, port)) {
-    if (verbosity > 0) {
-      Serial.print("MQTT connection failed! Error code = ");
-      Serial.println(mqttClient.connectError());
+  if (verbosity > 0) Serial.println("Attempting to connect to the MQTT broker...");
+
+  //Bounded attempts (stored settings, then secrets.h -- see
+  //connectToMqttBroker()'s comment for why that order, reversed from
+  //WiFi's), then the manual host/username/password setup flow if both
+  //fail -- same shape as the WiFi fallback above. This is what actually
+  //fixes the "host moved IP or auth changed" case instead of just
+  //showing a permanent, unfixable "Not connected" on the Connection
+  //screen (the old behavior, before this existed).
+  if (!connectToMqttBroker()) {
+    if (verbosity > 0) Serial.println("Both stored and secrets.h MQTT settings failed -- showing manual MQTT setup");
+    g_awaitingManualMqttSetup = true;
+    lv_textarea_set_text(mqttHostTextarea, mqttHost);  //prefill with whatever secrets.h resolved to
+    lv_scr_load(scr_mqtt_host);
+    while (g_awaitingManualMqttSetup) {
+      lv_timer_handler();
+      serviceDevCommands();
+      if (g_pendingMqttAttempt) {
+        g_pendingMqttAttempt = false;
+        attemptMqttConnectFromSetup(g_pendingMqttHost, g_pendingMqttUser, g_pendingMqttPass);
+      }
+      delay(5);
     }
-    //Unlike Unit 1, don't hang forever here -- a remote display losing its
-    //broker connection at boot shouldn't brick the screen. Fall through and
-    //let the Connection screen show "Not connected"; retry logic is a later
-    //spiral (same gap exists on Unit 1 today, tracked in its CLAUDE.md).
   } else {
-    if (verbosity > 0) Serial.println("Connected to the MQTT broker.");
-
-    mqttClient.onMessage(onMqttMessage);
-
-    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatterySoC); }
-    mqttClient.subscribe(subtopicBatterySoC);
-
-    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryAction); }
-    mqttClient.subscribe(subtopicBatteryAction);
-
-    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine1); }
-    mqttClient.subscribe(subtopicLine1);
-
-    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine2); }
-    mqttClient.subscribe(subtopicLine2);
-
-    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine1Grid); }
-    mqttClient.subscribe(subtopicLine1Grid);
-
-    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine2Grid); }
-    mqttClient.subscribe(subtopicLine2Grid);
-
-    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryDaySoc); }
-    mqttClient.subscribe(subtopicBatteryDaySoc);
-
-    if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryYesterdaySoc); }
-    mqttClient.subscribe(subtopicBatteryYesterdaySoc);
-    //Subscribe-only -- no mqttClient.beginMessage()/publish anywhere in this
-    //sketch, on any topic. Unit 2 has no publish authority, by design.
+    subscribeAllMqttTopics();
   }
 }
 
@@ -3333,6 +3674,12 @@ void loop() {
   if (g_wifiChangeRequested) {
     g_wifiChangeRequested = false;
     startChangeWifiFlow();
+  }
+
+  //Same reasoning as the WiFi change above -- see startChangeMqttFlow().
+  if (g_mqttChangeRequested) {
+    g_mqttChangeRequested = false;
+    startChangeMqttFlow();
   }
 
   //Rebuild the Battery screen's curve when fresh data arrives WHILE
