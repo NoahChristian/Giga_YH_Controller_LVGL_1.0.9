@@ -61,6 +61,11 @@
 // #define MQTT_PASSWORD "YourMQTTPassword"
 
 #include "Arduino_H7_Video.h"
+//LVGL's own memory pool is SDRAM-backed via ea_malloc() (see
+//LV_MEM_POOL_ALLOC in lv_conf.h) -- SDRAM.begin() must run before
+//lv_init() (called internally by Display.begin() below) registers that
+//pool, or ea_malloc() has nothing to allocate from and returns NULL.
+#include "SDRAM.h"
 #include "lvgl.h"
 #include "Arduino_GigaDisplayTouch.h"
 #include "lv_conf.h"
@@ -128,7 +133,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.54"
+#define VERSION_DASHBOARD "1.0.56"
 //version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
 //                Connection screen live (SSID/RSSI/broker state), everything
 //                else placeholder. Did not compile (LVGL v8-style input
@@ -838,6 +843,97 @@ uint32_t dsi_getDisplayYSize(void);
 //                 over secrets.h on the next boot, not just coincidentally
 //                 still working because both happen to hold the same
 //                 values.
+//version 1.0.55 - Fixed a real, reproducible board hang on "Change
+//                 WiFi"/"Change MQTT" (v1.0.54 regression, worse on a
+//                 SECOND invocation of either than the first) via
+//                 real-hardware bisection and progressively finer
+//                 Serial trace logging. Root cause: the mbed RTOS main
+//                 thread's stack -- 32KB by default on this core's own
+//                 variant config -- was too small for this app's LVGL
+//                 object creation (building the WiFi scan list's rows
+//                 specifically), causing a silent stack overflow rather
+//                 than a clean error. Fixed via a sketch-local
+//                 mbed_app.json (arduino-cli picks it up automatically)
+//                 raising rtos.main-thread-stack-size to 128KB.
+//                 Along the way, also moved LVGL's own memory pool off
+//                 internal SRAM onto the Giga's external 8MB SDRAM
+//                 (LV_MEM_SIZE 512KB via ea_malloc, see lv_conf.h) --
+//                 this alone did NOT fix the hang (the real bottleneck
+//                 was the stack, not the heap), but it's a genuine
+//                 improvement in its own right: internal SRAM is scarce
+//                 and shared with the WiFi module/RTOS/etc., while the
+//                 Giga's SDRAM sits almost entirely idle by default.
+//                 Also fixed the MQTT flow's 3 separate always-alive
+//                 lv_keyboard widgets (added in 1.0.54) down to 1
+//                 shared, reparented keyboard -- a real, unnecessary
+//                 memory cost, though not the hang's root cause either.
+//                 Verified on real hardware: "Change WiFi" and "Change
+//                 MQTT" both complete successfully on repeated
+//                 back-to-back invocations, not just the first.
+//version 1.0.56 - The 1.0.55 fix above was incomplete: a chained real-
+//                 hardware test (WiFi x2 then MQTT x2, no reboot
+//                 between) still hung. Added logMemStatus() (LVGL's own
+//                 lv_mem_monitor(), logged after every Change WiFi/
+//                 Change MQTT flow) to actually measure the heap instead
+//                 of guessing, which found two compounding, previously-
+//                 undiagnosed root causes:
+//                 1) A genuine, unpatched LVGL v9.5.0 bug (upstream
+//                    issue #9794/PR #9795, fixed in LVGL after our
+//                    version shipped): lv_obj_class_create_obj() and
+//                    lv_obj_set_parent() both grow a parent's children
+//                    array via an UNCHECKED lv_realloc(), immediately
+//                    indexing into the result. Under memory pressure
+//                    that realloc can return NULL, turning a normal
+//                    allocation failure into a raw NULL-pointer write --
+//                    exactly the "hangs/corrupts on a later invocation"
+//                    signature reported. Hit on every WiFi-scan-list row
+//                    build (lv_obj_create) and every single MQTT
+//                    keyboard reparent (lv_obj_set_parent, see
+//                    attachMqttKeyboard()). Backported minimal NULL-
+//                    checks for all four unchecked realloc call sites in
+//                    lvgl/src/core/lv_obj_class.c and lv_obj_tree.c.
+//                 2) The 1.0.55 changelog's own "moved LVGL's memory
+//                    pool to SDRAM, 512KB via ea_malloc" claim had never
+//                    actually taken effect: lv_conf.h sits one directory
+//                    level above lvgl's src/ folder (Arduino's install
+//                    layout), but lv_conf_internal.h's own fallback
+//                    search path assumes two levels up (the upstream/
+//                    PlatformIO layout) -- and whether the __has_include
+//                    auto-detect ahead of that fallback succeeds turns
+//                    out to depend on per-file include-path quirks that
+//                    differ between the sketch's own translation unit
+//                    and LVGL's own library .c files. Confirmed via a
+//                    #pragma-message compile probe that lv_mem_core_
+//                    builtin.c -- the file that actually creates the
+//                    memory pool -- was silently using
+//                    lv_conf_internal.h's built-in 64KB/internal-SRAM
+//                    default this entire time, regardless of anything
+//                    set in lv_conf.h. This fully explains why editing
+//                    LV_MEM_SIZE across the 1.0.55 investigation never
+//                    changed the compiled RAM stat, and why the real
+//                    heap was running at 84-91% used with single-digit-
+//                    KB free and fragmentation climbing to 49% across
+//                    just two chained invocations -- a far more direct
+//                    explanation for intermittent failures than pure
+//                    fragmentation. Fixed by forcing an absolute
+//                    LV_CONF_PATH in lv_conf_internal.h so every
+//                    translation unit resolves the exact same lv_conf.h,
+//                    unconditionally (also caught and fixed a real,
+//                    previously-masked config bug this exposed:
+//                    LV_FONT_DEFAULT pointed at the disabled
+//                    lv_font_montserrat_14; corrected to _32, the only
+//                    size actually enabled).
+//                 Verified on real hardware post-fix: chained WiFi x2
+//                 then MQTT x2 (the exact sequence that hung before) via
+//                 simulated touch, logMemStatus() showing total=~517KB,
+//                 free=~460-467KB (89-90% free), free_biggest essentially
+//                 equal to free_size, frag_pct=1%, max_used=~52-59KB
+//                 across all four invocations -- no growth, no
+//                 fragmentation buildup, no leak signature. (Global
+//                 variables RAM also dropped from 144184 to 78648 bytes
+//                 in the build stats -- the old, invisible 64KB static
+//                 SRAM fallback array disappearing now that the real
+//                 SDRAM-backed pool is actually in use.)
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -1381,12 +1477,23 @@ char g_pendingMqttUser[33];
 char g_pendingMqttPass[64];
 
 lv_obj_t* mqttHostTextarea;
-lv_obj_t* mqttHostKeyboard;
 lv_obj_t* mqttUsernameTextarea;
-lv_obj_t* mqttUsernameKeyboard;
 lv_obj_t* mqttPasswordTextarea;
-lv_obj_t* mqttPasswordKeyboard;
 lv_obj_t* mqttConnectStatusLbl;
+//Single keyboard SHARED across all three MQTT screens (reparented +
+//reconfigured on each transition -- see attachMqttKeyboard()) instead
+//of one full lv_keyboard per screen. Each lv_keyboard is a substantial
+//persistent object (a full button matrix, ~40+ buttons with their own
+//style/state records) that, once created, lives for the sketch's whole
+//lifetime -- three of them on top of the pre-existing wifiKeyboard was
+//enough extra pressure on this board's limited internal SRAM (LVGL's
+//own memory pool stays in internal SRAM by default, not the Giga's much
+//larger external SDRAM, unless explicitly reconfigured to use it) to
+//cause a real, reproducible hang building the WiFi scan list's later
+//rows -- confirmed via bisection and real-hardware trace logging
+//2026-07-17. One shared keyboard for the MQTT flow fixes this at the
+//root rather than working around it with a bigger memory pool.
+lv_obj_t* mqttKeyboard;
 
 //labels/widgets that need periodic/live updates after screen build
 lv_obj_t* lbl_home_clock;
@@ -1951,6 +2058,33 @@ void forcePaint() {
   }
 }
 
+//Diagnostic for the 2026-07-17 chained-invocation hang investigation --
+//logs LVGL's own heap state (the SDRAM-backed ea_malloc pool, see
+//lv_conf.h) after every Change WiFi / Change MQTT flow. free_size
+//trending down across repeated invocations points to a genuine leak;
+//free_size holding steady while free_biggest_size shrinks / frag_pct
+//climbs points to fragmentation from the many small child-array
+//reallocs each screen rebuild does (lv_obj_create/delete, and the
+//shared keyboard's repeated lv_obj_set_parent() reparenting) instead.
+void logMemStatus(const char* tag) {
+  lv_mem_monitor_t mon;
+  lv_mem_monitor(&mon);
+  Serial.print("MEM[");
+  Serial.print(tag);
+  Serial.print("] total=");
+  Serial.print(mon.total_size);
+  Serial.print(" free=");
+  Serial.print(mon.free_size);
+  Serial.print(" free_biggest=");
+  Serial.print(mon.free_biggest_size);
+  Serial.print(" used_pct=");
+  Serial.print(mon.used_pct);
+  Serial.print(" frag_pct=");
+  Serial.print(mon.frag_pct);
+  Serial.print(" max_used=");
+  Serial.println(mon.max_used);
+}
+
 //Connecting has no dot -- just two-line amber "Attempting\nto Connect"
 //text, per request. Connected/Not connected keep the dot + single-line
 //text as before.
@@ -2364,6 +2498,7 @@ void startChangeWifiFlow() {
   //covers both a genuinely new connection and a cancel-out (old
   //connection still intact, never touched above).
   setConnStatusIndicator(WiFi.status() == WL_CONNECTED ? WIFI_UI_CONNECTED : WIFI_UI_NOT_CONNECTED);
+  logMemStatus("after ChangeWifi");
 }
 
 void onChangeWifiClicked(lv_event_t* e) {
@@ -2390,6 +2525,12 @@ void attemptWifiConnectFromSetup(const char* s, const char* p) {
     saveWifiCredentials(s, p);
     setNtpTime();
     g_awaitingManualWifiSetup = false;
+    //Was only ever reset on the Cancel path (navConnection()) -- left
+    //true forever after a SUCCESSFUL runtime change, a real bug (found
+    //2026-07-17) though not confirmed as the cause of the "works once,
+    //not afterwards" hang reported on real hardware. Reset here too for
+    //correctness regardless.
+    g_manualSetupIsRuntimeChange = false;
     lv_scr_load(scr_home);
   } else {
     lv_label_set_text(wifiConnectStatusLbl, "Couldn't connect. Check the password and try again.");
@@ -2437,8 +2578,14 @@ void onWifiNetworkSelected(lv_event_t* e) {
 //MQTT" button. Same reentrancy-safe flag-deferred pattern as the WiFi
 //flow throughout -- see g_wifiChangeRequested's comment for why.
 
-void navMqttHostScreen(lv_event_t* e) { lv_scr_load(scr_mqtt_host); }
-void navMqttUsernameScreen(lv_event_t* e) { lv_scr_load(scr_mqtt_username); }
+void navMqttHostScreen(lv_event_t* e) {
+  attachMqttKeyboard(scr_mqtt_host, mqttHostTextarea, LV_KEYBOARD_MODE_NUMBER);
+  lv_scr_load(scr_mqtt_host);
+}
+void navMqttUsernameScreen(lv_event_t* e) {
+  attachMqttKeyboard(scr_mqtt_username, mqttUsernameTextarea, LV_KEYBOARD_MODE_TEXT_LOWER);
+  lv_scr_load(scr_mqtt_username);
+}
 
 void onChangeMqttClicked(lv_event_t* e) {
   g_mqttChangeRequested = true;
@@ -2451,6 +2598,10 @@ void startChangeMqttFlow() {
   g_mqttManualSetupIsRuntimeChange = true;
   g_awaitingManualMqttSetup = true;
   lv_textarea_set_text(mqttHostTextarea, mqttHost);  //prefill with the current value for editing
+  //Re-attach to the host screen in NUMBER mode -- a prior use of this
+  //flow may have left the shared keyboard parented to the password
+  //screen in TEXT_LOWER mode.
+  attachMqttKeyboard(scr_mqtt_host, mqttHostTextarea, LV_KEYBOARD_MODE_NUMBER);
   lv_scr_load(scr_mqtt_host);
   while (g_awaitingManualMqttSetup) {
     lv_timer_handler();
@@ -2461,6 +2612,7 @@ void startChangeMqttFlow() {
     }
     delay(5);
   }
+  logMemStatus("after ChangeMqtt");
 }
 
 //Called only from the manual-setup wait loop itself (see
@@ -2480,6 +2632,8 @@ void attemptMqttConnectFromSetup(const char* host, const char* user, const char*
     saveMqttCredentials(host, user, pass);
     subscribeAllMqttTopics();
     g_awaitingManualMqttSetup = false;
+    //Same fix/rationale as the identical line in attemptWifiConnectFromSetup().
+    g_mqttManualSetupIsRuntimeChange = false;
     lv_scr_load(scr_home);
   } else {
     lv_label_set_text(mqttConnectStatusLbl, "Couldn't connect. Check the broker IP and try again.");
@@ -2494,6 +2648,7 @@ void onMqttHostSubmit(lv_event_t* e) {
   strncpy(g_pendingMqttHost, h, sizeof(g_pendingMqttHost) - 1);
   g_pendingMqttHost[sizeof(g_pendingMqttHost) - 1] = '\0';
   lv_textarea_set_text(mqttUsernameTextarea, mqttUserRuntime);  //prefill with the current value
+  attachMqttKeyboard(scr_mqtt_username, mqttUsernameTextarea, LV_KEYBOARD_MODE_TEXT_LOWER);
   lv_scr_load(scr_mqtt_username);
 }
 
@@ -2503,6 +2658,7 @@ void onMqttUsernameSubmit(lv_event_t* e) {
   g_pendingMqttUser[sizeof(g_pendingMqttUser) - 1] = '\0';
   lv_textarea_set_text(mqttPasswordTextarea, mqttPassRuntime);  //prefill with the current value
   lv_obj_add_flag(mqttConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  attachMqttKeyboard(scr_mqtt_password, mqttPasswordTextarea, LV_KEYBOARD_MODE_TEXT_LOWER);
   lv_scr_load(scr_mqtt_password);
 }
 
@@ -2694,6 +2850,19 @@ void buildWifiPasswordScreen() {
 //since a broker IP is only ever digits and dots. accepted_chars is a
 //second layer on top of that (belt-and-suspenders against the
 //keyboard's own "ABC" mode-switch button).
+//
+//All three screens share ONE mqttKeyboard object (see its declaration
+//comment for why) rather than each creating their own -- attached via
+//attachMqttKeyboard() on every screen transition instead of at build
+//time.
+void attachMqttKeyboard(lv_obj_t* screen, lv_obj_t* textarea, lv_keyboard_mode_t mode) {
+  lv_obj_set_parent(mqttKeyboard, screen);
+  lv_keyboard_set_mode(mqttKeyboard, mode);
+  lv_keyboard_set_textarea(mqttKeyboard, textarea);
+  //Sticky-bottom-alignment fix -- see the identical comment on wifiKeyboard.
+  lv_obj_align(mqttKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+}
+
 void buildMqttHostScreen() {
   scr_mqtt_host = makeScreenRoot();
   lv_obj_t* back = lv_label_create(scr_mqtt_host);
@@ -2713,12 +2882,11 @@ void buildMqttHostScreen() {
   lv_textarea_set_accepted_chars(mqttHostTextarea, "0123456789.");
   lv_obj_add_event_cb(mqttHostTextarea, onMqttHostSubmit, LV_EVENT_READY, NULL);
 
-  mqttHostKeyboard = lv_keyboard_create(scr_mqtt_host);
-  lv_obj_set_size(mqttHostKeyboard, 800, 260);
-  lv_keyboard_set_mode(mqttHostKeyboard, LV_KEYBOARD_MODE_NUMBER);
-  lv_keyboard_set_textarea(mqttHostKeyboard, mqttHostTextarea);
-  //Sticky-bottom-alignment fix -- see the identical comment on wifiKeyboard.
-  lv_obj_align(mqttHostKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+  //The one shared keyboard is created here (host screen builds first)
+  //and reparented to whichever MQTT screen needs it from here on.
+  mqttKeyboard = lv_keyboard_create(scr_mqtt_host);
+  lv_obj_set_size(mqttKeyboard, 800, 260);
+  attachMqttKeyboard(scr_mqtt_host, mqttHostTextarea, LV_KEYBOARD_MODE_NUMBER);
 }
 
 void buildMqttUsernameScreen() {
@@ -2738,11 +2906,10 @@ void buildMqttUsernameScreen() {
   lv_textarea_set_one_line(mqttUsernameTextarea, true);
   lv_textarea_set_max_length(mqttUsernameTextarea, 32);
   lv_obj_add_event_cb(mqttUsernameTextarea, onMqttUsernameSubmit, LV_EVENT_READY, NULL);
-
-  mqttUsernameKeyboard = lv_keyboard_create(scr_mqtt_username);
-  lv_obj_set_size(mqttUsernameKeyboard, 800, 260);
-  lv_keyboard_set_textarea(mqttUsernameKeyboard, mqttUsernameTextarea);
-  lv_obj_align(mqttUsernameKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+  //Keyboard itself is attached on transition into this screen (see
+  //onMqttHostSubmit()), not here -- it doesn't exist yet at this point
+  //in setup() (buildMqttHostScreen() creates it, and build order across
+  //these three isn't guaranteed relative to each other beyond host-first).
 }
 
 void buildMqttPasswordScreen() {
@@ -2772,11 +2939,8 @@ void buildMqttPasswordScreen() {
   lv_obj_set_width(mqttConnectStatusLbl, 720);
   lv_label_set_long_mode(mqttConnectStatusLbl, LV_LABEL_LONG_MODE_WRAP);
   lv_obj_add_flag(mqttConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
-
-  mqttPasswordKeyboard = lv_keyboard_create(scr_mqtt_password);
-  lv_obj_set_size(mqttPasswordKeyboard, 800, 260);
-  lv_keyboard_set_textarea(mqttPasswordKeyboard, mqttPasswordTextarea);
-  lv_obj_align(mqttPasswordKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+  //Keyboard attached on transition into this screen (see
+  //onMqttUsernameSubmit()), same reasoning as the username screen above.
 }
 
 //---- Home screen ----
@@ -3511,12 +3675,33 @@ void buildAlmanacScreen() {
   lv_obj_align(lbl_tide_right, LV_ALIGN_TOP_RIGHT, -150, 430);
 }
 
+//This sketch's own directory also has an mbed_app.json (arduino-cli
+//picks it up automatically) raising rtos.main-thread-stack-size to
+//128KB, up from this core's own 32KB default (set in its variant's own
+//conf/mbed_app.json). Confirmed via real-hardware bisection + trace
+//logging (2026-07-17): the default was too small for this app's LVGL
+//object creation, causing a silent stack overflow -- manifesting as a
+//hard hang building the WiFi scan list's rows, worse on a SECOND
+//"Change WiFi"/"Change MQTT" invocation than the first. If a future
+//change needs even more headroom, raise that value rather than
+//assuming a hang here is a heap/pool issue -- see also LV_MEM_SIZE's
+//own comment in lv_conf.h.
 void setup() {
   Serial.begin(115200);
   delay(3000);
 
   Serial.print("Giga YH Dashboard - Unit 2 (remote display) - V");
   Serial.println(VERSION_DASHBOARD);
+
+  //Must run before Display.begin() (which calls lv_init() internally) --
+  //LVGL's memory pool is ea_malloc()-backed (see lv_conf.h), and
+  //ea_malloc() has nothing to hand out until the SDRAM block is
+  //registered. SDRAM.begin() itself is idempotent (checks the FMC
+  //controller's own state register before re-initializing), so this is
+  //safe even if something else also initializes SDRAM later.
+  if (!SDRAM.begin()) {
+    Serial.println("SDRAM.begin() failed! LVGL's memory pool won't be available.");
+  }
 
   Display.begin();
   TouchDetector.begin();
