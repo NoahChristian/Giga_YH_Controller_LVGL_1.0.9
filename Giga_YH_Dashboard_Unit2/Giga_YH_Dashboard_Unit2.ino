@@ -133,7 +133,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.57"
+#define VERSION_DASHBOARD "1.0.58"
 //version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
 //version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
 //version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
@@ -218,6 +218,22 @@ uint32_t dsi_getDisplayYSize(void);
 //                 not just a successful change -- now reconnects to the prior network/broker in both cases.
 //                 Also corrected the 1.0.56 lv_conf.h diagnosis (misattributed to a directory-layout bug;
 //                 real cause is Arduino_H7_Video's own bundled config shadowing any user-supplied one).
+//version 1.0.58 - Almanac screen is now real, replacing its last remaining placeholder data: weather
+//                 (Met.no), sunrise/sunset, and moonrise/moonset/phase/illumination, all via a new HA
+//                 pyscript automation (homeassistant/pyscript/almanac_data.py, skyfield for the moon
+//                 calculations) publishing to a new V1.0/Home/Almanac/Data MQTT topic every 6 hours. The
+//                 moon-phase icon is a real, geometrically-accurate rendering (lv_canvas, terminator-ellipse
+//                 construction from the real phase angle) instead of one fixed crescent shape -- verified
+//                 the illuminated-area fraction this produces exactly matches the phase's real illuminated
+//                 %, not just a visual approximation. Found and fixed a real, previously-latent timezone
+//                 bug along the way: this board's RTC is set to an already-local-shifted epoch (see
+//                 parseNtpPacket()), not true UTC, so formatEpochTime() needs the same +3600*timezone
+//                 adjustment before displaying an externally-sourced (genuinely UTC) epoch -- caught
+//                 because the new sunrise/sunset times initially showed as physically impossible (sunrise
+//                 at 12:54 PM). Also hit and worked around a real pyscript quirk: a top-level "from skyfield
+//                 import almanac" fails with a misleading AttributeError under pyscript's execution model,
+//                 even though the same statement works fine inside a function or in plain Python --
+//                 confirmed directly against the instance before settling on dotted-style imports instead.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -345,6 +361,27 @@ const char subtopicBatteryDaySoc[] = "V1.0/Home/Battery/DaySOC";
 //by the same pyscript automation (see battery_day_curve.py) -- used only
 //for the Saved Yesterday figure (see the calc in loop()), not charted.
 const char subtopicBatteryYesterdaySoc[] = "V1.0/Home/Battery/YesterdaySOC";
+
+//Published by a pyscript automation on the HA side (see
+//homeassistant/pyscript/almanac_data.py), every 6 hours: weather
+//(Met.no), sun rise/set, and moon rise/set/phase, for the Almanac
+//screen -- see parseAlmanacPayload() and updateMoonPhaseIcon() below.
+const char subtopicAlmanacData[] = "V1.0/Home/Almanac/Data";
+
+char g_weatherCondition[24] = "";
+int g_weatherTempF = 0;
+time_t g_sunriseEpoch = 0;
+time_t g_sunsetEpoch = 0;
+time_t g_moonriseEpoch = 0;
+time_t g_moonsetEpoch = 0;
+//0-360 degrees (0=new, 180=full) -- the single authoritative value the
+//icon and illuminated-% text are both derived from; see
+//updateMoonPhaseIcon()'s own comment for the geometry.
+float g_moonPhaseAngle = 0;
+char g_moonPhaseName[24] = "";
+bool g_hasAlmanacData = false;
+unsigned long g_lastAlmanacDataMs = 0;
+bool g_almanacDataDirty = false; //set on new MQTT data, cleared once the Almanac screen's been refreshed from it
 
 #define MAX_DAYSOC_POINTS 96 //one point per 15-min bucket, full 24h day
 uint8_t g_daySocBucket[MAX_DAYSOC_POINTS];
@@ -842,6 +879,24 @@ lv_obj_t* schedule_bar_seg[6];  //6, not 4 -- weekdays now have more segments th
 lv_obj_t* tide_line_obj;
 lv_obj_t* lbl_tide_left;   //positional (not content-fixed) -- see rebuildTideCurve()
 lv_obj_t* lbl_tide_right;
+lv_obj_t* lbl_almanac_weather;
+lv_obj_t* lbl_almanac_sunrise;
+lv_obj_t* lbl_almanac_sunset;
+lv_obj_t* lbl_almanac_moonrise;
+lv_obj_t* lbl_almanac_moonset;
+lv_obj_t* lbl_almanac_phase;
+//Accurate moon-phase icon, redrawn from real phase-angle data -- see
+//updateMoonPhaseIcon(). Separate from the generic fixed-crescent
+//makeMoonIcon() glyphs still used in the Moonrise/Moonset columns
+//above (those are just "this is about the moon" indicators, not meant
+//to show the real current phase).
+lv_obj_t* moon_phase_canvas;
+#define MOON_ICON_D 22
+//RGB565 (16bpp), not ARGB8888 -- this icon is always fully opaque (flat
+//style, matching the rest of this dashboard), so no alpha channel is
+//needed. Raw byte buffer + LV_CANVAS_BUF_SIZE(), per LVGL 9's actual
+//canvas API -- NOT an lv_color_t array (a common but wrong assumption).
+static uint8_t moon_canvas_buf[LV_CANVAS_BUF_SIZE(MOON_ICON_D, MOON_ICON_D, 16, LV_DRAW_BUF_STRIDE_ALIGN)];
 
 //---- NTP / clock (same approach as Unit 1's getLocaltime/setNtpTime) ----
 char* getLocaltime(char buffer[]) {
@@ -1022,6 +1077,9 @@ void subscribeAllMqttTopics() {
 
   if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryYesterdaySoc); }
   mqttClient.subscribe(subtopicBatteryYesterdaySoc);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicAlmanacData); }
+  mqttClient.subscribe(subtopicAlmanacData);
   //Subscribe-only -- no mqttClient.beginMessage()/publish anywhere in this
   //sketch, on any topic. Unit 2 has no publish authority, by design.
 }
@@ -1191,6 +1249,58 @@ int parseSocCurvePayload(const char* payload, uint8_t* bucketOut, uint8_t* value
   return count;
 }
 
+//Parses almanac_data.py's colon-delimited payload -- see
+//subtopicAlmanacData's own comment for the field order. Manual parse,
+//same convention as parseSocCurvePayload() above (no strtok). Returns
+//false (leaving all *Out params untouched) if the payload is malformed,
+//so a bad message can't silently zero out previously-good data.
+bool parseAlmanacPayload(const char* payload, char* conditionOut, size_t conditionCap,
+                          int* tempFOut, time_t* sunriseOut, time_t* sunsetOut,
+                          time_t* moonriseOut, time_t* moonsetOut,
+                          float* phaseAngleOut, char* phaseNameOut, size_t phaseNameCap) {
+  const char* p = payload;
+  float tempF = atof(p);
+
+  const char* c1 = strchr(p, ':');
+  if (!c1) return false;
+  const char* c2 = strchr(c1 + 1, ':');
+  if (!c2) return false;
+  size_t condLen = min((size_t)(c2 - (c1 + 1)), conditionCap - 1);
+  strncpy(conditionOut, c1 + 1, condLen);
+  conditionOut[condLen] = '\0';
+
+  const char* c3 = strchr(c2 + 1, ':');
+  if (!c3) return false;
+  time_t sunrise = (time_t)atol(c2 + 1);
+
+  const char* c4 = strchr(c3 + 1, ':');
+  if (!c4) return false;
+  time_t sunset = (time_t)atol(c3 + 1);
+
+  const char* c5 = strchr(c4 + 1, ':');
+  if (!c5) return false;
+  time_t moonrise = (time_t)atol(c4 + 1);
+
+  const char* c6 = strchr(c5 + 1, ':');
+  if (!c6) return false;
+  time_t moonset = (time_t)atol(c5 + 1);
+
+  const char* c7 = strchr(c6 + 1, ':');
+  if (!c7) return false;
+  float phaseAngle = atof(c6 + 1);
+
+  strncpy(phaseNameOut, c7 + 1, phaseNameCap - 1);
+  phaseNameOut[phaseNameCap - 1] = '\0';
+
+  *tempFOut = (int)(tempF + 0.5f); //round, not truncate
+  *sunriseOut = sunrise;
+  *sunsetOut = sunset;
+  *moonriseOut = moonrise;
+  *moonsetOut = moonset;
+  *phaseAngleOut = phaseAngle;
+  return true;
+}
+
 //---- MQTT message handler (subscribe-only -- this never publishes) ----
 void onMqttMessage(int messageSize) {
   //1024, not the 256 every other topic here has gotten away with -- the
@@ -1302,6 +1412,22 @@ void onMqttMessage(int messageSize) {
     tbuf[size] = '\0';
     g_yesterdaySocCount = parseSocCurvePayload(tbuf, g_yesterdaySocBucket, g_yesterdaySocValue, g_yesterdaySocState, MAX_DAYSOC_POINTS);
     if (trace) { Serial.print("Battery YesterdaySOC points = "); Serial.println(g_yesterdaySocCount); }
+
+  } else if (topic.equals(subtopicAlmanacData)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    if (parseAlmanacPayload(tbuf, g_weatherCondition, sizeof(g_weatherCondition), &g_weatherTempF,
+                             &g_sunriseEpoch, &g_sunsetEpoch, &g_moonriseEpoch, &g_moonsetEpoch,
+                             &g_moonPhaseAngle, g_moonPhaseName, sizeof(g_moonPhaseName))) {
+      g_hasAlmanacData = true;
+      g_lastAlmanacDataMs = millis();
+      g_almanacDataDirty = true;
+      if (trace) { Serial.print("Almanac: "); Serial.print(g_weatherTempF); Serial.print("F "); Serial.print(g_weatherCondition); Serial.print(", phase="); Serial.println(g_moonPhaseName); }
+    }
   }
 }
 
@@ -1706,7 +1832,11 @@ void navBattery(lv_event_t* e) {
   g_daySocDirty = false;
 }
 void navGrid(lv_event_t* e) { lv_scr_load(scr_grid); }
-void navAlmanac(lv_event_t* e) { lv_scr_load(scr_almanac); }
+void navAlmanac(lv_event_t* e) {
+  lv_scr_load(scr_almanac);
+  updateAlmanacScreen(); //always fresh on entry, same reasoning as navBattery()
+  g_almanacDataDirty = false;
+}
 
 void makeBackButton(lv_obj_t* parent) {
   lv_obj_t* back = lv_label_create(parent);
@@ -2919,7 +3049,10 @@ void rebuildBatteryDayCurve() {
 //one sunrise/sunset/moonrise/moonset column: icon, then value, then caption,
 //all centered on cx via a fixed-width column container so text-anchor=middle
 //from the mockup survives regardless of actual rendered text width.
-void buildAlmanacTimeColumn(lv_obj_t* parent, lv_coord_t cx, bool isSun, const char* value, const char* caption) {
+//Returns the value label so callers can update it at runtime (see
+//updateAlmanacScreen()) -- this function only builds the static
+//structure once.
+lv_obj_t* buildAlmanacTimeColumn(lv_obj_t* parent, lv_coord_t cx, bool isSun, const char* value, const char* caption) {
   const lv_coord_t w = 150;
   //value-to-caption gap widened from an initial 23px to 30px, matching the
   //Grid screen's stat columns -- both used the same too-tight pattern,
@@ -2940,21 +3073,25 @@ void buildAlmanacTimeColumn(lv_obj_t* parent, lv_coord_t cx, bool isSun, const c
   lv_obj_align(val, LV_ALIGN_TOP_MID, 0, 40);
   lv_obj_t* cap = makeLabel(col, caption, COLOR_TEXT_DIM);
   lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 74);
+  return val;
 }
 
 void buildAlmanacScreen() {
   scr_almanac = makeScreenRoot();
   makeBackButton(scr_almanac);
 
-  makeLabel(scr_almanac, "68F  Cloudy", COLOR_TEXT, 350, 95);
+  //Placeholder text sized for the worst case ("68F  Partlycloudy") so the
+  //label's own build-time layout doesn't need to change once real data
+  //(from almanac_data.py, see subtopicAlmanacData) replaces it.
+  lbl_almanac_weather = makeLabel(scr_almanac, "68F  Partlycloudy", COLOR_TEXT, 350, 95);
 
   //pushed down from the original layout (which collided with the moon-phase
   //row below it once rendered on real hardware) and widened into columns
   //that center regardless of text width.
-  buildAlmanacTimeColumn(scr_almanac, 160, true, "5:58 AM", "Sunrise");
-  buildAlmanacTimeColumn(scr_almanac, 320, true, "8:41 PM", "Sunset");
-  buildAlmanacTimeColumn(scr_almanac, 480, false, "9:14 PM", "Moonrise");
-  buildAlmanacTimeColumn(scr_almanac, 640, false, "6:37 AM", "Moonset");
+  lbl_almanac_sunrise = buildAlmanacTimeColumn(scr_almanac, 160, true, "5:58 AM", "Sunrise");
+  lbl_almanac_sunset = buildAlmanacTimeColumn(scr_almanac, 320, true, "8:41 PM", "Sunset");
+  lbl_almanac_moonrise = buildAlmanacTimeColumn(scr_almanac, 480, false, "9:14 PM", "Moonrise");
+  lbl_almanac_moonset = buildAlmanacTimeColumn(scr_almanac, 640, false, "6:37 AM", "Moonset");
 
   //height widened from 30 to 40 -- 30 was clipping the descenders on the
   //two g's in "Waxing gibbous" against the row's own bottom edge (you
@@ -2963,10 +3100,16 @@ void buildAlmanacScreen() {
   //class of bug). y nudged up slightly so the extra height doesn't eat
   //too far into the gap before the Tide label/chart below.
   lv_obj_t* phase_row = makeFlexRow(scr_almanac, 0, 298, 800, 40, 10);
-  makeMoonIcon(phase_row, 0, 0, 18);
+  //Real, phase-accurate icon (see updateMoonPhaseIcon()) instead of the
+  //fixed generic crescent used elsewhere on this screen -- built once as
+  //an lv_canvas here, redrawn whenever real phase data arrives.
+  moon_phase_canvas = lv_canvas_create(phase_row);
+  lv_canvas_set_buffer(moon_phase_canvas, moon_canvas_buf, MOON_ICON_D, MOON_ICON_D, LV_COLOR_FORMAT_RGB565);
   //plain hyphen instead of a Unicode middle-dot -- same missing-glyph issue
-  //as the battery caption's en-dash above
-  makeLabel(phase_row, "Waxing gibbous - 72% lit", COLOR_MOON_GRAY);
+  //as the battery caption's en-dash above. Worst-case-width placeholder
+  //("Waning crescent - 100% lit") so the flex row's layout doesn't shift
+  //once real data replaces it.
+  lbl_almanac_phase = makeLabel(phase_row, "Waning crescent - 100% lit", COLOR_MOON_GRAY);
 
   lv_obj_t* tide_lbl = makeLabel(scr_almanac, "Tide", COLOR_BLUE_TIDE);
   lv_obj_align(tide_lbl, LV_ALIGN_TOP_MID, 0, 344);
@@ -2982,6 +3125,100 @@ void buildAlmanacScreen() {
   lbl_tide_left = makeLabel(scr_almanac, "High --:-- --", COLOR_TEXT, 150, 430);
   lbl_tide_right = makeLabel(scr_almanac, "Low --:-- --", COLOR_TEXT);
   lv_obj_align(lbl_tide_right, LV_ALIGN_TOP_RIGHT, -150, 430);
+}
+
+//"5:58 AM" -- same %I:%M %p convention as the main clock, for an
+//arbitrary epoch (not necessarily "now") coming from almanac_data.py's
+//MQTT payload.
+//
+//The +3600*timezone adjustment matters here specifically: this board's
+//RTC is set (see parseNtpPacket()'s identical adjustment) to an
+//already-local-shifted epoch, not true UTC -- time(NULL)/_rtc_localtime()
+//elsewhere in this file work without any further adjustment because
+//they're reading that same pre-shifted clock. almanac_data.py's payload
+//is genuine UTC (Python's tz-aware .timestamp()), so it needs the same
+//shift applied here before _rtc_localtime() can treat it consistently
+//with every other displayed time on this dashboard.
+char* formatEpochTime(time_t epoch, char buffer[]) {
+  tm t;
+  time_t adjusted = epoch + (3600 * timezone);
+  _rtc_localtime(adjusted, &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+  strftime(buffer, 16, "%I:%M %p", &t);
+  return buffer;
+}
+
+//Redraws moon_phase_canvas as a real, geometrically-accurate phase icon
+//from g_moonPhaseAngle (0=new, 180=full, 0-360 covering a full waxing+
+//waning cycle) -- not one of a fixed set of 8 pictures.
+//
+//A moon phase's illuminated region is the disk intersected/unioned with
+//an ellipse whose horizontal half-width is the disk's own half-width at
+//that row, scaled by cos(theta) (theta = phase angle folded into 0-180,
+//see thetaForFormula below). This is the standard, exact construction
+//most moon-phase widgets use -- at theta=0 (new) the ellipse collapses
+//to the disk's edge (nothing lit); at theta=90 (quarter) it collapses to
+//a flat vertical line (exactly half lit); at theta=180 (full) it
+//collapses to the far edge (everything lit) -- one continuous formula
+//covers crescent, quarter, and gibbous with no special-casing.
+//
+//limbSign picks which side is lit for waxing vs. waning (an arbitrary
+//but consistent left/right convention -- flip both signs below if it
+//reads backwards for your hemisphere/preference).
+void updateMoonPhaseIcon() {
+  float angle = g_moonPhaseAngle;
+  bool waxing = (angle <= 180.0f);
+  float thetaForFormula = waxing ? angle : (360.0f - angle);
+  float cosTheta = cosf(radians(thetaForFormula));
+  float limbSign = waxing ? 1.0f : -1.0f;
+
+  const float R = MOON_ICON_D / 2.0f;
+  lv_canvas_fill_bg(moon_phase_canvas, COLOR_BG, LV_OPA_COVER);
+
+  for (int y = 0; y < MOON_ICON_D; y++) {
+    float ny = (y + 0.5f - R) / R;
+    if (fabsf(ny) > 1.0f) continue;
+    float diskHalfWidth = sqrtf(1.0f - ny * ny);
+    float terminatorX = cosTheta * diskHalfWidth;
+
+    for (int x = 0; x < MOON_ICON_D; x++) {
+      float nx = (x + 0.5f - R) / R;
+      if (nx * nx + ny * ny > 1.0f) continue; //outside the disk -- leave as background
+      bool illuminated = (nx * limbSign) >= terminatorX;
+      lv_canvas_set_px(moon_phase_canvas, x, y,
+                        illuminated ? COLOR_MOON_GRAY : lv_color_hex(0x232428),
+                        LV_OPA_COVER);
+    }
+  }
+  lv_obj_invalidate(moon_phase_canvas);
+}
+
+//Refreshes every Almanac screen element from the latest g_*Epoch/
+//g_moonPhase*/g_weather* globals (see subtopicAlmanacData/onMqttMessage
+//above) -- called on navigating to the screen and, from loop(), when
+//fresh data arrives while already on it (same pattern as
+//rebuildBatteryDayCurve()/g_daySocDirty).
+void updateAlmanacScreen() {
+  if (!g_hasAlmanacData) return;
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%dF  %s", g_weatherTempF, g_weatherCondition);
+  lv_label_set_text(lbl_almanac_weather, buf);
+
+  char timeBuf[16];
+  lv_label_set_text(lbl_almanac_sunrise, formatEpochTime(g_sunriseEpoch, timeBuf));
+  lv_label_set_text(lbl_almanac_sunset, formatEpochTime(g_sunsetEpoch, timeBuf));
+  lv_label_set_text(lbl_almanac_moonrise, formatEpochTime(g_moonriseEpoch, timeBuf));
+  lv_label_set_text(lbl_almanac_moonset, formatEpochTime(g_moonsetEpoch, timeBuf));
+
+  //Illuminated % derived from the phase angle here (not sent separately
+  //over MQTT) -- see updateMoonPhaseIcon()'s comment for why the angle
+  //alone is authoritative for both the icon and this number.
+  float k = (1.0f - cosf(radians(g_moonPhaseAngle))) / 2.0f;
+  char phaseBuf[40];
+  snprintf(phaseBuf, sizeof(phaseBuf), "%s - %d%% lit", g_moonPhaseName, (int)(k * 100.0f + 0.5f));
+  lv_label_set_text(lbl_almanac_phase, phaseBuf);
+
+  updateMoonPhaseIcon();
 }
 
 //This sketch's own directory also has an mbed_app.json (arduino-cli
@@ -3180,6 +3417,14 @@ void loop() {
   if (g_daySocDirty && lv_scr_act() == scr_battery) {
     g_daySocDirty = false;
     rebuildBatteryDayCurve();
+  }
+
+  //Same reasoning as the Battery screen curve above -- navAlmanac()
+  //handles the "just navigated there" case itself, this only covers
+  //staying on the screen as a new 6-hour almanac update arrives.
+  if (g_almanacDataDirty && lv_scr_act() == scr_almanac) {
+    g_almanacDataDirty = false;
+    updateAlmanacScreen();
   }
 
   //Tide data only changes once a day; re-checking every minute (not

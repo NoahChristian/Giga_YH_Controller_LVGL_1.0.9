@@ -212,13 +212,20 @@ pixel-band scanning.** Verify new/resized text containers via zoomed
 (4–6x) crops of the actual glyph shapes from a real capture, and confirm
 real pixel clearance, not just an ink-vs-gap scan or a thumbnail eyeball.
 
+**Almanac screen is fully real as of v1.0.58** — weather (Met.no), sun,
+and moon (rise/set/phase/illumination) all come from a new HA pyscript
+automation (`homeassistant/pyscript/almanac_data.py`, uses `skyfield` —
+see its own header comment for the required `requirements.txt` and a
+real pyscript import quirk it works around) publishing to
+`V1.0/Home/Almanac/Data` every 6 hours. The moon-phase icon is a real
+geometric rendering (`lv_canvas`, terminator-ellipse construction from
+the actual phase angle), not one fixed picture. Externally-sourced
+epochs (this topic's rise/set times) need `formatEpochTime()`'s
+`+3600*timezone` adjustment before display — this board's RTC is set to
+an already-local-shifted epoch (see `parseNtpPacket()`), not true UTC,
+unlike what you'd assume from a genuinely-UTC source.
+
 **Open tickets (parked, not yet implemented)**:
-- Almanac screen's weather/moon-phase is still placeholder, not wired to
-  real data. HA's Moon integration gives phase as a discrete state (no
-  illumination % without a custom template sensor); HA's Sun integration
-  gives sunrise/sunset easily; moonrise/moonset has no HA built-in — would
-  need a custom sensor or the same NOAA-precomputed-table approach used
-  for tide.
 - Unit 1 oscillation-fix halving logic re-check (see above, twice-flagged).
 - Occasional double-tap/slow physical touch input, unresolved — GitHub
   issue #1.
