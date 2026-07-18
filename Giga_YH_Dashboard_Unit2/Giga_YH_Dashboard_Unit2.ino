@@ -134,840 +134,90 @@ uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
 #define VERSION_DASHBOARD "1.0.57"
-//version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
-//                Connection screen live (SSID/RSSI/broker state), everything
-//                else placeholder. Did not compile (LVGL v8-style input
-//                device driver API used against the actually-installed v9).
-//version 1.0.1 - Fixed touch input driver for LVGL 9 (lv_indev_create/
-//                lv_indev_set_read_cb replacing the removed lv_indev_drv_t
-//                struct API). First clean compile against arduino:mbed_giga
-//                4.6.0 + lvgl 9.5.0 + Arduino_GigaDisplayTouch 1.1.0.
-//version 1.0.9 - Numbering corrected to continue from the prior Unit 2
-//                lineage (Giga_LVGL_Tutorial_v1_0_8, inferred from that
-//                project's folder name -- correct me if that's not the
-//                right prior version) rather than restarting at 1.0.0.
-//                Also added the boot-time Serial version banner below.
-//                On real hardware: WiFi and MQTT broker connect confirmed
-//                working; found and fixed a missing success-log message
-//                that had looked like an indefinite hang in mqttClient.connect().
-//version 1.0.10 - Subscribed (read-only) to Battery/SoC and Battery/Action --
-//                 the same topics the sibling ESP32_Fuel_Gauge project
-//                 publishes to. Battery ring/state on Home and Battery
-//                 screens now reflect real data once a message arrives;
-//                 the Battery screen's historical curve is still a
-//                 placeholder. Still zero publish calls anywhere.
-//                 Confirmed on real hardware: WiFi/MQTT connect, both
-//                 subscriptions logged correctly by name.
-//version 1.0.11 - Subscribed (read-only) to Unit 1's own Line1/Line2
-//                 output-readback topics. Grid flow screen's L1/L2 numbers
-//                 are now real. Still zero publish calls.
-//version 1.0.12 - Post-hardware-review fix batch: replaced hand-guessed
-//                 absolute label coordinates with LVGL alignment primitives
-//                 and flex-row legend containers to fix the overlap/overrun
-//                 bugs found on real hardware; added the green/blue/red
-//                 muted battery-state color scheme (Idle/Discharging/
-//                 Charging) to both the Battery and Grid panels via one
-//                 shared helper; added isGridBypassed() to drive the Grid
-//                 panel's Consuming/Bypassing status and watt total from
-//                 real L1+L2 data; replaced the flat placeholder chart bars
-//                 on the Battery and Almanac screens with real lv_line
-//                 curves using the design mockups' own point data; added
-//                 gateway/local IP rows to the Connection screen and split
-//                 it into two columns; added simple sun/moon icon shapes to
-//                 the Almanac screen; added an explicit MQTT client ID
-//                 (mqttClient.setId) as a precaution -- not the expected fix
-//                 for the missing Line1/Line2 data seen in testing, which is
-//                 explained by Unit 1 not running during off-peak hours, not
-//                 a subscription bug. Also added lightweight last-received
-//                 timestamp bookkeeping per MQTT topic for future staleness
-//                 detection. Confirmed on real hardware: boots, connects,
-//                 subscribes, and parses Battery/SoC correctly with no
-//                 regressions from this batch.
-//version 1.0.13 - Widened the gap between the Home screen's weather pill and
-//                 TOU-rate pill (Time quadrant) after a hardware photo showed
-//                 their text visibly colliding -- the two pills' 40px
-//                 top-to-top spacing wasn't enough clearance in practice.
-//version 1.0.14 - Added a screen exporter (dumpFramebufferToSerial(),
-//                 triggered by sending 'D' over Serial): dumps the live DSI
-//                 framebuffer as raw RGB565 so a PC-side script
-//                 (tools/dump_screen.py) can reconstruct a real PNG of
-//                 whatever's on screen. Dev/debug only, not part of the
-//                 dashboard's normal operation -- lets layout be checked
-//                 against real rendered text metrics without needing a
-//                 hardware photo for every tweak.
-//version 1.0.15 - Added serial-triggered screen navigation ('H'/'T'/'C'/
-//                 'B'/'G'/'M', dev/debug only) so every screen can be
-//                 captured by the exporter without touching the board. Also
-//                 fixed a real bug the exporter caught immediately: the
-//                 Home screen's weather and TOU-rate pills were built with
-//                 guessed fixed widths (190px/240px) narrower than their
-//                 actual rendered text, so LVGL's default child-clipping
-//                 was cutting text off both pills -- replaced with
-//                 makeAutoPill(), which sizes the pill to its label's real
-//                 content instead of a guess. Same fix applied to the Time
-//                 & rates screen's larger TOU pill.
-//version 1.0.16 - Used the exporter (tools/capture_all.py) to capture and
-//                 inspect every screen for the first time and fixed
-//                 everything it caught: two Unicode punctuation characters
-//                 (en-dash, middle-dot) rendering as missing-glyph boxes on
-//                 the default font, replaced with plain hyphens; the
-//                 Connection screen's "MQTT broker"/"IP address" labels
-//                 overlapping their own values (fixed with a new
-//                 right-aligned fixed-width makeRowLabel() helper instead
-//                 of a guessed gap); the Grid screen's "Saved today"
-//                 caption clipped in a too-narrow stat column; the Home
-//                 screen's battery-state placeholder text ("Waiting for
-//                 data") clipped because it's deliberately left-justified
-//                 with less room than centered text would have; and the
-//                 Home screen's TOU pill overflowing its quadrant once the
-//                 auto-pill fix let it size to its real (too-wide for this
-//                 quadrant) content.
-//version 1.0.17 - The 1.0.16 Connection-screen fix above introduced its own
-//                 new bug, caught by re-capturing after that fix: the
-//                 right-aligned label box was too narrow, so "MQTT broker"/
-//                 "IP address"/"Firmware" wrapped onto a second line and
-//                 collided with the row below instead of overlapping the
-//                 value column. Widened the label box and switched
-//                 makeRowLabel() to LV_LABEL_LONG_MODE_CLIP so a
-//                 still-too-narrow label clips instead of wrapping and
-//                 breaking row spacing. Screen-capture PNGs now get a
-//                 timestamp in their filename (never overwritten) and are
-//                 logged to tools/captures/capture_log.csv for an audit
-//                 trail of what was captured and when.
-//version 1.0.18 - The 1.0.17 fix above solved the wrapping but, by pushing
-//                 rightValueX further right to make room, ran values like
-//                 "Connected" and full IP addresses off the 800px screen
-//                 edge instead -- caught by re-capturing again. Shifted the
-//                 whole right column left instead of continuing to widen
-//                 it rightward, so both the label box and the value column
-//                 have real headroom on their own side.
-//version 1.0.19 - 1.0.18's leftward shift also shrank rightLabelW from 210
-//                 (already confirmed wide enough for "MQTT broker") down to
-//                 180, silently clipping its leading "M" -- caught by
-//                 re-capturing yet again. Kept the leftward shift but
-//                 restored labelW to the already-confirmed-good 210. This
-//                 three-iteration back-and-forth is exactly why the
-//                 exporter exists: each fix got re-captured and checked
-//                 instead of assumed correct.
-//version 1.0.20 - Re-capturing the Grid screen after all the Connection
-//                 screen churn above showed its "Saved today" column
-//                 (widened to 180px back in 1.0.16) was STILL clipped --
-//                 180px isn't enough for an 11-character string at this
-//                 font, same lesson as "MQTT broker" needing 210px. Reused
-//                 that confirmed 210px width instead of guessing a third
-//                 number, and reflowed the L1/L2 columns to make room.
-//version 1.0.21 - Widened the value-to-caption line spacing (26px -> 34px)
-//                 in the Grid screen's L1/L2/Saved-today stat columns after
-//                 you flagged it as visually tight, and applied the same
-//                 30px gap to the Almanac screen's sunrise/sunset/moonrise/
-//                 moonset columns, which used the same tight pattern.
-//version 1.0.22 - Home screen's weather pill (Time quadrant) had its
-//                 opaque background clipping into the descenders ('y' in
-//                 "Monday"/"July") of the date label directly above it --
-//                 pushed the pill (and the TOU pill below it, to keep their
-//                 gap) down to clear it.
-//version 1.0.23 - Found the real root cause of a worse bug: both TOU pills
-//                 ("$0.38/kWh" on Home, the longer one on Time & rates) had
-//                 their own text clipped at the top. Measured raw pixels
-//                 from an exporter capture (not guesswork) and found the
-//                 pill was both mispositioned (~20px off from its intended
-//                 align offset) AND undersized (roughly half the expected
-//                 content height) -- a known LVGL gotcha where
-//                 LV_SIZE_CONTENT layout is deferred/batched, so reading a
-//                 freshly created object's size (via lv_obj_align) right
-//                 after creating it can see a stale, not-yet-resolved
-//                 size. Fixed at the source in makeAutoPill() with
-//                 lv_obj_update_layout(), which every pill on the dashboard
-//                 uses, rather than papering over it with a bigger guessed
-//                 padding value on just the two pills that happened to
-//                 show it. Design rule going forward: never clip an
-//                 ascender or descender; always verify at least 2px of
-//                 clear spacing via the exporter, not by eye.
-//version 1.0.24 - 1.0.23's lv_obj_update_layout() fix made no measurable
-//                 difference (verified by re-measuring the same pixels --
-//                 identical before/after), so the deferred-layout theory
-//                 was wrong. Measured further and found the real
-//                 discrepancy: two pills with identical padding computed
-//                 very different LV_SIZE_CONTENT heights (~44px vs. ~26px),
-//                 correlated with clickable vs. non-clickable state rather
-//                 than anything about the text itself. Rather than keep
-//                 chasing why, replaced LV_SIZE_CONTENT height with a
-//                 fixed, generous height (40-44px) and lv_obj_center() for
-//                 the label in makeAutoPill() -- a plain, unambiguous
-//                 layout with no dependency on that quirk at all.
-//version 1.0.25 - 1.0.24's explicit lv_obj_set_height() had NO effect
-//                 either -- re-measured raw pixels and got byte-identical
-//                 results to 1.0.23, confirming the call was silently
-//                 ignored. Root cause: lv_obj_set_width(pill,
-//                 LV_SIZE_CONTENT) appears to put the whole object in an
-//                 auto-size mode that a later fixed lv_obj_set_height()
-//                 doesn't override on its own. Fix: let the
-//                 LV_SIZE_CONTENT auto-size resolve first via
-//                 lv_obj_update_layout(), THEN call lv_obj_set_height() as
-//                 the deliberately-last size-related operation.
-//version 1.0.26 - 1.0.25's override-after-update_layout ALSO made no
-//                 measurable difference (identical pixel measurements
-//                 again), ruling out call-ordering entirely as the
-//                 mechanism. Stopped trying to fix LV_SIZE_CONTENT on the
-//                 pill container and instead measure a throwaway probe
-//                 label's real width directly, then build the pill with a
-//                 fully explicit (non-CONTENT) width/height from that
-//                 measurement -- sidesteps whatever is actually wrong with
-//                 CONTENT-sizing on this particular container/theme
-//                 combination rather than continuing to fight it.
-//version 1.0.27 - Found the REAL root cause after 1.0.26's fix also had
-//                 zero visible effect, verified via a diagnostic build
-//                 that changed the pill's own color (which DID show up,
-//                 proving the code was running) while its measured pixel
-//                 bounds stayed byte-identical regardless of any size
-//                 change: q_time (and the other three Home quadrants, and
-//                 every screen via makeScreenRoot()) never zeroed their
-//                 OWN default padding, which the active theme sets to a
-//                 non-zero value on plain lv_obj_create() containers. That
-//                 silently shifted every absolute-position/aligned child
-//                 on every screen by the same amount, AND shrank the
-//                 quadrant's real usable content area -- so the TOU pill
-//                 was being clipped by its own parent's real (smaller than
-//                 assumed) boundary no matter what size the pill itself
-//                 was given. Fixed with an explicit
-//                 lv_obj_set_style_pad_all(obj, 0, 0) on makeScreenRoot()
-//                 and all four Home quadrants.
-//version 1.0.28 - Almanac screen: the sunrise/sunset/moonrise/moonset
-//                 columns (95px tall) and the moon-phase row (30px tall)
-//                 were both too short for their real content, clipping the
-//                 BOTTOM of the caption line / the descenders on "Waxing
-//                 gibbous"'s two g's. A same-color-as-background clip is
-//                 invisible to a simple ink-vs-background pixel scan (it
-//                 looks identical to the font just ending there) -- this
-//                 one needed you pointing out specific glyph damage (a "u"
-//                 losing its connecting bottom curve, reading almost like
-//                 "ii") in a zoomed crop before it was traceable. Widened
-//                 both containers and nudged the Tide label down to keep
-//                 clearance from the (fixed-coordinate, reused-from-the-
-//                 SVG-mockup) tide chart below it.
-//version 1.0.29 - Same 30px-too-short-container bug hit the legend rows on
-//                 the Battery screen ("Charging (super off-peak)"/
-//                 "Discharging", clipped at bottom -- reported directly)
-//                 and the Time & rates screen ("Super off-peak"/"Off-peak"/
-//                 "On-peak", fixed proactively since it's the identical
-//                 makeFlexRow+makeLegendItem pattern). Both widened from
-//                 30 to 40px; the Battery one also nudged up slightly to
-//                 stay within the 480px screen height.
-//version 1.0.30 - Real data pass (display-only, no Unit 1/control changes):
-//                 (1) real summer TOU rates/schedule (on-peak 4-9pm every
-//                 day, super off-peak 12am-2pm weekends/holidays only,
-//                 off-peak the rest; 2026 holiday dates computed exactly)
-//                 now drive the Home/Time & rates pills and the Time
-//                 screen's schedule bar every second, replacing the old
-//                 static "$0.38/kWh"/flat green bar placeholders;
-//                 (2) subscribed to Line1Set (same topic Unit 1 itself
-//                 uses for Home Assistant's total_power_from_grid) for a
-//                 real whole-household grid-consumption reading, now
-//                 driving the Grid screen's big number/status (3-state:
-//                 Consuming/Bypassing/Exporting, since the real signal
-//                 can go negative unlike the old L1+L2-sum proxy);
-//                 (3) real NOAA tide predictions for La Jolla (station
-//                 9410230, all of 2026, embedded from a verified NOAA
-//                 fetch -- see tide_data_2026.h) replace the Almanac
-//                 screen's static single-curve mockup data, with a
-//                 cosine-eased curve between today's actual high/low
-//                 events and real High/Low time labels.
-//version 1.0.31 - Fixed the weekday TOU schedule: 1.0.30 assumed weekdays
-//                 had no super off-peak window at all (matching only the
-//                 weekend/holiday numbers you'd given first), which you
-//                 caught -- weekdays actually have TWO super off-peak
-//                 windows, 12am-6am and 10am-2pm. Refactored the schedule
-//                 into a single buildTouWindows() both the tier lookup
-//                 (computeTouStatus) and the visual bar (buildTouSegments)
-//                 now derive from, instead of two separately-maintained
-//                 copies of the schedule shape that could (and did
-//                 nearly) drift apart. Bar segment count bumped from 4 to
-//                 6 (weekdays now need more segments than weekends).
-//version 1.0.32 - Added two more pills below the Time & rates screen's
-//                 main status pill, showing the other two rates (no
-//                 "until" time, just tier + price), ordered by which one
-//                 comes up next in the schedule -- findUpcomingTiers()
-//                 walks buildTouWindows() forward from now to decide the
-//                 order. Same flex-row-pair centering pattern as every
-//                 other multi-item row on this dashboard.
-//version 1.0.33 - 1.0.32's side-by-side pair ran off both edges of the
-//                 screen -- "Super off-peak - $0.09/kWh" is long enough
-//                 that two of them plus a gap don't fit in 800px.
-//                 Restacked all three pills vertically (one per row)
-//                 instead, per your correction.
-//version 1.0.34 - Grid screen ("the consumption page") rework, per a
-//                 detailed discussion: (1) two rings side by side --
-//                 Battery (L1+L2 feeder sum, dynamic In/Out/Idle label,
-//                 unchanged battery-state colors) and Grid (real
-//                 Line1Set+Line2Set sum, static "Grid In/Out" label,
-//                 blue/red by sign only); (2) corrected a real
-//                 misunderstanding about Line1Set/Line2Set -- they're
-//                 independent per-line signed readings, NOT a duplicated
-//                 whole-home value as an earlier comment claimed (user
-//                 confirmed via HIL testing), so both are now subscribed
-//                 and summed for the true total; (3) relabeled L1/L2 to
-//                 L1/L2 Feeder and added L1/L2 Grid columns showing the
-//                 real per-line data; (4) Saved Today is now computed
-//                 (time-averaged: elapsed on/off-peak hours today, purely
-//                 from the clock + schedule, x last-known battery
-//                 discharge power x their rates) instead of a hardcoded
-//                 "$4.20"; (5) fixed the Almanac tide High/Low labels to
-//                 sort by actual time of day (left=earlier) instead of a
-//                 fixed High=left/Low=right that could disagree with the
-//                 curve's own left-to-right time order; (6) corrected a
-//                 header comment calling this a "power-arbitrage" system
-//                 -- it's TOU optimization, not buying/selling power.
-//                 Also flagged (not fixed here): Unit 1's own
-//                 oscillation-fix halving logic assumed the now-corrected
-//                 Line1Set/Line2Set-are-duplicates premise -- tracked
-//                 separately.
-//version 1.0.35 - 1.0.34's Battery ring shipped with a literal zero-length
-//                 arc (angles 0,0 never updated), invisible next to the
-//                 Grid ring's visible placeholder arc -- caught in the
-//                 first real hardware capture. Turned it into an actual
-//                 gauge instead of just fixing the placeholder angle: the
-//                 user gave the real hardware limit (max battery
-//                 discharge/output is 1800W), so the ring now shows
-//                 |L1+L2 feeder power| / 1800W as a real 0-360 degree
-//                 arc, same pattern as the SoC ring elsewhere.
-//version 1.0.36 - Grid screen's two ring columns (185px tall) clipped the
-//                 descending 'y' in "Battery" against their own bottom
-//                 edge -- caught in the first real hardware capture of
-//                 1.0.35. Widened to 200px and nudged the rows below down
-//                 to keep clear gaps. Also added a test layout on the
-//                 Home screen's bottom-right quadrant: the battery power
-//                 ring next to the grid power ring, short "Batt"/"Grid"
-//                 labels for now, purely to confirm two rings fit in that
-//                 compact 396x236 space before refining further.
-//version 1.0.37 - 1.0.36's Home quadrant two-ring test also clipped --
-//                 zoomed pixel inspection showed "Batt"/"Grid" cut across
-//                 their whole bottom edge, not just a descender: 130px
-//                 was less than the bare-minimum ring+watts+label space
-//                 needed with ZERO margin, not just a tight fit. Widened
-//                 to 190px with real (10px+) gaps between every element
-//                 this time instead of just enough to theoretically clear.
-//version 1.0.38 - Real-hardware bug batch, caught after actual daily use:
-//                 (1) the Home/Time date labels ("Monday, July 13") were
-//                 build-time placeholder text that was never updated at
-//                 runtime -- added getLocalDateStr() (same _rtc_localtime
-//                 the clock already uses) and wired it into the existing
-//                 1-second tick, same as the clock string; (2) the Grid
-//                 ring's arc angle was never set in loop() at all (only
-//                 its color was) -- it was permanently stuck at its
-//                 build-time placeholder (60-120 degrees) regardless of
-//                 real data, which is why it looked like the whole Home
-//                 quadrant wasn't "loading"; now scaled as a real gauge
-//                 like the Battery ring, against a new MAX_GRID_POWER
-//                 (22kW, a ring-visual-only scale, never clamps the
-//                 displayed number); (3) g_line1GridPower/g_line2GridPower
-//                 were each silently constrained to +-900W (a leftover
-//                 copy-paste from Line1/Line2's real 900W output ceiling)
-//                 -- since these are independent real Home Assistant
-//                 grid readings with no such ceiling, this capped
-//                 combined consumption at 1800W exactly, which is what
-//                 the user saw and is now removed entirely, per request,
-//                 in favor of displaying the real unclamped value.
-//                 MAX_BATTERY_POWER's comment clarified: it only scales
-//                 the Battery ring's gauge and only applies to discharge
-//                 -- charging was, and remains, uncapped in the displayed
-//                 number.
-//version 1.0.39 - Tapping the Home screen's bottom-right quadrant stopped
-//                 navigating to the Grid screen once 1.0.36 added the
-//                 Batt/Grid ring columns there. Root cause: makeColumn()
-//                 builds on lv_obj_create(), which is CLICKABLE by
-//                 default, and never cleared that flag (unlike makeRing,
-//                 which explicitly does) -- the two columns cover almost
-//                 the whole quadrant, so LVGL delivered the tap to the
-//                 column (which has no handler) instead of bubbling it up
-//                 to the quadrant's own navGrid callback. Every other
-//                 makeColumn() call site was already non-interactive
-//                 content, so clearing CLICKABLE there is a pure fix, not
-//                 a behavior tradeoff.
-//version 1.0.40 - Added a simulated-touch serial command ('P' + 3-digit x
-//                 + 3-digit y, e.g. "P402242") per request, so tap
-//                 regressions like 1.0.39's can be verified from a PC
-//                 script instead of needing hands on the board. Registers
-//                 a second LVGL pointer indev fed from serial instead of
-//                 the real digitizer -- goes through real hit-testing/
-//                 click-bubbling, not a fake shortcut -- auto-releasing
-//                 ~80ms after the press so LVGL sees a normal click, not
-//                 a long-press/drag. See tools/sim_tap.py. Initial version
-//                 fed the indev already-logical (800x480) coordinates and
-//                 silently never hit anything: LVGL applies its own
-//                 lv_display_rotate_point() to every pointer indev's raw
-//                 point (Arduino_H7_Video creates the LVGL display at the
-//                 physical panel's native 480x800 portrait + ROTATION_270,
-//                 and the real touch driver "just works" because the
-//                 touch controller already reports raw panel-space
-//                 coordinates for LVGL to rotate). Traced with a temporary
-//                 LV_EVENT_ALL debug handler on the target object, which
-//                 showed only periodic redraw events and zero PRESSED/
-//                 RELEASED -- confirmed the point was landing nowhere.
-//                 Fixed by inverting ROTATION_270's transform in
-//                 simTouchReadCb() so the serial protocol can stay in
-//                 familiar logical coordinates.
-//version 1.0.41 - Saved Today was valuing a single instantaneous
-//                 discharge-power sample (g_lastDischargePower, last
-//                 reading while battery state was "Discharging") x
-//                 elapsed on/off-peak hours -- per request, replaced
-//                 with real state-of-charge: energy withdrawn today is
-//                 now (1 - SoC) x the real 18kWh pack capacity
-//                 (BATTERY_CAPACITY_KWH), so a fully charged battery
-//                 always shows $0.00 and it rises as SoC drops. Still
-//                 uses the same time-averaged on/off-peak elapsed-hours
-//                 split to value that energy (uniform-consumption
-//                 simplification, unchanged). g_lastDischargePower is
-//                 gone -- it had no other use.
-//version 1.0.42 - Saved Today's blended rate used hours ELAPSED SO FAR
-//                 today, so before the first on-peak window starts (e.g.
-//                 all morning) onPeakHours was 0 and the blend collapsed
-//                 to a pure $0.43492 off-peak rate -- not wrong exactly
-//                 (correctly reflects that no on-peak time has actually
-//                 occurred yet), but per request changed to use the
-//                 day's FIXED on-peak/off-peak hour totals instead (via
-//                 computeElapsedTierHours(..., 24.0, ...), reusing the
-//                 same function for the whole-day case), so the blended
-//                 rate is stable all day and always strictly between
-//                 $0.43492 and $0.65410.
-//version 1.0.43 - Added an orbiting charge/discharge dot to the SoC
-//                 ring (both the Home quadrant and the Battery detail
-//                 screen), planned and mocked up interactively before
-//                 writing any of this. The ring itself is unchanged
-//                 (still teal, still starts east) except its track is
-//                 now red instead of neutral gray, per request. The dot
-//                 layers two more independent signals on top: color +
-//                 spin direction from g_batteryState (yellow/clockwise
-//                 while charging, amethyst/counter-clockwise while
-//                 discharging, matching the physical ESP32 FastLED fuel
-//                 gauge's own traveling-highlight colors exactly), and
-//                 spin rate from real power (up to 1 full rotation/sec
-//                 at 100%) -- feeder power (L1+L2) over MAX_BATTERY_POWER
-//                 while discharging, grid total power via a two-point
-//                 calibrated line (50W->10%, 7000W->100%) while charging
-//                 as a temporary stand-in until a real charge-power MQTT
-//                 topic exists. Idle never spins. Implemented as a plain
-//                 lv_obj dot repositioned every animation tick via
-//                 cos/sin from a tracked float angle (not an lv_arc
-//                 rotation), so a mid-spin direction/rate change restarts
-//                 from the dot's current position instead of snapping
-//                 back to the east starting point. Also fixed the same
-//                 click-through bug as makeColumn() (v1.0.39) in the
-//                 pre-existing makeDot() helper -- lv_obj_create() is
-//                 clickable by default and the orbiting dot moves around
-//                 clickable quadrants/screens, so this needed to be
-//                 correct even though the existing static legend dots
-//                 never surfaced it in practice.
-//version 1.0.44 - Real-hardware bug batch: (1) the SoC ring's Charging/
-//                 Discharging/Idle state text could show a false "Idle"
-//                 indefinitely -- g_batteryState defaults to 0 (Idle) at
-//                 boot, there's no MQTT staleness timeout by design, and
-//                 the Battery/Action topic's publisher likely doesn't
-//                 retain it, so a freshly booted/reflashed Unit 2 has no
-//                 way to learn the CURRENT state until the next real
-//                 transition. Now gated on g_lastBatteryActionMs (only
-//                 ever set inside the Action handler) so it shows
-//                 nothing until a real reading has actually arrived,
-//                 instead of a guess; (2) added seconds back to the
-//                 clock (getLocaltime(), shared by Home and Time
-//                 screens); (3) Home quadrant's "Batt" label spelled
-//                 out to "Battery" -- fits fine in the 185px column.
-//version 1.0.45 - Added a static "Feeder" caption below the Home
-//                 quadrant's Battery label, centered, per request --
-//                 clarifies that ring measures feeder power (same
-//                 source as the Grid screen's L1/L2 Feeder columns).
-//                 Plain text, no data dependency, so it shows
-//                 regardless of whether Unit 1 is currently publishing.
-//version 1.0.46 - First pieces of the planned WiFi setup flow (network
-//                 select + on-screen keyboard UI comes in a later
-//                 version): (1) mbed KVStore (QSPI-backed, physically
-//                 separate from program flash so it survives a sketch
-//                 reflash, not just a reboot) for persisting a
-//                 manually-entered WiFi network across firmware
-//                 updates -- saveWifiCredentials()/loadWifiCredentials(),
-//                 verified round-trip AND reflash-survival on real
-//                 hardware via a temporary 'K' serial test command;
-//                 (2) connectToWiFi() no longer retries forever with a
-//                 single credential source -- bounded 3x15s attempts
-//                 against secrets.h, then 3x15s against stored KVStore
-//                 credentials if that fails, returning false if both do
-//                 (setup() currently just retries this pair indefinitely
-//                 since the manual setup screens that should take over
-//                 at that point don't exist yet -- next version); (3)
-//                 ssid[]/password[] grew from secrets.h-exact-length to
-//                 fixed 33/64-byte buffers (real WiFi SSID/WPA2 maximums)
-//                 so a runtime-entered network can actually fit.
-//version 1.0.47 - Manual WiFi setup flow completed and verified end-to-end
-//                 on real hardware: network-scan list screen and
-//                 lv_keyboard-based password entry screen, both wired into
-//                 the fallback chain from 1.0.46. Also extracted the
-//                 serial dev-command handling (screen dump/nav/sim-touch)
-//                 into a standalone serviceDevCommands(), called from both
-//                 loop() and setup()'s manual-setup wait loop -- previously
-//                 those dev tools only worked from loop(), so they were
-//                 unusable during exactly the blocking flow they're most
-//                 needed for. Removed the temporary 'K' KVStore test
-//                 command now that the real flow exercises save/load for
-//                 real. Three real bugs found and fixed via screen-dump
-//                 captures during testing: (1) scan-list rows were sized
-//                 equal to their list container's *outer* width, overflowing
-//                 past the container's own side padding -- combined with
-//                 the "Secured"/"Open" label, this clipped text against the
-//                 physical 800px screen edge (rendered as "Secure" with the
-//                 trailing "d" cut off); rows now use lv_pct(100), and the
-//                 label was shortened to "Lock"/"Open" and right-aligned
-//                 via makeRowLabel() to fit the narrow gap next to the
-//                 signal-strength bars; (2) hidden/non-broadcasting
-//                 networks surfaced as scan results with an empty SSID,
-//                 rendering as dead, unlabeled, still-tappable rows -- now
-//                 skipped; (3) lv_keyboard_create()'s own constructor
-//                 bottom-docks the keyboard via a *sticky* LV_ALIGN_BOTTOM_MID
-//                 (LVGL re-applies it on later internal layout passes),
-//                 which fired against a stale intermediate height and left
-//                 the keyboard positioned at y=440 instead of y=220 --
-//                 only its top ~40px row (of four) was visible above the
-//                 480px screen bottom, making three of the four keyboard
-//                 rows completely unusable. Fixed by re-asserting the
-//                 bottom alignment as the last setup step instead of
-//                 fighting it with a fixed lv_obj_set_pos. Confirmed on
-//                 real hardware: tapped a real scanned network ("Oscar"),
-//                 typed its real password via the on-screen keyboard,
-//                 connected, and -- on a completely fresh reflash with
-//                 secrets.h still pointed at a bogus test network -- the
-//                 board fell through to the just-saved KVStore credentials
-//                 and connected using those, proving the manual-entry ->
-//                 KVStore-save -> KVStore-load round trip is real, not
-//                 just the earlier synthetic test.
-//version 1.0.48 - Replaced the Home quadrant's and Connection screen's
-//                 hardcoded-green "Connected" dot/label (set once at
-//                 screen-build time, never touched again) with a real
-//                 three-state indicator (Connecting/Connected/Not
-//                 connected) via setConnStatusIndicator(), called at
-//                 every real WiFi state transition: before the first
-//                 connect attempt, after it resolves (either source, or
-//                 falling through to manual setup), after a successful
-//                 manual/Reset-network round trip, and once per second
-//                 from loop()'s existing update tick (this sketch has no
-//                 active reconnect loop, so a runtime drop correctly
-//                 shows "Not connected" instead of a stale "Connected").
-//                 Also added the Connection screen's "Reset network"
-//                 button -- clears the stored KVStore credentials and
-//                 re-enters the same manual setup flow immediately,
-//                 without touching secrets.h, for switching networks
-//                 without a reflash. Along the way, found and fixed a
-//                 second real bug: a single lv_timer_handler() call
-//                 before a blocking WiFi call doesn't guarantee the
-//                 frame has actually reached the panel by the time
-//                 execution continues -- added forcePaint() (several
-//                 ticks with a short real delay between them) and used
-//                 it everywhere a state needs to be visibly painted
-//                 before blocking. Verified the indicator itself is
-//                 correct via a temporary debug print reading the live
-//                 LVGL label text directly (confirmed "Connecting" during
-//                 a forced-failure test) after a screen-dump capture
-//                 taken at that same instant misleadingly still showed
-//                 the previous "Connected" state -- traced to the
-//                 screen-dump tool itself reading stale DRAM content
-//                 that survives a soft reset during the display's own
-//                 cold-boot window, not a firmware bug (three separate
-//                 captures across different boot attempts, including one
-//                 after the forcePaint fix, came back byte-for-byte
-//                 identical, which a live redraw could never produce).
-//version 1.0.49 - Real-hardware feedback batch on the WiFi feature:
-//                 (1) Connecting now shows no dot, just two-line amber
-//                 "Attempting\nto Connect" text (previously a dot +
-//                 single-line "Connecting"); Connected/Not connected keep
-//                 the dot. (2) Password entry no longer masks with dots
-//                 -- shows the typed password in plain text, so it can be
-//                 checked directly against the real network password
-//                 instead of trusting a character count. (3) Renamed/
-//                 repositioned the Connection screen's network-switch
-//                 button from "Reset network" (bottom-right) to "Change
-//                 WiFi" (bottom-left, two lines, taller for an easier
-//                 touch target); simplified its behavior to not
-//                 pre-emptively disconnect or clear the stored credential
-//                 -- it just opens the scan screen, a successful new
-//                 connection overwrites the stored credential itself, and
-//                 canceling out now genuinely exits back to normal
-//                 operation (previously Cancel only changed the visible
-//                 screen while silently remaining blocked, harmless for
-//                 boot-time setup where nothing exists to cancel back to,
-//                 but not appropriate for a live already-connected
-//                 device -- see g_manualSetupIsRuntimeChange). (4) Fixed
-//                 a real clipping bug the "Attempting to Connect" text
-//                 surfaced: the Home quadrant's and Connection screen's
-//                 status row was only 30px tall, clipping the new
-//                 two-line text against its own bottom edge -- grown to
-//                 60px on both (harmless for the single-line Connected/
-//                 Not-connected states). (5) Home quadrant's clock/date/
-//                 weather/TOU-rate group is now replaced by a single
-//                 "--:--:--\nGetting Time, Date,\nand Status" message
-//                 (amber) while connecting, since the clock/date are
-//                 NTP-derived and meaningless before a connection exists;
-//                 swaps back once resolved. (6) The Home quadrant's SSID
-//                 line is hidden while connecting (nothing meaningful to
-//                 show yet) and shown again once Connected/Not connected,
-//                 rather than either always-visible or removed outright.
-//version 1.0.50 - Fixed two real, board-freezing hangs found testing the
-//                 "Change WiFi" button on real hardware, both the same
-//                 root cause at different call depths: running this
-//                 flow's blocking lv_timer_handler() wait loop directly
-//                 inside an LVGL click-event callback re-enters LVGL's
-//                 own timer/event dispatch, since the callback is itself
-//                 already running *inside* an active lv_timer_handler()
-//                 call. (1) The button's own click handler used to start
-//                 the whole flow immediately -- froze instantly on tap,
-//                 before "Scanning..." even rendered. Trying
-//                 lv_async_call() to defer it did NOT help (it's just a
-//                 zero-delay LVGL timer, still serviced BY
-//                 lv_timer_handler(), not genuinely outside it) -- fixed
-//                 by having the click handler only set a flag
-//                 (g_wifiChangeRequested), checked and acted on directly
-//                 in loop() itself, which calls lv_timer_handler() rather
-//                 than ever being called by it. (2) One level deeper:
-//                 attemptWifiConnectFromSetup() (via forcePaint()) was
-//                 still being called directly from onWifiPasswordSubmit()/
-//                 onWifiNetworkSelected(), themselves event callbacks
-//                 nested inside the wait loop's own lv_timer_handler()
-//                 call -- froze on the password screen after tapping
-//                 submit. Same fix, one level in: those callbacks now
-//                 only record which network/password to try
-//                 (g_pendingWifiAttempt), and the wait loop itself (both
-//                 copies, in setup() and startChangeWifiFlow()) makes the
-//                 actual attempt.
-//                 A same-day investigation into occasional double
-//                 presses/slow input on the real (not simulated)
-//                 on-screen keyboard tried several debounce approaches
-//                 and a coordinate-rotation "fix" -- all made things
-//                 worse or didn't help, including a mistaken rotation
-//                 transform confirmed to double-rotate coordinates that
-//                 LVGL's own display rotation already handles correctly
-//                 (touchpad_read() is back to its untouched original
-//                 form). Not resolved -- tracked as GitHub issue #1.
-//version 1.0.51 - Battery screen's chart is now real: subscribes to a
-//                 new HA-side topic (V1.0/Home/Battery/DaySOC, published
-//                 by a new pyscript automation --
-//                 homeassistant/pyscript/battery_day_curve.py -- rebuilt
-//                 from HA's own recorder history every 30 minutes) and
-//                 replaces the old static two-polyline mockup placeholder
-//                 with a real multi-segment curve. Renders as up to 8
-//                 lv_line segments (real margin for realistic cycle
-//                 counts), splitting into a new segment on every
-//                 Charging/Idle-vs-Discharging change, so any number of
-//                 real charge/discharge cycles in a day renders
-//                 correctly -- the old placeholder assumed exactly one
-//                 charge-then-discharge arc, which silently doesn't hold
-//                 on a system with two independent TOU-driven cycles.
-//                 Two-color per explicit request (deliberately the
-//                 OPPOSITE of this app's usual Charging=red/
-//                 Discharging=blue convention used elsewhere): Charging
-//                 and Idle both render blue, Discharging renders red.
-//                 Chart redraws when the screen is navigated to, and
-//                 when fresh data arrives while it's already the visible
-//                 screen -- not unconditionally in the background, since
-//                 nobody's looking at a hidden screen's chart. The old
-//                 fixed "now" dot/label (pinned to the placeholder's own
-//                 fixed example endpoint) is removed rather than ported
-//                 forward wrong. Saved Today's own known multi-cycle bug
-//                 (see next version) is NOT fixed yet in this version --
-//                 this is the curve-rendering half only, by design, to
-//                 verify on real hardware before layering the savings
-//                 math revision on top.
-//version 1.0.52 - Saved Today's multi-cycle bug (flagged in 1.0.51) is
-//                 fixed: it now walks the real g_daySoc* curve and sums
-//                 every discharging segment's SoC drop, each priced at
-//                 the ACTUAL historical TOU tier for that segment's own
-//                 bucket -- so a second cycle no longer silently
-//                 disappears if the battery recharged to 100% in
-//                 between. If NO discharge has happened yet today (only
-//                 charging so far, e.g. an early-morning super off-peak
-//                 charge), net charged energy is valued at today's
-//                 full-day blended rate instead, as a forward estimate
-//                 of what it'll be worth once discharged -- the moment
-//                 real discharge data exists, that estimate is dropped
-//                 entirely in favor of exact TOU pricing, not blended
-//                 with it. Also added a "Saved yesterday" column next to
-//                 it on the Grid screen, static "$5.55" placeholder text
-//                 for now -- Unit 2 doesn't retain SoC history across a
-//                 day rollover, so a real prior-day total needs a
-//                 pyscript-side computation (deferred).
-//version 1.0.53 - Saved Yesterday's placeholder ("$5.55") is now real:
-//                 the framework used for today's curve is extended to
-//                 also publish yesterday's full-day curve
-//                 (V1.0/Home/Battery/YesterdaySOC, same pyscript
-//                 automation, same bucket:soc:state encoding) and the
-//                 Saved Today calc is factored out into
-//                 computeSavedFromSocCurve() so Saved Yesterday can
-//                 reuse the exact same discharge-segment/TOU-pricing
-//                 logic against g_yesterdaySoc* instead of g_daySoc*.
-//                 Priced using YESTERDAY's real wday/month/day (see new
-//                 getYesterdayLocalTm(), epoch-based so month/year
-//                 rollovers are handled correctly), not today's, since
-//                 the TOU schedule/holiday status can differ day to
-//                 day. onMqttMessage()'s DaySOC parsing logic is now
-//                 shared via parseSocCurvePayload() rather than
-//                 duplicated for the new topic.
-//version 1.0.54 - MQTT broker host/username/password are now runtime-
-//                 editable (were compile-time HOME_ASSISTANT_IP/
-//                 MQTT_USERNAME/MQTT_PASSWORD consts), same
-//                 architecture as the existing WiFi setup flow: KVStore
-//                 persistence, a bounded stored-then-secrets.h connect
-//                 attempt at boot, and a manual 3-screen setup flow
-//                 (host -> username -> password) reachable via a new
-//                 "Change MQTT" button on the Connection screen or
-//                 automatically if both boot-time attempts fail --
-//                 previously a failed MQTT connect just showed a
-//                 permanent, unfixable "Not connected" with no path to
-//                 recover without a reflash. The host screen uses a
-//                 numeric/phone-pad keyboard (LV_KEYBOARD_MODE_NUMBER)
-//                 instead of the full alphanumeric one, since a broker
-//                 IP is only ever digits and dots. Priority order is
-//                 deliberately reversed from WiFi's (stored settings
-//                 tried FIRST, secrets.h as fallback) since the
-//                 scenario this exists for is specifically "the
-//                 broker's IP moved and secrets.h is now stale."
-//                 Also fixed a real (pre-existing, now-shared) bug
-//                 caught by real-hardware testing this: makeLabel() sets
-//                 no width/wrap, so wifiConnectStatusLbl's "Couldn't
-//                 connect..." error text was silently running off the
-//                 screen's right edge with no wrapping -- never actually
-//                 visible before since the WiFi version's message just
-//                 barely fit, but mqttConnectStatusLbl's one-character-
-//                 longer message tipped it over into visible clipping.
-//                 Both labels now get an explicit width + WRAP long-mode.
-//                 Verified end-to-end on real hardware: wrong-IP entry
-//                 shows the (now-wrapped) error and allows retry;
-//                 correcting it connects, subscribes, and returns home;
-//                 a forced reflash afterward confirmed via serial log
-//                 ("Connected to MQTT broker (stored settings)") that
-//                 the KVStore-saved settings really do take priority
-//                 over secrets.h on the next boot, not just coincidentally
-//                 still working because both happen to hold the same
-//                 values.
-//version 1.0.55 - Fixed a real, reproducible board hang on "Change
-//                 WiFi"/"Change MQTT" (v1.0.54 regression, worse on a
-//                 SECOND invocation of either than the first) via
-//                 real-hardware bisection and progressively finer
-//                 Serial trace logging. Root cause: the mbed RTOS main
-//                 thread's stack -- 32KB by default on this core's own
-//                 variant config -- was too small for this app's LVGL
-//                 object creation (building the WiFi scan list's rows
-//                 specifically), causing a silent stack overflow rather
-//                 than a clean error. Fixed via a sketch-local
-//                 mbed_app.json (arduino-cli picks it up automatically)
-//                 raising rtos.main-thread-stack-size to 128KB.
-//                 Along the way, also moved LVGL's own memory pool off
-//                 internal SRAM onto the Giga's external 8MB SDRAM
-//                 (LV_MEM_SIZE 512KB via ea_malloc, see lv_conf.h) --
-//                 this alone did NOT fix the hang (the real bottleneck
-//                 was the stack, not the heap), but it's a genuine
-//                 improvement in its own right: internal SRAM is scarce
-//                 and shared with the WiFi module/RTOS/etc., while the
-//                 Giga's SDRAM sits almost entirely idle by default.
-//                 Also fixed the MQTT flow's 3 separate always-alive
-//                 lv_keyboard widgets (added in 1.0.54) down to 1
-//                 shared, reparented keyboard -- a real, unnecessary
-//                 memory cost, though not the hang's root cause either.
-//                 Verified on real hardware: "Change WiFi" and "Change
-//                 MQTT" both complete successfully on repeated
-//                 back-to-back invocations, not just the first.
-//version 1.0.56 - The 1.0.55 fix above was incomplete: a chained real-
-//                 hardware test (WiFi x2 then MQTT x2, no reboot
-//                 between) still hung. Added logMemStatus() (LVGL's own
-//                 lv_mem_monitor(), logged after every Change WiFi/
-//                 Change MQTT flow) to actually measure the heap instead
-//                 of guessing, which found two compounding, previously-
-//                 undiagnosed root causes:
-//                 1) A genuine, unpatched LVGL v9.5.0 bug (upstream
-//                    issue #9794/PR #9795, fixed in LVGL after our
-//                    version shipped): lv_obj_class_create_obj() and
-//                    lv_obj_set_parent() both grow a parent's children
-//                    array via an UNCHECKED lv_realloc(), immediately
-//                    indexing into the result. Under memory pressure
-//                    that realloc can return NULL, turning a normal
-//                    allocation failure into a raw NULL-pointer write --
-//                    exactly the "hangs/corrupts on a later invocation"
-//                    signature reported. Hit on every WiFi-scan-list row
-//                    build (lv_obj_create) and every single MQTT
-//                    keyboard reparent (lv_obj_set_parent, see
-//                    attachMqttKeyboard()). Backported minimal NULL-
-//                    checks for all four unchecked realloc call sites in
-//                    lvgl/src/core/lv_obj_class.c and lv_obj_tree.c.
-//                 2) The 1.0.55 changelog's own "moved LVGL's memory
-//                    pool to SDRAM, 512KB via ea_malloc" claim had never
-//                    actually taken effect: lv_conf.h sits one directory
-//                    level above lvgl's src/ folder (Arduino's install
-//                    layout), but lv_conf_internal.h's own fallback
-//                    search path assumes two levels up (the upstream/
-//                    PlatformIO layout) -- and whether the __has_include
-//                    auto-detect ahead of that fallback succeeds turns
-//                    out to depend on per-file include-path quirks that
-//                    differ between the sketch's own translation unit
-//                    and LVGL's own library .c files. Confirmed via a
-//                    #pragma-message compile probe that lv_mem_core_
-//                    builtin.c -- the file that actually creates the
-//                    memory pool -- was silently using
-//                    lv_conf_internal.h's built-in 64KB/internal-SRAM
-//                    default this entire time, regardless of anything
-//                    set in lv_conf.h. This fully explains why editing
-//                    LV_MEM_SIZE across the 1.0.55 investigation never
-//                    changed the compiled RAM stat, and why the real
-//                    heap was running at 84-91% used with single-digit-
-//                    KB free and fragmentation climbing to 49% across
-//                    just two chained invocations -- a far more direct
-//                    explanation for intermittent failures than pure
-//                    fragmentation. Fixed by forcing an absolute
-//                    LV_CONF_PATH in lv_conf_internal.h so every
-//                    translation unit resolves the exact same lv_conf.h,
-//                    unconditionally (also caught and fixed a real,
-//                    previously-masked config bug this exposed:
-//                    LV_FONT_DEFAULT pointed at the disabled
-//                    lv_font_montserrat_14; corrected to _32, the only
-//                    size actually enabled).
-//                 Verified on real hardware post-fix: chained WiFi x2
-//                 then MQTT x2 (the exact sequence that hung before) via
-//                 simulated touch, logMemStatus() showing total=~517KB,
-//                 free=~460-467KB (89-90% free), free_biggest essentially
-//                 equal to free_size, frag_pct=1%, max_used=~52-59KB
-//                 across all four invocations -- no growth, no
-//                 fragmentation buildup, no leak signature. (Global
-//                 variables RAM also dropped from 144184 to 78648 bytes
-//                 in the build stats -- the old, invisible 64KB static
-//                 SRAM fallback array disappearing now that the real
-//                 SDRAM-backed pool is actually in use.)
-//version 1.0.57 - Fixed: "Change WiFi"/"Change MQTT" disconnected the
-//                 board even when the user cancelled out or an attempt
-//                 failed, not just on a successful change. Root causes:
-//                 (1) populateWifiScanList() calls WiFi.disconnect()
-//                 unconditionally on entry (genuinely required for a
-//                 clean scan on this hardware, see its own comment) --
-//                 previously nothing reconnected afterward if the flow
-//                 then ended without a new connection. (2)
-//                 ArduinoMqttClient's MqttClient::connect() calls
-//                 _client->stop() unconditionally before attempting the
-//                 new connection, regardless of whether that attempt
-//                 then succeeds -- so a failed "Change MQTT" (typo,
-//                 wrong IP, broker temporarily unreachable) silently
-//                 killed a working connection too. Fixed by capturing
-//                 the prior ssid/password (WiFi) or reusing
-//                 mqttHost/mqttUserRuntime/mqttPassRuntime (MQTT, only
-//                 overwritten on success) and reconnecting to them --
-//                 WiFi once, after the whole flow ends without a new
-//                 connection; MQTT immediately after each failed
-//                 attempt, plus re-subscribing (a fresh TCP session has
-//                 no subscriptions). Both guarded to only fire during a
-//                 live runtime change (g_manualSetupIsRuntimeChange /
-//                 g_mqttManualSetupIsRuntimeChange) -- boot-time
-//                 fallback has no prior working connection to restore.
-//                 Also corrected the lvgl_patches/ writeup: the
-//                 lv_conf.h resolution issue was misdiagnosed in 1.0.56
-//                 as an LVGL directory-layout bug (filed as
-//                 lvgl/lvgl#10356) -- the real cause is Arduino_H7_Video
-//                 (the Giga core's own display helper library) shipping
-//                 its own bundled lv_conf.h that shadows any
-//                 user-supplied one via __has_include, confirmed via
-//                 actual compiler include-resolution tracing. Not an
-//                 LVGL bug; the LV_CONF_PATH fix itself was already
-//                 correct, just misattributed. Issue corrected/closed.
+//version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
+//version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
+//version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
+//version 1.0.10 - Subscribed (read-only) to Battery/SoC + Battery/Action.
+//version 1.0.11 - Subscribed (read-only) to Unit 1's Line1/Line2 output-readback topics.
+//version 1.0.12 - Real-hardware fix batch: LVGL alignment instead of guessed coordinates, battery-state color
+//                 scheme, real lv_line charts, 2-column Connection screen, explicit MQTT client ID.
+//version 1.0.13 - Widened Home screen pill spacing (text was colliding).
+//version 1.0.14 - Added the screen exporter (dumpFramebufferToSerial + tools/dump_screen.py) for verifying
+//                 real rendered layout instead of guessing from source.
+//version 1.0.15 - Added serial screen-nav commands. Fixed pill text clipping via makeAutoPill() (guessed
+//                 widths were narrower than real rendered content).
+//version 1.0.16 - Iterative real-capture-driven fixes: Unicode glyph fallback, label overlap/clipping on
+//                 the Connection and Grid screens.
+//version 1.0.17 - The 1.0.16 fix introduced label wrapping/collision -- widened the box, switched to clip
+//                 long-mode. Captures now timestamped + logged to capture_log.csv.
+//version 1.0.18 - 1.0.17's widening ran values off the 800px screen edge -- shifted the whole right column
+//                 left instead of continuing to widen rightward.
+//version 1.0.19 - 1.0.18's shift silently shrank a label width below a previously-confirmed-good value --
+//                 restored it. Three-iteration lesson: re-capture and verify every fix, never assume.
+//version 1.0.20 - Same too-narrow-column bug hit the Grid screen's "Saved today" column -- reused the
+//                 already-confirmed-good width instead of guessing a third number.
+//version 1.0.21 - Widened stat-column line spacing on the Grid and Almanac screens (visually tight).
+//version 1.0.22 - Fixed the weather pill clipping into the date label's descenders above it.
+//version 1.0.23 - 1.0.27 - Extended debugging saga chasing TOU pill text clipping through several wrong
+//                 theories (deferred layout, LV_SIZE_CONTENT quirks, call ordering) before finding the real
+//                 cause: screen/quadrant containers never zeroed LVGL's default theme padding, silently
+//                 shrinking every container's real content area. Fixed with an explicit
+//                 lv_obj_set_style_pad_all(obj, 0, 0) on every container. Design rule since: verify real
+//                 pixel clearance via a capture, never assume a fix worked without re-measuring.
+//version 1.0.28 - 1.0.29 - Fixed same-color-as-background text clipping (invisible to a simple pixel scan)
+//                 on the Almanac and Battery/Time legend rows.
+//version 1.0.30 - Real data pass (display-only): TOU rates/schedule, Line1Set grid consumption, NOAA tide
+//                 predictions -- replacing static mockup placeholders.
+//version 1.0.31 - Fixed the weekday TOU schedule (two super-off-peak windows, not zero). Unified the
+//                 schedule into one buildTouWindows() source of truth for both the pill text and the bar.
+//version 1.0.32 - 1.0.33 - Added upcoming-tier pills to the Time & rates screen; restacked them vertically
+//                 after a side-by-side layout ran off both screen edges.
+//version 1.0.34 - Grid screen rework: two rings (Battery/Grid), corrected Line1Set/Line2Set as independent
+//                 (not duplicate) per-line signed readings -- confirmed via HIL testing -- real Saved Today
+//                 math, and chronological tide High/Low sort. Flagged (not fixed): Unit 1's own
+//                 oscillation-fix halving logic assumed the now-corrected duplicate-value premise.
+//version 1.0.35 - 1.0.37 - Battery ring gauge fixes: a zero-length placeholder arc, then clipping against
+//                 its own container, then Home quadrant two-ring layout iteration.
+//version 1.0.38 - Real-hardware batch: live date labels (were static build-time text), the Grid ring's arc
+//                 was never actually updated in loop(), removed an incorrect 900W clamp on grid readings.
+//version 1.0.39 - Fixed Home quadrant click-through: makeColumn() was clickable by default, swallowing taps
+//                 meant for the quadrant's own nav handler.
+//version 1.0.40 - Added a simulated-touch serial command for scripted regression testing without hands on
+//                 the board (tools/sim_tap.py). Fixed a coordinate-rotation mismatch found along the way.
+//version 1.0.41 - 1.0.42 - Saved Today math revised twice: real SoC-based energy instead of one power
+//                 sample, then fixed-day-hours blended rate instead of hours-elapsed-so-far.
+//version 1.0.43 - Added an orbiting charge/discharge dot to the SoC ring (color/direction/speed from real
+//                 battery state, matching the physical fuel-gauge hardware's own indicator).
+//version 1.0.44 - Real-hardware batch: fixed a false "Idle" shown on cold boot before any real data
+//                 arrives, added clock seconds, spelled out "Battery" label in full.
+//version 1.0.45 - Added a static "Feeder" caption under the Home quadrant's Battery label.
+//version 1.0.46 - 1.0.47 - Built the WiFi setup flow: KVStore-persisted credentials (survives a reflash),
+//                 bounded connect retries, network-scan + on-screen-keyboard password entry. Verified
+//                 round-trip and reflash-survival on real hardware.
+//version 1.0.48 - Real three-state (Connecting/Connected/Not connected) status indicator, "Reset network"
+//                 button, forcePaint() helper so a state is visibly painted before a blocking call.
+//version 1.0.49 - WiFi UX feedback batch: no-dot "Attempting to Connect" state, plaintext password entry,
+//                 renamed to "Change WiFi", Cancel now genuinely exits instead of silently staying blocked.
+//version 1.0.50 - Fixed two board-freezing hangs: LVGL's blocking wait loop can't run from inside a
+//                 click-event callback (re-enters lv_timer_handler()) -- deferred via flags checked from
+//                 loop() instead. Real-touchscreen double-tap issue investigated, not resolved (GitHub #1).
+//version 1.0.51 - 1.0.53 - Battery screen chart made real (multi-segment curve from an HA pyscript
+//                 automation); Saved Today/Yesterday math made real (per-segment TOU pricing against actual
+//                 SoC curves instead of a single power sample or hardcoded placeholder).
+//version 1.0.54 - MQTT broker host/username/password made runtime-editable, same architecture as the WiFi
+//                 setup flow. Fixed error-text overflow on the Connection screen.
+//version 1.0.55 - Fixed a real board hang on repeated Change WiFi/Change MQTT: the mbed RTOS main-thread
+//                 stack (32KB default) was too small for this app's LVGL object creation. Fixed via a
+//                 sketch-local mbed_app.json (128KB stack). Also moved LVGL's heap to external SDRAM and
+//                 consolidated the MQTT flow's 3 keyboards down to 1.
+//version 1.0.56 - 1.0.55's fix was incomplete -- a chained WiFi+MQTT test still hung. Root-caused to two
+//                 compounding bugs: an unpatched LVGL v9.5.0 realloc-NULL-deref bug (lvgl/lvgl#9794, patched
+//                 locally) and a local lv_conf.h resolution issue that left LVGL silently running on a 64KB
+//                 heap instead of the intended 512KB the whole time. See lvgl_patches/README.md.
+//version 1.0.57 - Fixed: Change WiFi/Change MQTT disconnected the board even on cancel or a failed attempt,
+//                 not just a successful change -- now reconnects to the prior network/broker in both cases.
+//                 Also corrected the 1.0.56 lv_conf.h diagnosis (misattributed to a directory-layout bug;
+//                 real cause is Arduino_H7_Video's own bundled config shadowing any user-supplied one).
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -1518,15 +768,8 @@ lv_obj_t* mqttConnectStatusLbl;
 //reconfigured on each transition -- see attachMqttKeyboard()) instead
 //of one full lv_keyboard per screen. Each lv_keyboard is a substantial
 //persistent object (a full button matrix, ~40+ buttons with their own
-//style/state records) that, once created, lives for the sketch's whole
-//lifetime -- three of them on top of the pre-existing wifiKeyboard was
-//enough extra pressure on this board's limited internal SRAM (LVGL's
-//own memory pool stays in internal SRAM by default, not the Giga's much
-//larger external SDRAM, unless explicitly reconfigured to use it) to
-//cause a real, reproducible hang building the WiFi scan list's later
-//rows -- confirmed via bisection and real-hardware trace logging
-//2026-07-17. One shared keyboard for the MQTT flow fixes this at the
-//root rather than working around it with a bigger memory pool.
+//style/state records); three of them on top of the pre-existing
+//wifiKeyboard was real, avoidable memory pressure.
 lv_obj_t* mqttKeyboard;
 
 //labels/widgets that need periodic/live updates after screen build
@@ -2092,14 +1335,11 @@ void forcePaint() {
   }
 }
 
-//Diagnostic for the 2026-07-17 chained-invocation hang investigation --
-//logs LVGL's own heap state (the SDRAM-backed ea_malloc pool, see
-//lv_conf.h) after every Change WiFi / Change MQTT flow. free_size
-//trending down across repeated invocations points to a genuine leak;
-//free_size holding steady while free_biggest_size shrinks / frag_pct
-//climbs points to fragmentation from the many small child-array
-//reallocs each screen rebuild does (lv_obj_create/delete, and the
-//shared keyboard's repeated lv_obj_set_parent() reparenting) instead.
+//Regression signal: logs LVGL's own heap state (the SDRAM-backed
+//ea_malloc pool, see lv_conf.h) after every Change WiFi / Change MQTT
+//flow. free_size trending down across repeated invocations would point
+//to a leak; free_size steady while frag_pct climbs would point to
+//fragmentation from the child-array reallocs each screen rebuild does.
 void logMemStatus(const char* tag) {
   lv_mem_monitor_t mon;
   lv_mem_monitor(&mon);
@@ -2520,12 +1760,10 @@ void navWifiScanRescan(lv_event_t* e) {
 //(setup()'s own inline wait loop) never calls this.
 void startChangeWifiFlow() {
   //Captured before populateWifiScanList()'s own WiFi.disconnect()
-  //(below, needed for a clean scan) tears down whatever connection
-  //existed BEFORE the user has made any choice at all -- the prior
-  //ssid/password are what let the post-loop code reconnect to what was
-  //actually working before, instead of leaving a live connection dead
-  //just because the user opened this screen and backed out (found
-  //2026-07-18, real-hardware report).
+  //(needed for a clean scan) tears down whatever connection existed
+  //before the user made any choice -- lets the post-loop code reconnect
+  //to what was actually working, instead of leaving a live connection
+  //dead just because the user opened this screen and backed out.
   char priorSsid[sizeof(ssid)];
   char priorPassword[sizeof(password)];
   strncpy(priorSsid, ssid, sizeof(priorSsid));
@@ -2698,17 +1936,12 @@ void attemptMqttConnectFromSetup(const char* host, const char* user, const char*
     lv_label_set_text(mqttConnectStatusLbl, "Couldn't connect. Check the broker IP and try again.");
     lv_obj_set_style_text_color(mqttConnectStatusLbl, COLOR_RED, 0);
     //MqttClient::connect() (inside tryConnectMqtt() above) unconditionally
-    //tears down any existing session before attempting the new one --
-    //_client->stop() runs regardless of whether the new attempt then
-    //succeeds. That means a failed "Change MQTT" attempt (typo, wrong
-    //broker IP, temporarily unreachable) otherwise silently kills a
-    //working connection instead of just failing to change it. mqttHost/
-    //mqttUserRuntime/mqttPassRuntime still hold the prior values here --
-    //they're only overwritten in the success branch above -- so
-    //reconnect to them and restore subscriptions (a fresh TCP session
-    //has none) rather than leaving the board disconnected over a failed
-    //change attempt. Only meaningful during a live runtime change; boot
-    //fallback had no working connection yet to restore.
+    //tears down any existing session before attempting the new one, even
+    //if that attempt then fails -- so reconnect to the prior, still-valid
+    //credentials (only overwritten on success above) and restore
+    //subscriptions (a fresh session has none), rather than leaving the
+    //board disconnected over a failed change. Boot fallback has no prior
+    //connection to restore, hence the runtime-change guard.
     if (g_mqttManualSetupIsRuntimeChange) {
       if (tryConnectMqtt(mqttHost, mqttUserRuntime, mqttPassRuntime)) {
         subscribeAllMqttTopics();
@@ -3753,15 +2986,11 @@ void buildAlmanacScreen() {
 
 //This sketch's own directory also has an mbed_app.json (arduino-cli
 //picks it up automatically) raising rtos.main-thread-stack-size to
-//128KB, up from this core's own 32KB default (set in its variant's own
-//conf/mbed_app.json). Confirmed via real-hardware bisection + trace
-//logging (2026-07-17): the default was too small for this app's LVGL
-//object creation, causing a silent stack overflow -- manifesting as a
-//hard hang building the WiFi scan list's rows, worse on a SECOND
-//"Change WiFi"/"Change MQTT" invocation than the first. If a future
-//change needs even more headroom, raise that value rather than
-//assuming a hang here is a heap/pool issue -- see also LV_MEM_SIZE's
-//own comment in lv_conf.h.
+//128KB, up from this core's own 32KB default -- too small for this
+//app's LVGL object creation, causing a silent stack overflow. If a
+//future change needs more headroom, raise that value rather than
+//assuming a hang is a heap/pool issue -- see also LV_MEM_SIZE's own
+//comment in lv_conf.h.
 void setup() {
   Serial.begin(115200);
   delay(3000);

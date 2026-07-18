@@ -164,26 +164,18 @@ needs re-verification**, flagged but not yet done.
 
 **LVGL 9.5.0 requires local patches — see
 [`Giga_YH_Dashboard_Unit2/lvgl_patches/README.md`](Giga_YH_Dashboard_Unit2/lvgl_patches/README.md).**
-Root-caused 2026-07-17 after a real, hard-to-diagnose board hang on
-repeated "Change WiFi"/"Change MQTT" invocations: (1) a real, confirmed
-unpatched LVGL bug
-([lvgl/lvgl#9794](https://github.com/lvgl/lvgl/issues/9794)) where an
-unchecked `lv_realloc()` can silently corrupt memory instead of failing
-cleanly, and (2) `Arduino_H7_Video` (the Giga core's own display-driver
-helper library) shipping a bundled `lv_conf.h` that silently shadows any
-user-supplied one via `__has_include`, regardless of where it's placed —
-left LVGL running on a 64KB internal-SRAM heap instead of the intended
-512KB SDRAM-backed pool, with no error. (2) was initially misdiagnosed as
-an LVGL directory-layout bug and filed as
-[lvgl/lvgl#10356](https://github.com/lvgl/lvgl/issues/10356); that
-diagnosis was wrong (not LVGL's fault) and the issue was corrected/closed
-— the fix itself (forcing `LV_CONF_PATH`) was right all along. **If LVGL
-is ever reinstalled or updated, the patches in `lvgl_patches/` must be
-reapplied** (or re-verified as already fixed upstream) before trusting
-this fix. A `logMemStatus()` helper (calls `lv_mem_monitor()`) is left in
-place after every Change WiFi/Change MQTT flow as an ongoing regression
-signal — watch `free_size`/`frag_pct` for a downward/upward trend if
-hangs ever recur.
+Two bugs behind a board hang on repeated "Change WiFi"/"Change MQTT":
+(1) an unchecked `lv_realloc()` upstream
+([lvgl/lvgl#9794](https://github.com/lvgl/lvgl/issues/9794)) that can
+corrupt memory instead of failing cleanly, and (2) `Arduino_H7_Video`
+(the Giga core's own display helper) shipping a bundled `lv_conf.h` that
+shadows any user-supplied one via `__has_include`, leaving LVGL silently
+on a 64KB heap instead of the intended 512KB SDRAM-backed pool. **If
+LVGL is ever reinstalled or updated, the patches in `lvgl_patches/` must
+be reapplied** (or re-verified as fixed upstream). `logMemStatus()`
+(calls `lv_mem_monitor()`) logs after every Change WiFi/Change MQTT flow
+as an ongoing regression signal — watch `free_size`/`frag_pct` if hangs
+ever recur.
 
 Screen exporter tool (`tools/dump_screen.py` + `tools/capture_all.py`):
 dumps the live LVGL framebuffer over serial (trigger byte `'D'`) and
