@@ -53,25 +53,26 @@
     #endif
 #endif
 
-//Root-caused 2026-07-17: this Arduino install places lv_conf.h directly
-//inside the lvgl library folder (one level above src/), but this file's
-//own fallback below ("../../lv_conf.h") assumes lv_conf.h sits NEXT TO
-//the lvgl folder (two levels up) -- the upstream/PlatformIO-style
-//layout. Whether __has_include("lv_conf.h") succeeds below is also
-//inconsistent per translation unit: it depends on whether that specific
-//file's compile command happens to have the library ROOT (not just
-//src/) on its include path, which varies across the sketch's own files
-//vs this library's own .c files. Confirmed via a #pragma-message probe
-//that pure-library files (e.g. lv_mem_core_builtin.c) were silently
-//falling through to lv_conf_internal.h's own built-in defaults (64KB
-//LV_MEM_SIZE) instead of this project's lv_conf.h (512KB, SDRAM-backed
-//pool) -- while running fine for years undetected because nothing had
-//ever compared LV_MEM_SIZE's compiled-in value against what lv_conf.h
-//actually said. An absolute LV_CONF_PATH sidesteps all of that
-//per-file include-search ambiguity by pointing every translation unit
-//at the exact same file, unconditionally.
+//Root-caused 2026-07-18 (corrected from an earlier, wrong diagnosis --
+//see lvgl/lvgl#10356): this has nothing to do with where lv_conf.h is
+//placed. The Arduino Giga core's own display-driver helper library,
+//Arduino_H7_Video, ships its OWN bundled lv_conf.h at
+//<arduino-core>/libraries/Arduino_H7_Video/src/lv_conf.h (a stub that
+//includes lv_conf_9.h, also bundled there). Because Arduino_H7_Video/src
+//is unconditionally on the include path for the whole sketch build (the
+//sketch itself #includes Arduino_H7_Video.h), __has_include("lv_conf.h")
+//finds THAT file and succeeds -- before any user-supplied lv_conf.h is
+//ever considered, regardless of where it's placed (library root, next
+//to the lvgl folder per the official docs, anywhere). Confirmed via
+//arm-none-eabi-gcc -E -H (actual include-resolution trace) and
+//#pragma-message probes checking whether LV_CONF_H/LV_CONF_INCLUDE_SIMPLE
+//ended up defined. lv_conf_internal.h itself is working exactly as
+//designed; it's legitimately finding *a* lv_conf.h, just not the
+//intended one. An absolute LV_CONF_PATH is the correct fix specifically
+//because it bypasses the __has_include search entirely, unconditionally
+//pointing every translation unit at the same, intended file.
 #ifndef LV_CONF_PATH
-    #define LV_CONF_PATH "C:/Users/noahc/OneDrive/Documents/Arduino/libraries/lvgl/lv_conf.h"
+    #define LV_CONF_PATH "C:/Users/noahc/OneDrive/Documents/Arduino/libraries/lv_conf.h"
 #endif
 
 /* If "lv_conf.h" is available from here try to use it later. */

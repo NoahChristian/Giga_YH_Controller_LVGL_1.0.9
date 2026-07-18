@@ -133,7 +133,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.56"
+#define VERSION_DASHBOARD "1.0.57"
 //version 1.0.0 - Spiral 1: all six screens built and touch-navigable,
 //                Connection screen live (SSID/RSSI/broker state), everything
 //                else placeholder. Did not compile (LVGL v8-style input
@@ -934,6 +934,40 @@ uint32_t dsi_getDisplayYSize(void);
 //                 in the build stats -- the old, invisible 64KB static
 //                 SRAM fallback array disappearing now that the real
 //                 SDRAM-backed pool is actually in use.)
+//version 1.0.57 - Fixed: "Change WiFi"/"Change MQTT" disconnected the
+//                 board even when the user cancelled out or an attempt
+//                 failed, not just on a successful change. Root causes:
+//                 (1) populateWifiScanList() calls WiFi.disconnect()
+//                 unconditionally on entry (genuinely required for a
+//                 clean scan on this hardware, see its own comment) --
+//                 previously nothing reconnected afterward if the flow
+//                 then ended without a new connection. (2)
+//                 ArduinoMqttClient's MqttClient::connect() calls
+//                 _client->stop() unconditionally before attempting the
+//                 new connection, regardless of whether that attempt
+//                 then succeeds -- so a failed "Change MQTT" (typo,
+//                 wrong IP, broker temporarily unreachable) silently
+//                 killed a working connection too. Fixed by capturing
+//                 the prior ssid/password (WiFi) or reusing
+//                 mqttHost/mqttUserRuntime/mqttPassRuntime (MQTT, only
+//                 overwritten on success) and reconnecting to them --
+//                 WiFi once, after the whole flow ends without a new
+//                 connection; MQTT immediately after each failed
+//                 attempt, plus re-subscribing (a fresh TCP session has
+//                 no subscriptions). Both guarded to only fire during a
+//                 live runtime change (g_manualSetupIsRuntimeChange /
+//                 g_mqttManualSetupIsRuntimeChange) -- boot-time
+//                 fallback has no prior working connection to restore.
+//                 Also corrected the lvgl_patches/ writeup: the
+//                 lv_conf.h resolution issue was misdiagnosed in 1.0.56
+//                 as an LVGL directory-layout bug (filed as
+//                 lvgl/lvgl#10356) -- the real cause is Arduino_H7_Video
+//                 (the Giga core's own display helper library) shipping
+//                 its own bundled lv_conf.h that shadows any
+//                 user-supplied one via __has_include, confirmed via
+//                 actual compiler include-resolution tracing. Not an
+//                 LVGL bug; the LV_CONF_PATH fix itself was already
+//                 correct, just misattributed. Issue corrected/closed.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -2480,7 +2514,25 @@ void navWifiScanRescan(lv_event_t* e) {
 //loop() itself (which calls lv_timer_handler(), never the reverse) is
 //what checks the flag and runs the real flow, from a genuinely top-level
 //context.
+//Only ever called from loop()'s g_wifiChangeRequested check below --
+//i.e. only from the Connection screen's "Change WiFi" button, always a
+//live runtime change with a real prior connection. Boot-time fallback
+//(setup()'s own inline wait loop) never calls this.
 void startChangeWifiFlow() {
+  //Captured before populateWifiScanList()'s own WiFi.disconnect()
+  //(below, needed for a clean scan) tears down whatever connection
+  //existed BEFORE the user has made any choice at all -- the prior
+  //ssid/password are what let the post-loop code reconnect to what was
+  //actually working before, instead of leaving a live connection dead
+  //just because the user opened this screen and backed out (found
+  //2026-07-18, real-hardware report).
+  char priorSsid[sizeof(ssid)];
+  char priorPassword[sizeof(password)];
+  strncpy(priorSsid, ssid, sizeof(priorSsid));
+  priorSsid[sizeof(priorSsid) - 1] = '\0';
+  strncpy(priorPassword, password, sizeof(priorPassword));
+  priorPassword[sizeof(priorPassword) - 1] = '\0';
+
   g_manualSetupIsRuntimeChange = true;
   g_awaitingManualWifiSetup = true;
   populateWifiScanList();
@@ -2494,9 +2546,16 @@ void startChangeWifiFlow() {
     }
     delay(5);
   }
+  //Not connected here means either a cancel or every attempt failed --
+  //never a successful new connection (that path already returns
+  //connected). Reconnect to what was working before rather than leaving
+  //the board disconnected over a cancelled/failed change.
+  if (WiFi.status() != WL_CONNECTED && priorSsid[0] != '\0') {
+    tryConnectWiFi(priorSsid, priorPassword, 3, 15000);
+  }
   //Reflects whatever's actually true now rather than assuming success --
-  //covers both a genuinely new connection and a cancel-out (old
-  //connection still intact, never touched above).
+  //covers a genuinely new connection, a restored prior one, and the
+  //rare case where even that reconnect attempt failed.
   setConnStatusIndicator(WiFi.status() == WL_CONNECTED ? WIFI_UI_CONNECTED : WIFI_UI_NOT_CONNECTED);
   logMemStatus("after ChangeWifi");
 }
@@ -2638,6 +2697,23 @@ void attemptMqttConnectFromSetup(const char* host, const char* user, const char*
   } else {
     lv_label_set_text(mqttConnectStatusLbl, "Couldn't connect. Check the broker IP and try again.");
     lv_obj_set_style_text_color(mqttConnectStatusLbl, COLOR_RED, 0);
+    //MqttClient::connect() (inside tryConnectMqtt() above) unconditionally
+    //tears down any existing session before attempting the new one --
+    //_client->stop() runs regardless of whether the new attempt then
+    //succeeds. That means a failed "Change MQTT" attempt (typo, wrong
+    //broker IP, temporarily unreachable) otherwise silently kills a
+    //working connection instead of just failing to change it. mqttHost/
+    //mqttUserRuntime/mqttPassRuntime still hold the prior values here --
+    //they're only overwritten in the success branch above -- so
+    //reconnect to them and restore subscriptions (a fresh TCP session
+    //has none) rather than leaving the board disconnected over a failed
+    //change attempt. Only meaningful during a live runtime change; boot
+    //fallback had no working connection yet to restore.
+    if (g_mqttManualSetupIsRuntimeChange) {
+      if (tryConnectMqtt(mqttHost, mqttUserRuntime, mqttPassRuntime)) {
+        subscribeAllMqttTopics();
+      }
+    }
   }
 }
 
