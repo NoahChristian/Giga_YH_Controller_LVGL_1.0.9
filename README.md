@@ -1,41 +1,94 @@
-Purpose: This controls power flow to a home based on time-of-use rates that
-  can vary as much as 8x from peak to off-peak. Thus it can act as an arbitrator
-  of power rates for a household with appropriate hardware. THe Y-H hardware is
-  designed out-of-the-box to feed power from downstream current monitoring. This
-  is not an easy connection in the US grid because the current monitor really
-  needs to be upstream at the panel. Thus the math and control system are different,
-  and it needs a signed value of power flow to maintain levels of export close
-  to zero.
+# Giga YH — Time-of-Use Power Controller
 
-## Planned dashboard (design mockups)
+Home power flow arbitrated against time-of-use electricity rates that swing
+as much as 8x between peak and off-peak. Two Arduino Giga R1 boards:
 
-A touch-navigable redesign of the display is planned — a minimal Home
-screen plus five detail screens reachable by tapping. These are design
-mockups only; nothing below is implemented in the firmware yet. Full
-writeup: [`design/lvgl_redesign_plan.md`](design/lvgl_redesign_plan.md).
-An interactive, clickable version of all six screens is also available
-at [`design/mockups/giga_dashboard_mockup.html`](design/mockups/giga_dashboard_mockup.html).
+- **Unit 1 — controller** (`Giga_YH_Controller_LVGL_1.0.9.ino`): reads signed
+  grid power from a Home Assistant current monitor and trims two Y-H
+  grid-tied inverters (L1/L2 of a US split-phase 220V feed) over RS485 to
+  keep grid export near zero. The Y-H hardware natively expects a
+  downstream current-loop feed rather than the upstream panel reading the US
+  grid actually requires, so the control math has to reconstruct a signed
+  value from an absolute-value inverter interface. This is the
+  safety/timing-critical loop — see [`CLAUDE.md`](CLAUDE.md) before touching
+  it.
+- **Unit 2 — dashboard** (`Giga_YH_Dashboard_Unit2/`): a second physical
+  board, subscribe-only, no RS485, no publish, no control authority. Its job
+  is purely to display what Unit 1 and Home Assistant are already doing —
+  it structurally can't affect the control loop even if its own UI code is
+  wrong. Everything below is this board.
 
-**Home** — clock, weather, time-of-use status, connection status, battery, and net grid flow at a glance:
+## Unit 2 dashboard — overview
 
-![Home screen mockup](design/mockups/01_home.svg)
+A touch-navigable 800×480 status display: a glanceable Home screen plus five
+detail screens reachable by tapping. Built with LVGL on an Arduino Giga
+Display Shield. Real data throughout — no more placeholders — including
+live TOU rate/schedule, real per-line grid power over MQTT, a real battery
+SoC curve, and NOAA tide predictions.
 
-**Time & rates** — full time-of-use schedule, color-coded super off-peak/off-peak/on-peak:
+## Screens & interactions
 
-![Time and rates screen mockup](design/mockups/02_time_and_rates.svg)
+**Home** — clock, weather, current TOU rate, connection status, battery
+ring, and feeder/grid power at a glance. Tapping the weather pill opens
+Almanac; the rate pill opens Time & rates; the battery ring, feeder, and
+grid numbers each open their own detail screen.
 
-**Connection** — network and MQTT status, including per-topic last-seen freshness:
+![Home](Giga_YH_Dashboard_Unit2/docs/screenshots/01_home.png)
 
-![Connection screen mockup](design/mockups/03_connection.svg)
+**Time & rates** — the full day's on-peak/off-peak/super-off-peak schedule
+as a color-coded bar, plus each tier's rate and which one is active now.
 
-**Battery** — charge state and a day's SoC curve, colored by charge (super off-peak) vs. discharge:
+![Time and rates](Giga_YH_Dashboard_Unit2/docs/screenshots/02_time_and_rates.png)
 
-![Battery screen mockup](design/mockups/04_battery.svg)
+**Connection** — WiFi and MQTT broker status, signal strength, IP/router,
+and firmware version. "Change WiFi" and "Change MQTT" open in-place setup
+flows (below) for switching networks or brokers without a reflash.
 
-**Grid flow** — net import/export, L1/L2 breakdown, today's savings:
+![Connection](Giga_YH_Dashboard_Unit2/docs/screenshots/03_connection.png)
 
-![Grid flow screen mockup](design/mockups/05_grid_flow.svg)
+**Battery** — charge percentage, charging/discharging state, and today's
+SoC curve colored by charge vs. discharge.
 
-**Almanac** — weather, sunrise/sunset, moon phase, tide (reached by tapping the weather row on Home):
+![Battery](Giga_YH_Dashboard_Unit2/docs/screenshots/04_battery.png)
 
-![Almanac screen mockup](design/mockups/06_almanac.svg)
+**Grid** — battery and grid power rings, per-line (L1/L2) feeder and grid
+breakdown, and today's/yesterday's savings.
+
+![Grid](Giga_YH_Dashboard_Unit2/docs/screenshots/05_grid.png)
+
+**Almanac** (tap the weather pill on Home) — sunrise/sunset, moonrise/
+moonset and phase, and a real tide curve (NOAA predictions for La Jolla).
+Weather/moon-phase are still placeholder values, not yet wired to a real
+source — see Future work.
+
+![Almanac](Giga_YH_Dashboard_Unit2/docs/screenshots/06_almanac.png)
+
+### Changing WiFi or MQTT
+
+From Connection, "Change WiFi" scans and lists nearby networks:
+
+![Select WiFi network](Giga_YH_Dashboard_Unit2/docs/screenshots/07_wifi_select_network.png)
+
+Tapping a secured network opens an on-screen keyboard for its password:
+
+![Enter WiFi password](Giga_YH_Dashboard_Unit2/docs/screenshots/08_wifi_enter_password.png)
+
+"Change MQTT" walks through broker IP, username, and password the same
+way, each field prefilled with the current value for quick edits:
+
+![MQTT setup](Giga_YH_Dashboard_Unit2/docs/screenshots/09_mqtt_setup.png)
+
+Both flows persist the new credentials on a successful connection and leave
+the prior connection untouched on Cancel.
+
+## Future work
+
+- Wire the Almanac screen's weather and moon-phase display to a real
+  source (Home Assistant's Moon integration only gives a discrete phase
+  state, not illumination %; moonrise/moonset has no HA built-in and would
+  need the same NOAA-precomputed-table approach already used for tide).
+- Re-verify Unit 1's oscillation-fix halving logic against the confirmed
+  understanding that `Line1Set`/`Line2Set` are independent signed per-line
+  readings, not duplicates of one whole-household value (see `CLAUDE.md`).
+- Unit 1: WiFi/MQTT boot failures still hang forever with no reconnect
+  path; no reconnect logic if the link drops after `setup()`.
