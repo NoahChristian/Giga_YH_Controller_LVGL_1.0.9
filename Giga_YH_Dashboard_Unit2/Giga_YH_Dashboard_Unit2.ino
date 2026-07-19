@@ -133,7 +133,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.61"
+#define VERSION_DASHBOARD "1.0.62"
 //version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
 //version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
 //version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
@@ -277,6 +277,24 @@ uint32_t dsi_getDisplayYSize(void);
 //                 both are "next occurrence from now" (see almanac_data.py), so moonset genuinely
 //                 lands before moonrise depending on time of day/phase. Fixed the same squished
 //                 Back/caption/text-entry spacing on the MQTT username screen (missed it earlier).
+//version 1.0.62 - Rise/set times are now TODAY's local calendar day (midnight to midnight), not
+//                 "next occurrence from now" -- past today's own event, "next" was rolling into
+//                 tomorrow and pairing mismatched calendar days with no indication of that (e.g.
+//                 today's remaining moonset next to tomorrow's moonrise, instead of today's own
+//                 moonrise/moonset pair). almanac_data.py now queries a fixed midnight-to-midnight
+//                 window instead of (now, now+3days); confirmed against real astronomical data
+//                 before deploying that the window change alone doesn't affect the v1.0.61 column-
+//                 swap logic's correctness -- rise/set order can still flip within a single
+//                 calendar day (common near full moon), so that logic is unchanged, just fed
+//                 correctly-scoped epochs now. A rise or set can be genuinely ABSENT from a given
+//                 calendar day (the lunar day is ~24h50m, ~50min longer than solar, so roughly
+//                 monthly a day has two moonrises and no moonset or vice versa) -- sent as a 0
+//                 epoch sentinel, and the Arduino side (layoutEventPair(), replacing the old
+//                 inline swap-only logic) now hides that column and centers the other rather than
+//                 showing a placeholder "--" for something that isn't unknown but genuinely
+//                 doesn't exist that day. Sunrise/sunset switched from the sun.sun entity's
+//                 next_rising/next_setting (same "next from now" problem, just far less
+//                 noticeable) to the identical skyfield calendar-day approach, for consistency.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -928,10 +946,15 @@ lv_obj_t* lbl_almanac_sunset;
 lv_obj_t* lbl_almanac_moonrise;
 lv_obj_t* lbl_almanac_moonset;
 lv_obj_t* lbl_almanac_phase;
-//Column containers (not just the value labels above) for the two moon
-//rows -- needed so updateAlmanacScreen() can swap which physical column
-//(left/right) Moonrise vs. Moonset renders in, so the chronologically
-//earlier of the two always reads left-to-right (see its own comment).
+//Column containers (not just the value labels above) for all four
+//rows -- needed so updateAlmanacScreen() can hide a column entirely (a
+//rise or set can be genuinely absent from a given calendar day -- see
+//almanac_data.py's header comment) and, for the two moon columns only,
+//swap which physical column (left/right) Moonrise vs. Moonset renders
+//in, so the chronologically earlier of the two always reads
+//left-to-right (see its own comment).
+lv_obj_t* col_sunrise;
+lv_obj_t* col_sunset;
 lv_obj_t* col_moonrise;
 lv_obj_t* col_moonset;
 //Accurate moon-phase icon, redrawn from real phase-angle data -- see
@@ -3261,10 +3284,12 @@ void buildAlmanacScreen() {
   //pushed down from the original layout (which collided with the moon-phase
   //row below it once rendered on real hardware) and widened into columns
   //that center regardless of text width. Sun columns don't need a
-  //colOut/moon-canvas (nullptr for those three params) -- only the two
-  //moon columns can swap position or need a phase-accurate icon.
-  lbl_almanac_sunrise = buildAlmanacTimeColumn(scr_almanac, 160, true, "5:58 AM", "Sunrise", nullptr, nullptr, nullptr);
-  lbl_almanac_sunset = buildAlmanacTimeColumn(scr_almanac, 320, true, "8:41 PM", "Sunset", nullptr, nullptr, nullptr);
+  //moon-canvas (nullptr for those two params) -- only the moon columns
+  //need a phase-accurate icon -- but all four need colOut now, so
+  //updateAlmanacScreen() can hide/recenter one that's absent for today
+  //(see almanac_data.py's header comment).
+  lbl_almanac_sunrise = buildAlmanacTimeColumn(scr_almanac, 160, true, "5:58 AM", "Sunrise", &col_sunrise, nullptr, nullptr);
+  lbl_almanac_sunset = buildAlmanacTimeColumn(scr_almanac, 320, true, "8:41 PM", "Sunset", &col_sunset, nullptr, nullptr);
   lbl_almanac_moonrise = buildAlmanacTimeColumn(scr_almanac, 480, false, "9:14 PM", "Moonrise", &col_moonrise, &moonrise_icon_canvas, moonrise_icon_buf);
   lbl_almanac_moonset = buildAlmanacTimeColumn(scr_almanac, 640, false, "6:37 AM", "Moonset", &col_moonset, &moonset_icon_canvas, moonset_icon_buf);
 
@@ -3374,6 +3399,47 @@ void renderMoonPhaseIcon(lv_obj_t* canvas, lv_coord_t d) {
   lv_obj_invalidate(canvas);
 }
 
+//Shows/positions or hides a rise+set column pair for today's Almanac row.
+//epoch==0 means that event doesn't occur on today's calendar day at all
+//(see almanac_data.py's header comment -- a real, if uncommon, case for
+//the moon) -- hides that column and centers the other one in the space
+//both would have shared, rather than leaving a "--" placeholder for
+//something that isn't merely unknown but genuinely doesn't exist today.
+//allowSwap (moon only) additionally swaps which physical column each
+//renders in when the set genuinely happens before the rise in absolute
+//time -- both are today's real events, but "rise" and "set" don't imply
+//a left-to-right time order the way they do for the sun (see the moon
+//columns' own call site below).
+void layoutEventPair(lv_obj_t* colRise, lv_obj_t* colSet, time_t riseEpoch, time_t setEpoch,
+                      lv_coord_t riseCx, lv_coord_t setCx, bool allowSwap) {
+  const lv_coord_t colW = 150;
+  bool hasRise = (riseEpoch != 0);
+  bool hasSet = (setEpoch != 0);
+
+  if (hasRise && hasSet) {
+    if (allowSwap && setEpoch < riseEpoch) {
+      lv_coord_t tmp = riseCx;
+      riseCx = setCx;
+      setCx = tmp;
+    }
+    lv_obj_clear_flag(colRise, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(colSet, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(colRise, riseCx - colW / 2);
+    lv_obj_set_x(colSet, setCx - colW / 2);
+  } else if (hasRise) {
+    lv_obj_clear_flag(colRise, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(colSet, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(colRise, (riseCx + setCx) / 2 - colW / 2);
+  } else if (hasSet) {
+    lv_obj_add_flag(colRise, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(colSet, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(colSet, (riseCx + setCx) / 2 - colW / 2);
+  } else {
+    lv_obj_add_flag(colRise, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(colSet, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
 //Refreshes every Almanac screen element from the latest g_*Epoch/
 //g_moonPhase*/g_weather* globals (see subtopicAlmanacData/onMqttMessage
 //above) -- called on navigating to the screen and, from loop(), when
@@ -3391,28 +3457,26 @@ void updateAlmanacScreen() {
   snprintf(buf, sizeof(buf), "%d\xC2\xB0""F  %s", g_weatherTempF, g_weatherCondition);
   lv_label_set_text(lbl_almanac_weather, buf);
 
+  //0 means that event doesn't happen today at all (see layoutEventPair()'s
+  //own comment) -- skip setting text for it; the column gets hidden
+  //entirely below, so stale-but-hidden text is harmless, but this avoids
+  //ever formatting a bogus time out of a 0 epoch.
   char timeBuf[16];
-  lv_label_set_text(lbl_almanac_sunrise, formatEpochTime(g_sunriseEpoch, timeBuf));
-  lv_label_set_text(lbl_almanac_sunset, formatEpochTime(g_sunsetEpoch, timeBuf));
-  lv_label_set_text(lbl_almanac_moonrise, formatEpochTime(g_moonriseEpoch, timeBuf));
-  lv_label_set_text(lbl_almanac_moonset, formatEpochTime(g_moonsetEpoch, timeBuf));
+  if (g_sunriseEpoch != 0) lv_label_set_text(lbl_almanac_sunrise, formatEpochTime(g_sunriseEpoch, timeBuf));
+  if (g_sunsetEpoch != 0) lv_label_set_text(lbl_almanac_sunset, formatEpochTime(g_sunsetEpoch, timeBuf));
+  if (g_moonriseEpoch != 0) lv_label_set_text(lbl_almanac_moonrise, formatEpochTime(g_moonriseEpoch, timeBuf));
+  if (g_moonsetEpoch != 0) lv_label_set_text(lbl_almanac_moonset, formatEpochTime(g_moonsetEpoch, timeBuf));
 
-  //Both values are "next occurrence from now" (see almanac_data.py's own
-  //header comment), so moonset can genuinely land before moonrise
-  //depending on time of day/phase -- swap which physical column (left,
-  //cx=480, vs. right, cx=640) each one renders in so the chronologically
-  //earlier event always reads left-to-right, regardless of which label
-  //it is. Sunrise/sunset never need this -- the sun only ever rises
-  //before it sets within a calendar day.
-  const lv_coord_t colW = 150;
-  lv_coord_t moonriseCx = 480, moonsetCx = 640;
-  if (g_moonsetEpoch < g_moonriseEpoch) {
-    lv_coord_t tmp = moonriseCx;
-    moonriseCx = moonsetCx;
-    moonsetCx = tmp;
-  }
-  lv_obj_set_x(col_moonrise, moonriseCx - colW / 2);
-  lv_obj_set_x(col_moonset, moonsetCx - colW / 2);
+  //Sun: never swaps (the sun only ever rises before it sets within a
+  //calendar day at this latitude) but can still in principle be absent
+  //(polar day/night elsewhere) -- see layoutEventPair()'s own comment.
+  layoutEventPair(col_sunrise, col_sunset, g_sunriseEpoch, g_sunsetEpoch, 160, 320, false);
+  //Moon: both are today's real calendar-day events, but "rise" and "set"
+  //don't imply a left-to-right time order for the moon the way they do
+  //for the sun -- e.g. near full moon the moon can still be up from the
+  //previous evening, set in the early morning, then rise again that same
+  //night, so Set legitimately reads before Rise for that day.
+  layoutEventPair(col_moonrise, col_moonset, g_moonriseEpoch, g_moonsetEpoch, 480, 640, true);
 
   //Illuminated % derived from the phase angle here (not sent separately
   //over MQTT) -- see renderMoonPhaseIcon()'s comment for why the angle

@@ -219,11 +219,23 @@ see its own header comment for the required `requirements.txt` and a
 real pyscript import quirk it works around) publishing to
 `V1.0/Home/Almanac/Data` every 6 hours. The moon-phase icon is a real
 geometric rendering (`lv_canvas`, terminator-ellipse construction from
-the actual phase angle), not one fixed picture. Externally-sourced
-epochs (this topic's rise/set times) need `formatEpochTime()`'s
-`+3600*timezone` adjustment before display — this board's RTC is set to
-an already-local-shifted epoch (see `parseNtpPacket()`), not true UTC,
-unlike what you'd assume from a genuinely-UTC source.
+the actual phase angle), not one fixed picture, and the same rendering
+now also drives the Moonrise/Moonset column icons (`renderMoonPhaseIcon()`
+in the `.ino`, generalized to any canvas/size as of v1.0.61). Rise/set
+times (all four) are **today's local calendar day**, not "next
+occurrence from now" (v1.0.62+ — see `almanac_data.py`'s own header
+comment for why that distinction matters: past the day's own event,
+"next" rolls into tomorrow and pairs mismatched calendar days with no
+indication of that). A rise or set can be genuinely absent from a given
+day (0 epoch sentinel) — the Arduino side (`layoutEventPair()`) hides
+that column and centers the other one rather than showing a placeholder.
+Moonrise/Moonset also swap which physical column they render in when
+Set happens before Rise in absolute time (real and common near full
+moon) — Sunrise/Sunset never need that swap at this latitude. Externally-
+sourced epochs need `formatEpochTime()`'s `+3600*timezone` adjustment
+before display — this board's RTC is set to an already-local-shifted
+epoch (see `parseNtpPacket()`), not true UTC, unlike what you'd assume
+from a genuinely-UTC source.
 
 **Open tickets (parked, not yet implemented)**:
 - Unit 1 oscillation-fix halving logic re-check (see above, twice-flagged).
