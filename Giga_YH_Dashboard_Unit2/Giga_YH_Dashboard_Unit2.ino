@@ -133,7 +133,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.58"
+#define VERSION_DASHBOARD "1.0.59"
 //version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
 //version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
 //version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
@@ -234,6 +234,18 @@ uint32_t dsi_getDisplayYSize(void);
 //                 import almanac" fails with a misleading AttributeError under pyscript's execution model,
 //                 even though the same statement works fine inside a function or in plain Python --
 //                 confirmed directly against the instance before settling on dotted-style imports instead.
+//version 1.0.59 - Almanac weather line: degree symbol, sentence-cased condition, one font size up
+//                 (Montserrat 34), and switched from a hardcoded x position to a persistent centered
+//                 align -- it was drifting off-center as real variable-length condition text replaced
+//                 the build-time placeholder. Home quadrant's weather pill now shows the same real
+//                 data too, instead of a permanent "Cloudy, 68F >". Fixed a real bug in the v1.0.57
+//                 cancel-disconnect fix: it only covered WiFi, so cancelling a WiFi change still
+//                 silently killed the MQTT broker connection (populateWifiScanList()'s WiFi.disconnect()
+//                 tears down the underlying socket, and this sketch has no standing MQTT reconnect
+//                 loop) -- startChangeWifiFlow() now reconnects MQTT with the already-in-effect
+//                 credentials whenever WiFi ends up connected but MQTT doesn't. Added a few px of
+//                 vertical spacing on the WiFi/MQTT password screens -- Back/the caption/the text
+//                 entry were nearly touching on real hardware.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -1423,6 +1435,14 @@ void onMqttMessage(int messageSize) {
     if (parseAlmanacPayload(tbuf, g_weatherCondition, sizeof(g_weatherCondition), &g_weatherTempF,
                              &g_sunriseEpoch, &g_sunsetEpoch, &g_moonriseEpoch, &g_moonsetEpoch,
                              &g_moonPhaseAngle, g_moonPhaseName, sizeof(g_moonPhaseName))) {
+      //Sentence case here, once per message -- Met.no's condition string
+      //arrives all-lowercase ("sunny"), and both the Home pill and the
+      //Almanac screen read this same global, so fixing it at the source
+      //(rather than in each display-update function) keeps them consistent
+      //regardless of which screen the user happens to visit first.
+      if (g_weatherCondition[0] >= 'a' && g_weatherCondition[0] <= 'z') {
+        g_weatherCondition[0] -= 32;
+      }
       g_hasAlmanacData = true;
       g_lastAlmanacDataMs = millis();
       g_almanacDataDirty = true;
@@ -1925,6 +1945,22 @@ void startChangeWifiFlow() {
   //covers a genuinely new connection, a restored prior one, and the
   //rare case where even that reconnect attempt failed.
   setConnStatusIndicator(WiFi.status() == WL_CONNECTED ? WIFI_UI_CONNECTED : WIFI_UI_NOT_CONNECTED);
+
+  //populateWifiScanList()'s WiFi.disconnect() above tears down the TCP
+  //socket the MQTT client was using, regardless of whether this flow ends
+  //in a cancel, a failed attempt, or a genuinely new connection -- and
+  //this sketch has no standing MQTT reconnect loop (see loop()'s own
+  //comment on lbl_conn_broker), so without this the broker connection
+  //stays dead until the user separately visits Change MQTT, even though
+  //nothing about the MQTT config itself changed. Same "only disconnect if
+  //an actual change happened" principle as the WiFi restore above, applied
+  //to MQTT: reconnect with whatever credentials were already in effect
+  //(mqttHost/mqttUserRuntime/mqttPassRuntime), not new ones.
+  if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
+    if (tryConnectMqtt(mqttHost, mqttUserRuntime, mqttPassRuntime)) {
+      subscribeAllMqttTopics();
+    }
+  }
   logMemStatus("after ChangeWifi");
 }
 
@@ -2237,11 +2273,16 @@ void buildWifiPasswordScreen() {
   lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(back, navWifiScanRescan, LV_EVENT_CLICKED, NULL);
 
-  wifiPasswordSsidLbl = makeLabel(scr_wifi_password, "Enter password for", COLOR_TEXT_MUTED, 40, 50);
+  //y-offsets nudged down a few px at each step (was 50/82/137, back-to-label
+  //and label-to-textarea nearly touched/overlapped on real hardware -- the
+  //original deltas assumed a shorter line height than this default font
+  //actually renders) so Back/the caption/the text entry read as visibly
+  //separate rows instead of squished together.
+  wifiPasswordSsidLbl = makeLabel(scr_wifi_password, "Enter password for", COLOR_TEXT_MUTED, 40, 58);
 
   wifiPasswordTextarea = lv_textarea_create(scr_wifi_password);
   lv_obj_set_size(wifiPasswordTextarea, 720, 46);
-  lv_obj_set_pos(wifiPasswordTextarea, 40, 82);
+  lv_obj_set_pos(wifiPasswordTextarea, 40, 98);
   //Plain text, not password-masked -- per request, so what's typed on
   //the on-screen keyboard is directly checkable against the real network
   //password instead of trusting a dot count.
@@ -2252,7 +2293,7 @@ void buildWifiPasswordScreen() {
   //cases) -- one attachment point covers both.
   lv_obj_add_event_cb(wifiPasswordTextarea, onWifiPasswordSubmit, LV_EVENT_READY, NULL);
 
-  wifiConnectStatusLbl = makeLabel(scr_wifi_password, "", COLOR_RED, 40, 137);
+  wifiConnectStatusLbl = makeLabel(scr_wifi_password, "", COLOR_RED, 40, 153);
   //makeLabel() sets no width/wrap, so long status text (the "Couldn't
   //connect..." error) was silently running off the 800px screen edge
   //with no wrapping at all -- caught on real hardware testing the MQTT
@@ -2360,18 +2401,20 @@ void buildMqttPasswordScreen() {
   lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(back, navMqttUsernameScreen, LV_EVENT_CLICKED, NULL);
 
-  makeLabel(scr_mqtt_password, "MQTT password", COLOR_TEXT_MUTED, 40, 50);
+  //Same y-offset nudge (50/82/137 -> 58/98/153) as buildWifiPasswordScreen()
+  //-- identical squished-row issue on this screen, same fix.
+  makeLabel(scr_mqtt_password, "MQTT password", COLOR_TEXT_MUTED, 40, 58);
 
   mqttPasswordTextarea = lv_textarea_create(scr_mqtt_password);
   lv_obj_set_size(mqttPasswordTextarea, 720, 46);
-  lv_obj_set_pos(mqttPasswordTextarea, 40, 82);
+  lv_obj_set_pos(mqttPasswordTextarea, 40, 98);
   //Plain text, not password-masked -- same rationale/precedent as the
   //WiFi password field (see buildWifiPasswordScreen()'s comment).
   lv_textarea_set_one_line(mqttPasswordTextarea, true);
   lv_textarea_set_max_length(mqttPasswordTextarea, 63);
   lv_obj_add_event_cb(mqttPasswordTextarea, onMqttPasswordSubmit, LV_EVENT_READY, NULL);
 
-  mqttConnectStatusLbl = makeLabel(scr_mqtt_password, "", COLOR_RED, 40, 137);
+  mqttConnectStatusLbl = makeLabel(scr_mqtt_password, "", COLOR_RED, 40, 153);
   //See the identical fix/comment on wifiConnectStatusLbl -- makeLabel()
   //sets no width/wrap, so this ran off the screen edge uncaught until a
   //real-hardware capture showed it clipping mid-sentence.
@@ -2406,7 +2449,13 @@ void buildHomeScreen() {
 
   //pushed down from 122 -- the date label above has descenders (the 'y' in
   //"Monday"/"July") that this pill's opaque background was clipping into
-  weather_pill = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_TEXT, "Cloudy, 68F >", 16, 40);
+  //Worst-case placeholder text so the pill's build-time fixed width (see
+  //makeAutoPill's own comment -- it never resizes after construction) fits
+  //the longest real condition string this can ever show: HA's `weather`
+  //domain normalizes Met.no's own symbol codes down to one of a small fixed
+  //set (sunny/cloudy/rainy/snowy/etc.), and "lightning-rainy" is the
+  //longest of those.
+  weather_pill = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_TEXT, "Lightning-rainy, 68\xC2\xB0""F >", 16, 40);
   lv_obj_align(weather_pill, LV_ALIGN_TOP_MID, 0, 134);
   lv_obj_add_flag(weather_pill, LV_OBJ_FLAG_CLICKABLE);
   //LVGL doesn't bubble click events to parents unless LV_OBJ_FLAG_EVENT_BUBBLE
@@ -3080,10 +3129,22 @@ void buildAlmanacScreen() {
   scr_almanac = makeScreenRoot();
   makeBackButton(scr_almanac);
 
-  //Placeholder text sized for the worst case ("68F  Partlycloudy") so the
+  //Placeholder text sized for the worst case ("68°F  Partlycloudy") so the
   //label's own build-time layout doesn't need to change once real data
-  //(from almanac_data.py, see subtopicAlmanacData) replaces it.
-  lbl_almanac_weather = makeLabel(scr_almanac, "68F  Partlycloudy", COLOR_TEXT, 350, 95);
+  //(from almanac_data.py, see subtopicAlmanacData) replaces it. Positioned
+  //via a persistent LV_ALIGN_TOP_MID (style-based, re-centers automatically
+  //whenever the label's own width changes -- see makeAutoPill's inner-label
+  //centering for the same mechanism) instead of a fixed x -- an earlier
+  //version used a hardcoded x assuming a specific text width, which drifted
+  //visibly off-center once real, variable-length condition text replaced
+  //the placeholder.
+  //One font size up from this screen's default (Montserrat 34, the next
+  //size actually compiled in -- see lv_conf.h) to make temperature/
+  //condition more prominent than the smaller sunrise/sunset/moon captions
+  //below it.
+  lbl_almanac_weather = makeLabel(scr_almanac, "68\xC2\xB0""F  Partlycloudy", COLOR_TEXT);
+  lv_obj_set_style_text_font(lbl_almanac_weather, &lv_font_montserrat_34, 0);
+  lv_obj_align(lbl_almanac_weather, LV_ALIGN_TOP_MID, 0, 95);
 
   //pushed down from the original layout (which collided with the moon-phase
   //row below it once rendered on real hardware) and widened into columns
@@ -3201,7 +3262,12 @@ void updateAlmanacScreen() {
   if (!g_hasAlmanacData) return;
 
   char buf[24];
-  snprintf(buf, sizeof(buf), "%dF  %s", g_weatherTempF, g_weatherCondition);
+  //Degree symbol (U+00B0) is one of the few non-ASCII codepoints this
+  //project's Montserrat font subset actually includes (see
+  //lv_font_montserrat_32.c's own generation comment: "-r 0x20-0x7F,0xB0,
+  //0x2022") -- safe to use directly, unlike the en-dash/middle-dot glyphs
+  //this dashboard has hit missing-glyph boxes on elsewhere.
+  snprintf(buf, sizeof(buf), "%d\xC2\xB0""F  %s", g_weatherTempF, g_weatherCondition);
   lv_label_set_text(lbl_almanac_weather, buf);
 
   char timeBuf[16];
@@ -3451,6 +3517,17 @@ void loop() {
     getLocalDateStr(dateBuf);
     lv_label_set_text(lbl_home_date, dateBuf);
     lv_label_set_text(lbl_time_date, dateBuf);
+
+    //Real weather, once per second (cheap -- just a label update, and
+    //matches this block's existing cadence) instead of the build-time
+    //"Cloudy, 68F >" placeholder -- g_weatherCondition is already
+    //sentence-cased at MQTT-arrival time (see onMqttMessage()).
+    if (g_hasAlmanacData) {
+      char weatherBuf[32];
+      snprintf(weatherBuf, sizeof(weatherBuf), "%s, %d\xC2\xB0""F >", g_weatherCondition, g_weatherTempF);
+      lv_obj_t* weatherLbl = lv_obj_get_child(weather_pill, 0);
+      lv_label_set_text(weatherLbl, weatherBuf);
+    }
 
     //Real TOU tier/rate, once per second -- same cadence as the clock.
     //Display-only: this never touches Unit 1 or its RS485/battery

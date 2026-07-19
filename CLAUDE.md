@@ -150,10 +150,10 @@ independently of `VERSION_POWER` above.
 All real data, display-only, no control path: TOU rates/schedule (8
 hardcoded 2026 holiday dates), NOAA tide predictions for La Jolla (station
 9410230, `tide_data_2026.h`, regenerate via
-`tools/tide_data/convert_tide_data.py` for a future year), and real
-per-line grid power via `Line1Set`/`Line2Set` MQTT topics. Weather and
-moon-phase on the Almanac screen are still placeholder values (see Open
-tickets).
+`tools/tide_data/convert_tide_data.py` for a future year), real per-line
+grid power via `Line1Set`/`Line2Set` MQTT topics, and weather/sun/moon on
+the Almanac screen (and the Home quadrant's weather pill) -- see the
+v1.0.58 paragraph below.
 
 **`Line1Set`/`Line2Set` are independent signed per-line grid readings**,
 not a duplicated whole-household value (confirmed via HIL testing
