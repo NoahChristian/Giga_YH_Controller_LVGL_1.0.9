@@ -133,7 +133,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.59"
+#define VERSION_DASHBOARD "1.0.60"
 //version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
 //version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
 //version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
@@ -246,6 +246,28 @@ uint32_t dsi_getDisplayYSize(void);
 //                 credentials whenever WiFi ends up connected but MQTT doesn't. Added a few px of
 //                 vertical spacing on the WiFi/MQTT password screens -- Back/the caption/the text
 //                 entry were nearly touching on real hardware.
+//version 1.0.60 - Weather pill sized for the worst-case condition string ("Lightning-rainy") was
+//                 wider than its own quadrant once centered, pushing past the screen's left edge and
+//                 triggering scr_home's default scrollable behavior (a visible scrollbar) -- now
+//                 re-fits itself to each real value's own width (resizeAutoPillText()), same "snug"
+//                 feel as the TOU pill instead of a fixed worst-case box. Only resizes when the text
+//                 actually changed (compares against the last-shown string), not on every 1-second
+//                 clock tick -- an earlier version of this fix called it unconditionally every
+//                 second and froze the board solid within a couple seconds of boot on real hardware:
+//                 that much needless per-second label/layout churn was enough to trigger this
+//                 device's documented lv_realloc() fragility (lvgl_patches/README.md,
+//                 lvgl/lvgl#9794). In steady state the weather text only changes roughly once every
+//                 6 hours (almanac_data.py's publish interval), so resize-on-change is also just
+//                 correct, not merely a workaround. Added the same vertical-spacing fix to the MQTT
+//                 broker IP address screen (missed it when the password/WiFi screens were fixed).
+//                 Root-caused and fixed "cancelling Change MQTT still disconnects MQTT": unlike the
+//                 WiFi flow, connect() is never called on that cancel path, so the actual cause is
+//                 different -- startChangeMqttFlow()'s blocking wait loop suspends loop()'s own
+//                 mqttClient.poll() call for as long as the host/username/password screens are open,
+//                 so keepalive PINGREQs stop going out and a broker can silently drop an otherwise-
+//                 fine session before the user ever submits anything. Now polls inside that wait loop
+//                 (fixes it at the source) plus reconnects as a safety net if still disconnected once
+//                 the loop exits, same principle as the WiFi flow's v1.0.59 fix.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -1666,6 +1688,28 @@ lv_obj_t* makeAutoPill(lv_obj_t* parent, lv_color_t bg, lv_color_t textColor, co
   return pill;
 }
 
+//Re-fits an existing makeAutoPill() to new text, for pills whose text
+//length genuinely varies at runtime (unlike pill_home_tou/pill_time_tou,
+//where all real values happen to be the same length so the build-time
+//fixed width never needs to change). Needed for the weather pill: a
+//fixed width sized for the worst-case condition string ("Lightning-rainy")
+//made the pill wider than its own quadrant once centered, pushing past
+//the screen's left edge and triggering scr_home's default scrollable
+//behavior (a visible scrollbar) even though nothing was meant to scroll.
+//Sizing to each real value's own width instead keeps the pill snug, the
+//same way pill_home_tou's fixed "$0.65/kWh" width already reads as snug.
+//Both the pill and its inner label were built with a persistent
+//LV_ALIGN_TOP_MID/lv_obj_center (a style-based align, not a one-time
+//lv_obj_set_pos -- see lbl_almanac_weather's identical fix), so resizing
+//either one here re-centers it automatically on the next layout pass;
+//no explicit re-align call needed.
+void resizeAutoPillText(lv_obj_t* pill, const char* text, lv_coord_t padX) {
+  lv_obj_t* lbl = lv_obj_get_child(pill, 0);
+  lv_label_set_text(lbl, text);
+  lv_obj_update_layout(lbl);
+  lv_obj_set_width(pill, lv_obj_get_width(lbl) + 2 * padX);
+}
+
 lv_obj_t* makeRing(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t d, int16_t start_angle, int16_t end_angle, lv_color_t color) {
   lv_obj_t* arc = lv_arc_create(parent);
   lv_obj_set_size(arc, d, d);
@@ -2069,11 +2113,36 @@ void startChangeMqttFlow() {
   while (g_awaitingManualMqttSetup) {
     lv_timer_handler();
     serviceDevCommands();
+    //This blocking loop replaces loop()'s own top-level mqttClient.poll()
+    //call for as long as the user sits on the host/username/password
+    //screens (loop() itself is suspended on the call that got us here) --
+    //without this, poll()'s keepalive PINGREQ never goes out, so a broker
+    //that's stricter about its keepalive window can silently drop the
+    //still-good, unrelated MQTT session while the user is just looking at
+    //(or cancelling out of) this screen, well before any connect() attempt
+    //ever runs. Root cause of "cancelling Change MQTT still disconnects
+    //MQTT" -- connect() itself is provably not the culprit here, since it's
+    //never called at all on the cancel path.
+    mqttClient.poll();
     if (g_pendingMqttAttempt) {
       g_pendingMqttAttempt = false;
       attemptMqttConnectFromSetup(g_pendingMqttHost, g_pendingMqttUser, g_pendingMqttPass);
     }
     delay(5);
+  }
+  //Safety net alongside the poll() fix above -- covers any other reason
+  //the session could have dropped during the wait (e.g. a real network
+  //hiccup) on the cancel path, where nothing else in this function
+  //reconnects. The success path already leaves mqttClient connected with
+  //the NEW credentials by this point, so this is a no-op there; the
+  //failed-attempt path already reconnects with the prior credentials
+  //inside attemptMqttConnectFromSetup() itself. Same "only disconnect if
+  //an actual change happened" principle as startChangeWifiFlow()'s
+  //identical check.
+  if (!mqttClient.connected()) {
+    if (tryConnectMqtt(mqttHost, mqttUserRuntime, mqttPassRuntime)) {
+      subscribeAllMqttTopics();
+    }
   }
   logMemStatus("after ChangeMqtt");
 }
@@ -2352,11 +2421,14 @@ void buildMqttHostScreen() {
   lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(back, navConnection, LV_EVENT_CLICKED, NULL);
 
-  makeLabel(scr_mqtt_host, "MQTT broker IP address", COLOR_TEXT_MUTED, 40, 50);
+  //Same y-offset nudge (50/82 -> 58/98) as buildWifiPasswordScreen()/
+  //buildMqttPasswordScreen() -- identical squished Cancel/caption/text
+  //entry rows on this screen too.
+  makeLabel(scr_mqtt_host, "MQTT broker IP address", COLOR_TEXT_MUTED, 40, 58);
 
   mqttHostTextarea = lv_textarea_create(scr_mqtt_host);
   lv_obj_set_size(mqttHostTextarea, 720, 46);
-  lv_obj_set_pos(mqttHostTextarea, 40, 82);
+  lv_obj_set_pos(mqttHostTextarea, 40, 98);
   lv_textarea_set_one_line(mqttHostTextarea, true);
   lv_textarea_set_max_length(mqttHostTextarea, 63);
   lv_textarea_set_accepted_chars(mqttHostTextarea, "0123456789.");
@@ -2449,13 +2521,15 @@ void buildHomeScreen() {
 
   //pushed down from 122 -- the date label above has descenders (the 'y' in
   //"Monday"/"July") that this pill's opaque background was clipping into
-  //Worst-case placeholder text so the pill's build-time fixed width (see
-  //makeAutoPill's own comment -- it never resizes after construction) fits
-  //the longest real condition string this can ever show: HA's `weather`
-  //domain normalizes Met.no's own symbol codes down to one of a small fixed
-  //set (sunny/cloudy/rainy/snowy/etc.), and "lightning-rainy" is the
-  //longest of those.
-  weather_pill = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_TEXT, "Lightning-rainy, 68\xC2\xB0""F >", 16, 40);
+  //Just an ordinary build-time placeholder here, not a worst-case one --
+  //unlike pill_home_tou (all three real rate strings are the same length,
+  //so its fixed width never needs to change), the weather condition
+  //varies a lot in length ("Sunny" vs "Lightning-rainy"). Sizing the pill
+  //for the worst case made it wider than its own quadrant once centered,
+  //pushing past the screen's left edge and triggering scr_home's default
+  //scrollable behavior. resizeAutoPillText() (see its own comment) instead
+  //re-fits this pill to each real value's own width every update.
+  weather_pill = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_TEXT, "Cloudy, 68\xC2\xB0""F >", 16, 40);
   lv_obj_align(weather_pill, LV_ALIGN_TOP_MID, 0, 134);
   lv_obj_add_flag(weather_pill, LV_OBJ_FLAG_CLICKABLE);
   //LVGL doesn't bubble click events to parents unless LV_OBJ_FLAG_EVENT_BUBBLE
@@ -3518,15 +3592,30 @@ void loop() {
     lv_label_set_text(lbl_home_date, dateBuf);
     lv_label_set_text(lbl_time_date, dateBuf);
 
-    //Real weather, once per second (cheap -- just a label update, and
-    //matches this block's existing cadence) instead of the build-time
-    //"Cloudy, 68F >" placeholder -- g_weatherCondition is already
-    //sentence-cased at MQTT-arrival time (see onMqttMessage()).
+    //Real weather instead of the build-time "Cloudy, 68F >" placeholder --
+    //g_weatherCondition is already sentence-cased at MQTT-arrival time (see
+    //onMqttMessage()). resizeAutoPillText() (not a plain lv_label_set_text)
+    //re-fits the pill itself to the text's actual width -- condition text
+    //length varies enough ("Sunny" vs "Lightning-rainy") that a fixed
+    //build-time width either clips short text or, sized for the worst
+    //case, overflows the quadrant and triggers scr_home's default
+    //scrollbar. Only called when the text actually changed (g_weatherTempF
+    //ticks with every MQTT update, but the almanac topic only publishes
+    //every 6 hours -- see almanac_data.py -- so in steady state this
+    //string is identical second to second): calling this unconditionally
+    //every second, forever, hung the board on real hardware within a
+    //couple seconds of boot -- this device has a documented lv_realloc()
+    //fragility (see lvgl_patches/README.md, lvgl/lvgl#9794) and that much
+    //needless per-second label/layout churn was enough to trigger it.
+    static char lastWeatherBuf[32] = "";
     if (g_hasAlmanacData) {
       char weatherBuf[32];
       snprintf(weatherBuf, sizeof(weatherBuf), "%s, %d\xC2\xB0""F >", g_weatherCondition, g_weatherTempF);
-      lv_obj_t* weatherLbl = lv_obj_get_child(weather_pill, 0);
-      lv_label_set_text(weatherLbl, weatherBuf);
+      if (strcmp(weatherBuf, lastWeatherBuf) != 0) {
+        resizeAutoPillText(weather_pill, weatherBuf, 16);
+        strncpy(lastWeatherBuf, weatherBuf, sizeof(lastWeatherBuf) - 1);
+        lastWeatherBuf[sizeof(lastWeatherBuf) - 1] = '\0';
+      }
     }
 
     //Real TOU tier/rate, once per second -- same cadence as the clock.
