@@ -133,7 +133,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.60"
+#define VERSION_DASHBOARD "1.0.61"
 //version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
 //version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
 //version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
@@ -268,6 +268,15 @@ uint32_t dsi_getDisplayYSize(void);
 //                 fine session before the user ever submits anything. Now polls inside that wait loop
 //                 (fixes it at the source) plus reconnects as a safety net if still disconnected once
 //                 the loop exits, same principle as the WiFi flow's v1.0.59 fix.
+//version 1.0.61 - Moonrise/Moonset column icons now render the same real, phase-accurate icon as
+//                 the phase row (renderMoonPhaseIcon(), generalized to draw to any canvas/size)
+//                 instead of a generic fixed-crescent glyph -- all three show the actual current
+//                 phase, since it's the same real moon. Sun/moon icons in that row are 1.5x bigger
+//                 (20px -> 30px). Moonrise/Moonset now swap which physical column (left/right) they
+//                 render in so the chronologically earlier of the two always reads left-to-right --
+//                 both are "next occurrence from now" (see almanac_data.py), so moonset genuinely
+//                 lands before moonrise depending on time of day/phase. Fixed the same squished
+//                 Back/caption/text-entry spacing on the MQTT username screen (missed it earlier).
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -399,7 +408,7 @@ const char subtopicBatteryYesterdaySoc[] = "V1.0/Home/Battery/YesterdaySOC";
 //Published by a pyscript automation on the HA side (see
 //homeassistant/pyscript/almanac_data.py), every 6 hours: weather
 //(Met.no), sun rise/set, and moon rise/set/phase, for the Almanac
-//screen -- see parseAlmanacPayload() and updateMoonPhaseIcon() below.
+//screen -- see parseAlmanacPayload() and renderMoonPhaseIcon() below.
 const char subtopicAlmanacData[] = "V1.0/Home/Almanac/Data";
 
 char g_weatherCondition[24] = "";
@@ -410,7 +419,7 @@ time_t g_moonriseEpoch = 0;
 time_t g_moonsetEpoch = 0;
 //0-360 degrees (0=new, 180=full) -- the single authoritative value the
 //icon and illuminated-% text are both derived from; see
-//updateMoonPhaseIcon()'s own comment for the geometry.
+//renderMoonPhaseIcon()'s own comment for the geometry.
 float g_moonPhaseAngle = 0;
 char g_moonPhaseName[24] = "";
 bool g_hasAlmanacData = false;
@@ -919,18 +928,32 @@ lv_obj_t* lbl_almanac_sunset;
 lv_obj_t* lbl_almanac_moonrise;
 lv_obj_t* lbl_almanac_moonset;
 lv_obj_t* lbl_almanac_phase;
+//Column containers (not just the value labels above) for the two moon
+//rows -- needed so updateAlmanacScreen() can swap which physical column
+//(left/right) Moonrise vs. Moonset renders in, so the chronologically
+//earlier of the two always reads left-to-right (see its own comment).
+lv_obj_t* col_moonrise;
+lv_obj_t* col_moonset;
 //Accurate moon-phase icon, redrawn from real phase-angle data -- see
-//updateMoonPhaseIcon(). Separate from the generic fixed-crescent
-//makeMoonIcon() glyphs still used in the Moonrise/Moonset columns
-//above (those are just "this is about the moon" indicators, not meant
-//to show the real current phase).
+//renderMoonPhaseIcon(). The SAME calculation now also drives the
+//Moonrise/Moonset column icons below (moonrise_icon_canvas/
+//moonset_icon_canvas) -- all three show the real current phase, not a
+//generic fixed-crescent glyph.
 lv_obj_t* moon_phase_canvas;
-#define MOON_ICON_D 22
-//RGB565 (16bpp), not ARGB8888 -- this icon is always fully opaque (flat
-//style, matching the rest of this dashboard), so no alpha channel is
-//needed. Raw byte buffer + LV_CANVAS_BUF_SIZE(), per LVGL 9's actual
+lv_obj_t* moonrise_icon_canvas;
+lv_obj_t* moonset_icon_canvas;
+#define MOON_ICON_D 33  //1.5x the original 22px
+//1.5x the original 20px sun/moon time-column icons -- shared by
+//makeSunIcon() (Sunrise/Sunset) and the moon canvases (Moonrise/Moonset)
+//below so all four icons in that row stay the same visual size.
+#define ICON_D 30
+//RGB565 (16bpp), not ARGB8888 -- these icons are always fully opaque
+//(flat style, matching the rest of this dashboard), so no alpha channel
+//is needed. Raw byte buffer + LV_CANVAS_BUF_SIZE(), per LVGL 9's actual
 //canvas API -- NOT an lv_color_t array (a common but wrong assumption).
 static uint8_t moon_canvas_buf[LV_CANVAS_BUF_SIZE(MOON_ICON_D, MOON_ICON_D, 16, LV_DRAW_BUF_STRIDE_ALIGN)];
+static uint8_t moonrise_icon_buf[LV_CANVAS_BUF_SIZE(ICON_D, ICON_D, 16, LV_DRAW_BUF_STRIDE_ALIGN)];
+static uint8_t moonset_icon_buf[LV_CANVAS_BUF_SIZE(ICON_D, ICON_D, 16, LV_DRAW_BUF_STRIDE_ALIGN)];
 
 //---- NTP / clock (same approach as Unit 1's getLocaltime/setNtpTime) ----
 char* getLocaltime(char buffer[]) {
@@ -1850,10 +1873,10 @@ void makeLegendItem(lv_obj_t* row, lv_color_t dotColor, const char* text) {
   makeLabel(item, text, COLOR_TEXT_MUTED);
 }
 
-//sun/moon icon shapes, reusing the exact geometry from
-//design/mockups/06_almanac.svg (circle + 4 tick marks for sun, two
-//overlapping circles for a moon crescent silhouette). Positioned by
-//top-left corner of a (d x d) bounding box, like the other make* helpers.
+//Sun icon shape, reusing the exact geometry from design/mockups/06_almanac.svg
+//(circle + 4 tick marks). Positioned by top-left corner of a (d x d)
+//bounding box, like the other make* helpers. The moon's equivalent is no
+//longer a fixed glyph -- see renderMoonPhaseIcon().
 void makeSunIcon(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t d) {
   lv_coord_t r = d / 2;
   lv_coord_t cx = x + r, cy = y + r;
@@ -1863,12 +1886,6 @@ void makeSunIcon(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t d) {
   makeDot(parent, COLOR_AMBER, cx - 1, y + d + 2, 2);             //bottom
   makeDot(parent, COLOR_AMBER, x - tick - 2, cy - 1, 2);          //left
   makeDot(parent, COLOR_AMBER, x + d + 2, cy - 1, 2);             //right
-}
-
-void makeMoonIcon(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t d) {
-  makeDot(parent, COLOR_MOON_GRAY, x, y, d);
-  //offset circle in the background color carves out the crescent shape
-  makeDot(parent, COLOR_BG, x + d / 4, y - d / 10, d);
 }
 
 //navigate by loading a different pre-built screen; called from touch event callbacks
@@ -2450,11 +2467,13 @@ void buildMqttUsernameScreen() {
   lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
   lv_obj_add_event_cb(back, navMqttHostScreen, LV_EVENT_CLICKED, NULL);
 
-  makeLabel(scr_mqtt_username, "MQTT username", COLOR_TEXT_MUTED, 40, 50);
+  //Same y-offset nudge (50/82 -> 58/98) as the other MQTT/WiFi setup
+  //screens -- identical squished Back/caption/text entry rows.
+  makeLabel(scr_mqtt_username, "MQTT username", COLOR_TEXT_MUTED, 40, 58);
 
   mqttUsernameTextarea = lv_textarea_create(scr_mqtt_username);
   lv_obj_set_size(mqttUsernameTextarea, 720, 46);
-  lv_obj_set_pos(mqttUsernameTextarea, 40, 82);
+  lv_obj_set_pos(mqttUsernameTextarea, 40, 98);
   lv_textarea_set_one_line(mqttUsernameTextarea, true);
   lv_textarea_set_max_length(mqttUsernameTextarea, 32);
   lv_obj_add_event_cb(mqttUsernameTextarea, onMqttUsernameSubmit, LV_EVENT_READY, NULL);
@@ -3014,12 +3033,15 @@ void formatMinuteOfDay(int minuteOfDay, char* buf, size_t bufSize) {
 }
 
 //Chart geometry matches the space the old SVG-derived polyline used:
-//x 150-650 spans the 24-hour day, y 370-410 is the plotted height range
+//x 150-650 spans the 24-hour day, y 374-414 is the plotted height range
 //(inverted -- LVGL/SVG y grows downward, so a higher tide is a smaller y).
+//Y nudged down 4px from the original 370-410 along with the rest of this
+//screen's rows below the Sunrise/Sunset/Moonrise/Moonset columns, when
+//those grew taller for the 1.5x icon size (see buildAlmanacTimeColumn()).
 #define TIDE_CHART_X0 150
 #define TIDE_CHART_X1 650
-#define TIDE_CHART_Y_HIGH 370
-#define TIDE_CHART_Y_LOW 410
+#define TIDE_CHART_Y_HIGH 374
+#define TIDE_CHART_Y_LOW 414
 #define TIDE_CURVE_MAX_POINTS 48
 static lv_point_precise_t g_tideCurvePoints[TIDE_CURVE_MAX_POINTS];
 int g_tideCurvePointCount = 0;
@@ -3174,28 +3196,44 @@ void rebuildBatteryDayCurve() {
 //from the mockup survives regardless of actual rendered text width.
 //Returns the value label so callers can update it at runtime (see
 //updateAlmanacScreen()) -- this function only builds the static
-//structure once.
-lv_obj_t* buildAlmanacTimeColumn(lv_obj_t* parent, lv_coord_t cx, bool isSun, const char* value, const char* caption) {
+//structure once. colOut (optional) returns the column container itself --
+//needed for the two moon columns, whose left/right position can swap at
+//update time (see updateAlmanacScreen()). moonCanvasOut/moonCanvasBuf
+//(both required together, only for isSun==false) wire up a real,
+//phase-accurate icon instead of a generic glyph -- see
+//renderMoonPhaseIcon().
+lv_obj_t* buildAlmanacTimeColumn(lv_obj_t* parent, lv_coord_t cx, bool isSun, const char* value, const char* caption,
+                                  lv_obj_t** colOut, lv_obj_t** moonCanvasOut, uint8_t* moonCanvasBuf) {
   const lv_coord_t w = 150;
   //value-to-caption gap widened from an initial 23px to 30px, matching the
   //Grid screen's stat columns -- both used the same too-tight pattern,
   //caught when you flagged the Grid one as visually cramped.
   //
-  //Column height widened from 95 to 115 -- 95 wasn't enough room for
-  //icon(28) + value(~28) + caption starting at 70, so the caption's own
-  //bottom (and, for words with descenders, the descenders first) was
-  //being clipped by the column's own height boundary. Caught by you
-  //pointing out specific glyph damage ("u" missing its bottom curve,
-  //reading almost like "ii") that a simple ink-vs-background pixel-band
-  //scan couldn't distinguish from a font just ending there naturally --
-  //the clipping color and the surrounding background are identical.
-  lv_obj_t* col = makeColumn(parent, cx - w / 2, 178, w, 115);
-  if (isSun) makeSunIcon(col, w / 2 - 10, 8, 20);
-  else makeMoonIcon(col, w / 2 - 10, 8, 20);
+  //Column height widened from 95 to 115, then further to 119 when the
+  //icons grew from 20px to ICON_D (30px, 1.5x) -- kept the same
+  //value-to-caption gap and bottom margin that were already tuned to
+  //avoid clipping caption descenders against the column's own bottom
+  //edge (caught by you pointing out specific glyph damage -- "u" missing
+  //its bottom curve -- that plain ink-vs-background pixel scanning
+  //couldn't distinguish from a font just ending there naturally, since
+  //the clipping color and background are identical); the icon-to-value
+  //gap shrank a bit (12px -> 6px) to keep this screen's later rows
+  //(phase/tide) from all needing to shift down by the icon's full 10px
+  //growth.
+  lv_obj_t* col = makeColumn(parent, cx - w / 2, 178, w, 119);
+  if (isSun) {
+    makeSunIcon(col, w / 2 - ICON_D / 2, 8, ICON_D);
+  } else {
+    lv_obj_t* canvas = lv_canvas_create(col);
+    lv_canvas_set_buffer(canvas, moonCanvasBuf, ICON_D, ICON_D, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_pos(canvas, w / 2 - ICON_D / 2, 8);
+    *moonCanvasOut = canvas;
+  }
   lv_obj_t* val = makeLabel(col, value, lv_color_hex(0xd6d7d9));
-  lv_obj_align(val, LV_ALIGN_TOP_MID, 0, 40);
+  lv_obj_align(val, LV_ALIGN_TOP_MID, 0, 44);
   lv_obj_t* cap = makeLabel(col, caption, COLOR_TEXT_DIM);
-  lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 74);
+  lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 78);
+  if (colOut) *colOut = col;
   return val;
 }
 
@@ -3222,20 +3260,23 @@ void buildAlmanacScreen() {
 
   //pushed down from the original layout (which collided with the moon-phase
   //row below it once rendered on real hardware) and widened into columns
-  //that center regardless of text width.
-  lbl_almanac_sunrise = buildAlmanacTimeColumn(scr_almanac, 160, true, "5:58 AM", "Sunrise");
-  lbl_almanac_sunset = buildAlmanacTimeColumn(scr_almanac, 320, true, "8:41 PM", "Sunset");
-  lbl_almanac_moonrise = buildAlmanacTimeColumn(scr_almanac, 480, false, "9:14 PM", "Moonrise");
-  lbl_almanac_moonset = buildAlmanacTimeColumn(scr_almanac, 640, false, "6:37 AM", "Moonset");
+  //that center regardless of text width. Sun columns don't need a
+  //colOut/moon-canvas (nullptr for those three params) -- only the two
+  //moon columns can swap position or need a phase-accurate icon.
+  lbl_almanac_sunrise = buildAlmanacTimeColumn(scr_almanac, 160, true, "5:58 AM", "Sunrise", nullptr, nullptr, nullptr);
+  lbl_almanac_sunset = buildAlmanacTimeColumn(scr_almanac, 320, true, "8:41 PM", "Sunset", nullptr, nullptr, nullptr);
+  lbl_almanac_moonrise = buildAlmanacTimeColumn(scr_almanac, 480, false, "9:14 PM", "Moonrise", &col_moonrise, &moonrise_icon_canvas, moonrise_icon_buf);
+  lbl_almanac_moonset = buildAlmanacTimeColumn(scr_almanac, 640, false, "6:37 AM", "Moonset", &col_moonset, &moonset_icon_canvas, moonset_icon_buf);
 
   //height widened from 30 to 40 -- 30 was clipping the descenders on the
   //two g's in "Waxing gibbous" against the row's own bottom edge (you
   //caught this by pointing out specific glyph damage in a zoomed crop:
   //a "u" missing its bottom curve elsewhere on this screen, the same
-  //class of bug). y nudged up slightly so the extra height doesn't eat
-  //too far into the gap before the Tide label/chart below.
-  lv_obj_t* phase_row = makeFlexRow(scr_almanac, 0, 298, 800, 40, 10);
-  //Real, phase-accurate icon (see updateMoonPhaseIcon()) instead of the
+  //class of bug). y nudged down 4px from the columns above growing by
+  //the same amount (see buildAlmanacTimeColumn()) to preserve the same
+  //gap to the Tide label/chart below.
+  lv_obj_t* phase_row = makeFlexRow(scr_almanac, 0, 302, 800, 40, 10);
+  //Real, phase-accurate icon (see renderMoonPhaseIcon()) instead of the
   //fixed generic crescent used elsewhere on this screen -- built once as
   //an lv_canvas here, redrawn whenever real phase data arrives.
   moon_phase_canvas = lv_canvas_create(phase_row);
@@ -3246,8 +3287,9 @@ void buildAlmanacScreen() {
   //once real data replaces it.
   lbl_almanac_phase = makeLabel(phase_row, "Waning crescent - 100% lit", COLOR_MOON_GRAY);
 
+  //Same +4px nudge as phase_row above.
   lv_obj_t* tide_lbl = makeLabel(scr_almanac, "Tide", COLOR_BLUE_TIDE);
-  lv_obj_align(tide_lbl, LV_ALIGN_TOP_MID, 0, 344);
+  lv_obj_align(tide_lbl, LV_ALIGN_TOP_MID, 0, 348);
 
   //Built with zero points initially -- rebuildTideCurve() fills this in
   //once the clock is NTP-synced (real dates need real time), called once
@@ -3257,9 +3299,10 @@ void buildAlmanacScreen() {
   lv_obj_set_style_line_width(tide_line_obj, 3, 0);
   lv_obj_set_style_line_rounded(tide_line_obj, true, 0);
 
-  lbl_tide_left = makeLabel(scr_almanac, "High --:-- --", COLOR_TEXT, 150, 430);
+  //Same +4px nudge as phase_row/tide_lbl above.
+  lbl_tide_left = makeLabel(scr_almanac, "High --:-- --", COLOR_TEXT, 150, 434);
   lbl_tide_right = makeLabel(scr_almanac, "Low --:-- --", COLOR_TEXT);
-  lv_obj_align(lbl_tide_right, LV_ALIGN_TOP_RIGHT, -150, 430);
+  lv_obj_align(lbl_tide_right, LV_ALIGN_TOP_RIGHT, -150, 434);
 }
 
 //"5:58 AM" -- same %I:%M %p convention as the main clock, for an
@@ -3282,9 +3325,13 @@ char* formatEpochTime(time_t epoch, char buffer[]) {
   return buffer;
 }
 
-//Redraws moon_phase_canvas as a real, geometrically-accurate phase icon
-//from g_moonPhaseAngle (0=new, 180=full, 0-360 covering a full waxing+
-//waning cycle) -- not one of a fixed set of 8 pictures.
+//Redraws any of the three moon canvases (the phase-row icon, plus the
+//Moonrise/Moonset column icons) as a real, geometrically-accurate phase
+//icon from g_moonPhaseAngle (0=new, 180=full, 0-360 covering a full
+//waxing+waning cycle) -- not one of a fixed set of 8 pictures, and not
+//a generic "this is about the moon" glyph either. All three show the
+//SAME real phase, just at different sizes (d), since it's the same real
+//moon in all three places.
 //
 //A moon phase's illuminated region is the disk intersected/unioned with
 //an ellipse whose horizontal half-width is the disk's own half-width at
@@ -3299,32 +3346,32 @@ char* formatEpochTime(time_t epoch, char buffer[]) {
 //limbSign picks which side is lit for waxing vs. waning (an arbitrary
 //but consistent left/right convention -- flip both signs below if it
 //reads backwards for your hemisphere/preference).
-void updateMoonPhaseIcon() {
+void renderMoonPhaseIcon(lv_obj_t* canvas, lv_coord_t d) {
   float angle = g_moonPhaseAngle;
   bool waxing = (angle <= 180.0f);
   float thetaForFormula = waxing ? angle : (360.0f - angle);
   float cosTheta = cosf(radians(thetaForFormula));
   float limbSign = waxing ? 1.0f : -1.0f;
 
-  const float R = MOON_ICON_D / 2.0f;
-  lv_canvas_fill_bg(moon_phase_canvas, COLOR_BG, LV_OPA_COVER);
+  const float R = d / 2.0f;
+  lv_canvas_fill_bg(canvas, COLOR_BG, LV_OPA_COVER);
 
-  for (int y = 0; y < MOON_ICON_D; y++) {
+  for (int y = 0; y < d; y++) {
     float ny = (y + 0.5f - R) / R;
     if (fabsf(ny) > 1.0f) continue;
     float diskHalfWidth = sqrtf(1.0f - ny * ny);
     float terminatorX = cosTheta * diskHalfWidth;
 
-    for (int x = 0; x < MOON_ICON_D; x++) {
+    for (int x = 0; x < d; x++) {
       float nx = (x + 0.5f - R) / R;
       if (nx * nx + ny * ny > 1.0f) continue; //outside the disk -- leave as background
       bool illuminated = (nx * limbSign) >= terminatorX;
-      lv_canvas_set_px(moon_phase_canvas, x, y,
+      lv_canvas_set_px(canvas, x, y,
                         illuminated ? COLOR_MOON_GRAY : lv_color_hex(0x232428),
                         LV_OPA_COVER);
     }
   }
-  lv_obj_invalidate(moon_phase_canvas);
+  lv_obj_invalidate(canvas);
 }
 
 //Refreshes every Almanac screen element from the latest g_*Epoch/
@@ -3350,15 +3397,35 @@ void updateAlmanacScreen() {
   lv_label_set_text(lbl_almanac_moonrise, formatEpochTime(g_moonriseEpoch, timeBuf));
   lv_label_set_text(lbl_almanac_moonset, formatEpochTime(g_moonsetEpoch, timeBuf));
 
+  //Both values are "next occurrence from now" (see almanac_data.py's own
+  //header comment), so moonset can genuinely land before moonrise
+  //depending on time of day/phase -- swap which physical column (left,
+  //cx=480, vs. right, cx=640) each one renders in so the chronologically
+  //earlier event always reads left-to-right, regardless of which label
+  //it is. Sunrise/sunset never need this -- the sun only ever rises
+  //before it sets within a calendar day.
+  const lv_coord_t colW = 150;
+  lv_coord_t moonriseCx = 480, moonsetCx = 640;
+  if (g_moonsetEpoch < g_moonriseEpoch) {
+    lv_coord_t tmp = moonriseCx;
+    moonriseCx = moonsetCx;
+    moonsetCx = tmp;
+  }
+  lv_obj_set_x(col_moonrise, moonriseCx - colW / 2);
+  lv_obj_set_x(col_moonset, moonsetCx - colW / 2);
+
   //Illuminated % derived from the phase angle here (not sent separately
-  //over MQTT) -- see updateMoonPhaseIcon()'s comment for why the angle
-  //alone is authoritative for both the icon and this number.
+  //over MQTT) -- see renderMoonPhaseIcon()'s comment for why the angle
+  //alone is authoritative for both the icons and this number.
   float k = (1.0f - cosf(radians(g_moonPhaseAngle))) / 2.0f;
   char phaseBuf[40];
   snprintf(phaseBuf, sizeof(phaseBuf), "%s - %d%% lit", g_moonPhaseName, (int)(k * 100.0f + 0.5f));
   lv_label_set_text(lbl_almanac_phase, phaseBuf);
 
-  updateMoonPhaseIcon();
+  //Same real phase, three places -- see renderMoonPhaseIcon()'s own comment.
+  renderMoonPhaseIcon(moon_phase_canvas, MOON_ICON_D);
+  renderMoonPhaseIcon(moonrise_icon_canvas, ICON_D);
+  renderMoonPhaseIcon(moonset_icon_canvas, ICON_D);
 }
 
 //This sketch's own directory also has an mbed_app.json (arduino-cli
