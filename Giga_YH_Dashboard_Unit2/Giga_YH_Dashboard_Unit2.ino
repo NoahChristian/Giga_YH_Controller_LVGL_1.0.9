@@ -1,0 +1,3996 @@
+//Giga YH Dashboard - Unit 2 (remote display)
+//Author: Noah Christian (C) 2026
+//Spiral 1 + post-hardware fix batch
+//
+//Purpose: A touch-navigable status dashboard for the Giga_YH TOU-optimization
+//  home automation system, running as UNIT_NUMBER 2 -- subscribe-only, never
+//  publishes, never touches RS485, never writes an output command. It has no
+//  control authority over anything; it only displays. This is deliberate: it
+//  lets the dashboard UI (new, untested on real hardware) be proven out with
+//  zero blast radius on the actual power controller (Giga_YH_Controller_LVGL_1.0.9,
+//  UNIT_NUMBER 1), which has its own timing-sensitive RS485/MQTT control loop
+//  that this sketch must never compete with -- because it's a fully separate
+//  physical board, it structurally can't.
+//
+//Design reference: ../design/lvgl_redesign_plan.md and the mockups under
+//  ../design/mockups/ (01_home.svg .. 06_almanac.svg) are the visual source
+//  of truth this sketch is implementing. Read those before changing layout,
+//  colors, or screen structure here.
+//
+//Spiral 1 scope (see plan doc for what's deliberately NOT here yet):
+//  - All six screens exist and are reachable by touch: Home, Time & rates,
+//    Connection, Battery, Grid flow, Almanac.
+//  - Connection screen shows real data (SSID, RSSI, MQTT broker state) --
+//    free, no MQTT subscription needed.
+//  - Subscribed (not published -- this device has no publish authority,
+//    ever) to the sibling ESP32_Fuel_Gauge project's own Battery/SoC and
+//    Battery/Action topics, so the battery ring/state on both the Home
+//    and Battery screens are real once a reading arrives.
+//  - Also subscribed to Unit 1's own Line1/Line2 output-readback topics
+//    (the feeder columns) AND to Line1Set/Line2Set (Home Assistant's real
+//    per-line grid readings, independent signed values -- see
+//    g_line1GridPower/g_line2GridPower below). The Grid flow screen's
+//    right-hand ring is their sum, a genuine whole-household net-flow
+//    reading, not a proxy.
+//  - Real TOU rates/schedule (Home + Time & rates screens) and real NOAA
+//    tide predictions (Almanac screen) are also wired in, display-only --
+//    see the TOU/tide sections below. Weather is still a static
+//    placeholder.
+//  - No icon font, no lv_meter needle gauge, no lv_chart -- this sketch uses
+//    LVGL's default font and simple lv_arc/lv_obj/lv_line primitives instead,
+//    to stay on widgets that are stable across LVGL v7/v8/v9.
+//
+//Post-hardware fix batch (see plan doc "post-hardware fix batch" for the
+//full list this addresses): centers/aligns text via LVGL alignment
+//primitives instead of hand-guessed absolute coordinates (the root cause of
+//the overlap/overrun bugs found once this ran on a real screen); recolors
+//battery/grid state text to the green(Idle)/blue(Discharging)/red(Charging)
+//muted scheme; wires the Grid panel's Consuming/Bypassing status from real
+//L1+L2 data; replaces the flat placeholder chart bars with real lv_line
+//curves reusing the mockups' own point data; adds two new Connection screen
+//rows (gateway/local IP); adds simple sun/moon icon shapes to the Almanac
+//screen; gives this sketch an explicit MQTT client ID as a precaution
+//against ID collisions with Unit 1.
+//
+// arduino_secrets.h should contain the following definitions (same
+// convention as the Unit 1 controller sketch):
+// #define SECRET_SSID "YourWiFiSSID"
+// #define SECRET_PASS "YourWiFiPassword"
+// #define HOME_ASSISTANT_IP "YourHomeAssistantIP"
+// #define MQTT_USERNAME "YourMQTTUsername"
+// #define MQTT_PASSWORD "YourMQTTPassword"
+
+#include "Arduino_H7_Video.h"
+//LVGL's own memory pool is SDRAM-backed via ea_malloc() (see
+//LV_MEM_POOL_ALLOC in lv_conf.h) -- SDRAM.begin() must run before
+//lv_init() (called internally by Display.begin() below) registers that
+//pool, or ea_malloc() has nothing to allocate from and returns NULL.
+#include "SDRAM.h"
+#include "lvgl.h"
+#include "Arduino_GigaDisplayTouch.h"
+#include "lv_conf.h"
+
+#include "mbed.h"
+#include <mbed_mktime.h>
+#include <math.h>
+#include "kvstore_global_api.h"
+
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include "arduino_secrets.h"
+#include <ArduinoMqttClient.h>
+
+//Real NOAA CO-OPS tide predictions for La Jolla, CA (station 9410230),
+//covering all of 2026. Generated once via tools/tide_data/
+//convert_tide_data.py from a direct NOAA API fetch -- see that script
+//for regenerating a future year. Defines TideEvent and TIDE_EVENTS_2026.
+#include "tide_data_2026.h"
+
+//Arduino's build system auto-generates function prototypes and inserts
+//them near the top of the translation unit, BEFORE any type defined
+//later in this file -- any function using a custom struct/enum as a
+//parameter or return type breaks ("X has not been declared") unless
+//that type is already defined by this point. Hence these being all the
+//way up here instead of next to the functions that use them below.
+enum TouTier { TOU_SUPER_OFF_PEAK, TOU_OFF_PEAK, TOU_ON_PEAK };
+struct MonthDay { uint8_t month; uint8_t day; };
+struct TouStatus {
+  TouTier tier;
+  double rate;
+  bool weekendOrHoliday;
+  int nextBoundaryHour;  //24-hour; the hour this tier ends (24 = midnight)
+};
+struct TouSegment { int startHour; int endHour; lv_color_t color; };
+struct TouWindow { int startHour; int endHour; TouTier tier; };
+struct TidePoint { int minuteOfDay; float heightFeet; bool isHigh; };
+//see setConnStatusIndicator() -- drives the Home quadrant's and Connection
+//screen's dot+label, replacing what used to be a build-time-only
+//hardcoded green "Connected" dot.
+enum WifiUiState { WIFI_UI_CONNECTING, WIFI_UI_CONNECTED, WIFI_UI_NOT_CONNECTED };
+//orbit center/radius + tracked angle for the SoC ring's charge/discharge
+//dot -- see updateOrbitDot() for why the angle is tracked as a float
+//here instead of read back from LVGL.
+struct OrbitDot {
+  lv_obj_t* dot;
+  int16_t cx, cy, r;
+  float currentAngleDeg;
+  int lastDirection;
+  float lastPercent;
+};
+
+//These three are implemented in Arduino_H7_Video's own dsi.cpp (part of this
+//same library, already linked in because Arduino_H7_Video.cpp itself calls
+//them) but not declared in any header the sketch can see -- dsi.h lives in
+//the library's src/ folder, not its public include path. Redeclaring them
+//here with matching signatures lets the linker resolve them against the
+//already-compiled library object. Used only by dumpFramebufferToSerial()
+//below, a debug/dev feature: it lets me see what a screen actually looks
+//like (resolution, real text width, real overlap) over the same serial
+//port already used for logging, instead of relying on a hardware photo for
+//every layout tweak.
+uint32_t dsi_getActiveFrameBuffer(void);
+uint32_t dsi_getDisplayXSize(void);
+uint32_t dsi_getDisplayYSize(void);
+
+#define UNIT_NUMBER 2
+#define VERSION_DASHBOARD "1.0.62"
+//version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
+//version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
+//version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
+//version 1.0.10 - Subscribed (read-only) to Battery/SoC + Battery/Action.
+//version 1.0.11 - Subscribed (read-only) to Unit 1's Line1/Line2 output-readback topics.
+//version 1.0.12 - Real-hardware fix batch: LVGL alignment instead of guessed coordinates, battery-state color
+//                 scheme, real lv_line charts, 2-column Connection screen, explicit MQTT client ID.
+//version 1.0.13 - Widened Home screen pill spacing (text was colliding).
+//version 1.0.14 - Added the screen exporter (dumpFramebufferToSerial + tools/dump_screen.py) for verifying
+//                 real rendered layout instead of guessing from source.
+//version 1.0.15 - Added serial screen-nav commands. Fixed pill text clipping via makeAutoPill() (guessed
+//                 widths were narrower than real rendered content).
+//version 1.0.16 - Iterative real-capture-driven fixes: Unicode glyph fallback, label overlap/clipping on
+//                 the Connection and Grid screens.
+//version 1.0.17 - The 1.0.16 fix introduced label wrapping/collision -- widened the box, switched to clip
+//                 long-mode. Captures now timestamped + logged to capture_log.csv.
+//version 1.0.18 - 1.0.17's widening ran values off the 800px screen edge -- shifted the whole right column
+//                 left instead of continuing to widen rightward.
+//version 1.0.19 - 1.0.18's shift silently shrank a label width below a previously-confirmed-good value --
+//                 restored it. Three-iteration lesson: re-capture and verify every fix, never assume.
+//version 1.0.20 - Same too-narrow-column bug hit the Grid screen's "Saved today" column -- reused the
+//                 already-confirmed-good width instead of guessing a third number.
+//version 1.0.21 - Widened stat-column line spacing on the Grid and Almanac screens (visually tight).
+//version 1.0.22 - Fixed the weather pill clipping into the date label's descenders above it.
+//version 1.0.23 - 1.0.27 - Extended debugging saga chasing TOU pill text clipping through several wrong
+//                 theories (deferred layout, LV_SIZE_CONTENT quirks, call ordering) before finding the real
+//                 cause: screen/quadrant containers never zeroed LVGL's default theme padding, silently
+//                 shrinking every container's real content area. Fixed with an explicit
+//                 lv_obj_set_style_pad_all(obj, 0, 0) on every container. Design rule since: verify real
+//                 pixel clearance via a capture, never assume a fix worked without re-measuring.
+//version 1.0.28 - 1.0.29 - Fixed same-color-as-background text clipping (invisible to a simple pixel scan)
+//                 on the Almanac and Battery/Time legend rows.
+//version 1.0.30 - Real data pass (display-only): TOU rates/schedule, Line1Set grid consumption, NOAA tide
+//                 predictions -- replacing static mockup placeholders.
+//version 1.0.31 - Fixed the weekday TOU schedule (two super-off-peak windows, not zero). Unified the
+//                 schedule into one buildTouWindows() source of truth for both the pill text and the bar.
+//version 1.0.32 - 1.0.33 - Added upcoming-tier pills to the Time & rates screen; restacked them vertically
+//                 after a side-by-side layout ran off both screen edges.
+//version 1.0.34 - Grid screen rework: two rings (Battery/Grid), corrected Line1Set/Line2Set as independent
+//                 (not duplicate) per-line signed readings -- confirmed via HIL testing -- real Saved Today
+//                 math, and chronological tide High/Low sort. Flagged (not fixed): Unit 1's own
+//                 oscillation-fix halving logic assumed the now-corrected duplicate-value premise.
+//version 1.0.35 - 1.0.37 - Battery ring gauge fixes: a zero-length placeholder arc, then clipping against
+//                 its own container, then Home quadrant two-ring layout iteration.
+//version 1.0.38 - Real-hardware batch: live date labels (were static build-time text), the Grid ring's arc
+//                 was never actually updated in loop(), removed an incorrect 900W clamp on grid readings.
+//version 1.0.39 - Fixed Home quadrant click-through: makeColumn() was clickable by default, swallowing taps
+//                 meant for the quadrant's own nav handler.
+//version 1.0.40 - Added a simulated-touch serial command for scripted regression testing without hands on
+//                 the board (tools/sim_tap.py). Fixed a coordinate-rotation mismatch found along the way.
+//version 1.0.41 - 1.0.42 - Saved Today math revised twice: real SoC-based energy instead of one power
+//                 sample, then fixed-day-hours blended rate instead of hours-elapsed-so-far.
+//version 1.0.43 - Added an orbiting charge/discharge dot to the SoC ring (color/direction/speed from real
+//                 battery state, matching the physical fuel-gauge hardware's own indicator).
+//version 1.0.44 - Real-hardware batch: fixed a false "Idle" shown on cold boot before any real data
+//                 arrives, added clock seconds, spelled out "Battery" label in full.
+//version 1.0.45 - Added a static "Feeder" caption under the Home quadrant's Battery label.
+//version 1.0.46 - 1.0.47 - Built the WiFi setup flow: KVStore-persisted credentials (survives a reflash),
+//                 bounded connect retries, network-scan + on-screen-keyboard password entry. Verified
+//                 round-trip and reflash-survival on real hardware.
+//version 1.0.48 - Real three-state (Connecting/Connected/Not connected) status indicator, "Reset network"
+//                 button, forcePaint() helper so a state is visibly painted before a blocking call.
+//version 1.0.49 - WiFi UX feedback batch: no-dot "Attempting to Connect" state, plaintext password entry,
+//                 renamed to "Change WiFi", Cancel now genuinely exits instead of silently staying blocked.
+//version 1.0.50 - Fixed two board-freezing hangs: LVGL's blocking wait loop can't run from inside a
+//                 click-event callback (re-enters lv_timer_handler()) -- deferred via flags checked from
+//                 loop() instead. Real-touchscreen double-tap issue investigated, not resolved (GitHub #1).
+//version 1.0.51 - 1.0.53 - Battery screen chart made real (multi-segment curve from an HA pyscript
+//                 automation); Saved Today/Yesterday math made real (per-segment TOU pricing against actual
+//                 SoC curves instead of a single power sample or hardcoded placeholder).
+//version 1.0.54 - MQTT broker host/username/password made runtime-editable, same architecture as the WiFi
+//                 setup flow. Fixed error-text overflow on the Connection screen.
+//version 1.0.55 - Fixed a real board hang on repeated Change WiFi/Change MQTT: the mbed RTOS main-thread
+//                 stack (32KB default) was too small for this app's LVGL object creation. Fixed via a
+//                 sketch-local mbed_app.json (128KB stack). Also moved LVGL's heap to external SDRAM and
+//                 consolidated the MQTT flow's 3 keyboards down to 1.
+//version 1.0.56 - 1.0.55's fix was incomplete -- a chained WiFi+MQTT test still hung. Root-caused to two
+//                 compounding bugs: an unpatched LVGL v9.5.0 realloc-NULL-deref bug (lvgl/lvgl#9794, patched
+//                 locally) and a local lv_conf.h resolution issue that left LVGL silently running on a 64KB
+//                 heap instead of the intended 512KB the whole time. See lvgl_patches/README.md.
+//version 1.0.57 - Fixed: Change WiFi/Change MQTT disconnected the board even on cancel or a failed attempt,
+//                 not just a successful change -- now reconnects to the prior network/broker in both cases.
+//                 Also corrected the 1.0.56 lv_conf.h diagnosis (misattributed to a directory-layout bug;
+//                 real cause is Arduino_H7_Video's own bundled config shadowing any user-supplied one).
+//version 1.0.58 - Almanac screen is now real, replacing its last remaining placeholder data: weather
+//                 (Met.no), sunrise/sunset, and moonrise/moonset/phase/illumination, all via a new HA
+//                 pyscript automation (homeassistant/pyscript/almanac_data.py, skyfield for the moon
+//                 calculations) publishing to a new V1.0/Home/Almanac/Data MQTT topic every 6 hours. The
+//                 moon-phase icon is a real, geometrically-accurate rendering (lv_canvas, terminator-ellipse
+//                 construction from the real phase angle) instead of one fixed crescent shape -- verified
+//                 the illuminated-area fraction this produces exactly matches the phase's real illuminated
+//                 %, not just a visual approximation. Found and fixed a real, previously-latent timezone
+//                 bug along the way: this board's RTC is set to an already-local-shifted epoch (see
+//                 parseNtpPacket()), not true UTC, so formatEpochTime() needs the same +3600*timezone
+//                 adjustment before displaying an externally-sourced (genuinely UTC) epoch -- caught
+//                 because the new sunrise/sunset times initially showed as physically impossible (sunrise
+//                 at 12:54 PM). Also hit and worked around a real pyscript quirk: a top-level "from skyfield
+//                 import almanac" fails with a misleading AttributeError under pyscript's execution model,
+//                 even though the same statement works fine inside a function or in plain Python --
+//                 confirmed directly against the instance before settling on dotted-style imports instead.
+//version 1.0.59 - Almanac weather line: degree symbol, sentence-cased condition, one font size up
+//                 (Montserrat 34), and switched from a hardcoded x position to a persistent centered
+//                 align -- it was drifting off-center as real variable-length condition text replaced
+//                 the build-time placeholder. Home quadrant's weather pill now shows the same real
+//                 data too, instead of a permanent "Cloudy, 68F >". Fixed a real bug in the v1.0.57
+//                 cancel-disconnect fix: it only covered WiFi, so cancelling a WiFi change still
+//                 silently killed the MQTT broker connection (populateWifiScanList()'s WiFi.disconnect()
+//                 tears down the underlying socket, and this sketch has no standing MQTT reconnect
+//                 loop) -- startChangeWifiFlow() now reconnects MQTT with the already-in-effect
+//                 credentials whenever WiFi ends up connected but MQTT doesn't. Added a few px of
+//                 vertical spacing on the WiFi/MQTT password screens -- Back/the caption/the text
+//                 entry were nearly touching on real hardware.
+//version 1.0.60 - Weather pill sized for the worst-case condition string ("Lightning-rainy") was
+//                 wider than its own quadrant once centered, pushing past the screen's left edge and
+//                 triggering scr_home's default scrollable behavior (a visible scrollbar) -- now
+//                 re-fits itself to each real value's own width (resizeAutoPillText()), same "snug"
+//                 feel as the TOU pill instead of a fixed worst-case box. Only resizes when the text
+//                 actually changed (compares against the last-shown string), not on every 1-second
+//                 clock tick -- an earlier version of this fix called it unconditionally every
+//                 second and froze the board solid within a couple seconds of boot on real hardware:
+//                 that much needless per-second label/layout churn was enough to trigger this
+//                 device's documented lv_realloc() fragility (lvgl_patches/README.md,
+//                 lvgl/lvgl#9794). In steady state the weather text only changes roughly once every
+//                 6 hours (almanac_data.py's publish interval), so resize-on-change is also just
+//                 correct, not merely a workaround. Added the same vertical-spacing fix to the MQTT
+//                 broker IP address screen (missed it when the password/WiFi screens were fixed).
+//                 Root-caused and fixed "cancelling Change MQTT still disconnects MQTT": unlike the
+//                 WiFi flow, connect() is never called on that cancel path, so the actual cause is
+//                 different -- startChangeMqttFlow()'s blocking wait loop suspends loop()'s own
+//                 mqttClient.poll() call for as long as the host/username/password screens are open,
+//                 so keepalive PINGREQs stop going out and a broker can silently drop an otherwise-
+//                 fine session before the user ever submits anything. Now polls inside that wait loop
+//                 (fixes it at the source) plus reconnects as a safety net if still disconnected once
+//                 the loop exits, same principle as the WiFi flow's v1.0.59 fix.
+//version 1.0.61 - Moonrise/Moonset column icons now render the same real, phase-accurate icon as
+//                 the phase row (renderMoonPhaseIcon(), generalized to draw to any canvas/size)
+//                 instead of a generic fixed-crescent glyph -- all three show the actual current
+//                 phase, since it's the same real moon. Sun/moon icons in that row are 1.5x bigger
+//                 (20px -> 30px). Moonrise/Moonset now swap which physical column (left/right) they
+//                 render in so the chronologically earlier of the two always reads left-to-right --
+//                 both are "next occurrence from now" (see almanac_data.py), so moonset genuinely
+//                 lands before moonrise depending on time of day/phase. Fixed the same squished
+//                 Back/caption/text-entry spacing on the MQTT username screen (missed it earlier).
+//version 1.0.62 - Rise/set times are now TODAY's local calendar day (midnight to midnight), not
+//                 "next occurrence from now" -- past today's own event, "next" was rolling into
+//                 tomorrow and pairing mismatched calendar days with no indication of that (e.g.
+//                 today's remaining moonset next to tomorrow's moonrise, instead of today's own
+//                 moonrise/moonset pair). almanac_data.py now queries a fixed midnight-to-midnight
+//                 window instead of (now, now+3days); confirmed against real astronomical data
+//                 before deploying that the window change alone doesn't affect the v1.0.61 column-
+//                 swap logic's correctness -- rise/set order can still flip within a single
+//                 calendar day (common near full moon), so that logic is unchanged, just fed
+//                 correctly-scoped epochs now. A rise or set can be genuinely ABSENT from a given
+//                 calendar day (the lunar day is ~24h50m, ~50min longer than solar, so roughly
+//                 monthly a day has two moonrises and no moonset or vice versa) -- sent as a 0
+//                 epoch sentinel, and the Arduino side (layoutEventPair(), replacing the old
+//                 inline swap-only logic) now hides that column and centers the other rather than
+//                 showing a placeholder "--" for something that isn't unknown but genuinely
+//                 doesn't exist that day. Sunrise/sunset switched from the sun.sun entity's
+//                 next_rising/next_setting (same "next from now" problem, just far less
+//                 noticeable) to the identical skyfield calendar-day approach, for consistency.
+
+uint8_t verbosity = 255;
+bool trace = true;
+
+int timezone = -7; //GMT -7, Pacific Time -- same convention as Unit 1
+
+//Fixed, generous buffers (33 = 32-char WiFi SSID max + null; 64 = 63-char
+//WPA2 passphrase max + null) instead of char[]=SECRET_SSID's exact-fit
+//sizing -- those two only needed to hold the compile-time secrets.h
+//string, but a runtime-entered network (scanned SSID + typed password)
+//can be longer than whatever's in secrets.h.
+char ssid[33];
+char password[64];
+
+int wifiStatus = WL_IDLE_STATUS;
+
+//---- WiFi credential persistence (mbed KVStore, QSPI-backed) ----
+//Physically separate flash from the program flash the .ino gets written
+//to, so this survives a sketch reflash, not just a reboot -- per
+//request, so a manually-configured network doesn't need re-entering
+//after every firmware update. Default mbed KVStore mount point is
+//"/kv/"; keys can't contain '/' etc. per kv_set()'s own doc comment, so
+//"wifi_ssid"/"wifi_pass" (no further slashes) are used directly under it.
+#define KV_KEY_WIFI_SSID "/kv/wifi_ssid"
+#define KV_KEY_WIFI_PASS "/kv/wifi_pass"
+
+bool saveWifiCredentials(const char* s, const char* p) {
+  int rc1 = kv_set(KV_KEY_WIFI_SSID, s, strlen(s) + 1, 0);
+  int rc2 = kv_set(KV_KEY_WIFI_PASS, p, strlen(p) + 1, 0);
+  return rc1 == 0 && rc2 == 0;
+}
+
+//Returns true only if BOTH keys were found and fit within the given
+//buffers -- a partial save (e.g. power loss mid-write) should not be
+//treated as a usable stored credential.
+bool loadWifiCredentials(char* sOut, size_t sCap, char* pOut, size_t pCap) {
+  size_t actualS = 0, actualP = 0;
+  int rc1 = kv_get(KV_KEY_WIFI_SSID, sOut, sCap, &actualS);
+  int rc2 = kv_get(KV_KEY_WIFI_PASS, pOut, pCap, &actualP);
+  return rc1 == 0 && rc2 == 0 && actualS > 0 && actualP > 0;
+}
+
+//Same pattern, for the MQTT broker's host/username/password -- lets a
+//moved broker IP or changed auth be corrected from the device itself
+//(Connection screen's "Change MQTT" button, or shown automatically if
+//boot-time connect fails) instead of needing a reflash with an updated
+//arduino_secrets.h.
+#define KV_KEY_MQTT_HOST "/kv/mqtt_host"
+#define KV_KEY_MQTT_USER "/kv/mqtt_user"
+#define KV_KEY_MQTT_PASS "/kv/mqtt_pass"
+
+bool saveMqttCredentials(const char* host, const char* user, const char* pass) {
+  int rc1 = kv_set(KV_KEY_MQTT_HOST, host, strlen(host) + 1, 0);
+  int rc2 = kv_set(KV_KEY_MQTT_USER, user, strlen(user) + 1, 0);
+  int rc3 = kv_set(KV_KEY_MQTT_PASS, pass, strlen(pass) + 1, 0);
+  return rc1 == 0 && rc2 == 0 && rc3 == 0;
+}
+
+bool loadMqttCredentials(char* hostOut, size_t hostCap, char* userOut, size_t userCap, char* passOut, size_t passCap) {
+  size_t actualH = 0, actualU = 0, actualP = 0;
+  int rc1 = kv_get(KV_KEY_MQTT_HOST, hostOut, hostCap, &actualH);
+  int rc2 = kv_get(KV_KEY_MQTT_USER, userOut, userCap, &actualU);
+  int rc3 = kv_get(KV_KEY_MQTT_PASS, passOut, passCap, &actualP);
+  return rc1 == 0 && rc2 == 0 && rc3 == 0 && actualH > 0 && actualU > 0 && actualP > 0;
+}
+
+WiFiUDP Udp;
+unsigned int localPort = 2391; //different from Unit 1's 2390 in case both run on the same LAN segment during bring-up
+constexpr auto timeServer{ "pool.ntp.org" };
+const int NTP_PACKET_SIZE = 48;
+byte packetBuffer[NTP_PACKET_SIZE];
+
+Arduino_H7_Video Display(800, 480, GigaDisplayShield);
+Arduino_GigaDisplayTouch TouchDetector;
+
+WiFiClient wifiClient;
+MqttClient mqttClient(wifiClient);
+//Runtime-editable now (was a compile-time HOME_ASSISTANT_IP const) -- see
+//connectToMqttBroker()/saveMqttCredentials() and the MQTT setup screens
+//below. Sized like the WiFi ssid/password buffers (64/33/64), generous
+//past secrets.h's own compile-time strings.
+char mqttHost[64];
+char mqttUserRuntime[33];
+char mqttPassRuntime[64];
+int port = 1883;
+
+//Subscribe-only, per UNIT_NUMBER 2 -- this device never publishes anything,
+//on any topic. These are the same Battery/SoC and Battery/Action topics the
+//sibling ESP32_Fuel_Gauge project already publishes to; no new data source,
+//just a second subscriber.
+const char subtopicBatterySoC[] = "V1.0/Home/Battery/SoC";
+const char subtopicBatteryAction[] = "V1.0/Home/Battery/Action";
+//Same topics Giga_YH_Controller_LVGL_1.0.9 (Unit 1) itself publishes to
+//(pubtopic1/pubtopic2 there) -- its own L1/L2 output readback, unsigned
+//watts, only ever sent when that unit's UNIT_NUMBER < 2.
+const char subtopicLine1[] = "V1.0/Home/PowerFeeder/Line1";
+const char subtopicLine2[] = "V1.0/Home/PowerFeeder/Line2";
+//Same topics Unit 1 itself subscribes to (its subtopic1/subtopic2) for
+//Home Assistant's real grid readings. CORRECTED 2026-07-13 via the
+//user's own HIL testing: these are NOT a duplicated whole-household
+//value (an earlier comment here, and in Unit 1's own source, claimed
+//that) -- they're INDEPENDENT signed per-line readings. One line can be
+//positive (importing) while the other is negative (exporting), summing
+//toward zero at balance. True whole-household net grid consumption is
+//their SUM, not either one alone. See memory
+//project_line1set_line2set_independent.md for the full context and the
+//still-open question of whether this affects Unit 1's own oscillation-fix
+//calibration (tracked separately, not touched here).
+const char subtopicLine1Grid[] = "V1.0/Home/PowerFeeder/Line1Set";
+const char subtopicLine2Grid[] = "V1.0/Home/PowerFeeder/Line2Set";
+//Published by a pyscript automation on the HA side (not Unit 1), rebuilt
+//from HA's own recorder history every 30 minutes: today's battery SoC +
+//Charging/Discharging/Idle curve so far, as a compact retained CSV blob
+//("bucket:soc:state,bucket:soc:state,..." -- bucket = 15-minute index
+//since midnight 0-95, state = 0 Idle/1 Charging/2 Discharging, matching
+//g_batteryState's own encoding). See
+//homeassistant/pyscript/battery_day_curve.py for the HA-side half of
+//this. Feeds both the Battery screen's real chart (replacing the old
+//static two-polyline mockup placeholder) and the Saved Today calc, which
+//needs the same full-day data to correctly sum multiple discharge cycles
+//in one day instead of just comparing current SoC to 100%.
+const char subtopicBatteryDaySoc[] = "V1.0/Home/Battery/DaySOC";
+
+//Yesterday's full-day curve, same encoding, published alongside today's
+//by the same pyscript automation (see battery_day_curve.py) -- used only
+//for the Saved Yesterday figure (see the calc in loop()), not charted.
+const char subtopicBatteryYesterdaySoc[] = "V1.0/Home/Battery/YesterdaySOC";
+
+//Published by a pyscript automation on the HA side (see
+//homeassistant/pyscript/almanac_data.py), every 6 hours: weather
+//(Met.no), sun rise/set, and moon rise/set/phase, for the Almanac
+//screen -- see parseAlmanacPayload() and renderMoonPhaseIcon() below.
+const char subtopicAlmanacData[] = "V1.0/Home/Almanac/Data";
+
+char g_weatherCondition[24] = "";
+int g_weatherTempF = 0;
+time_t g_sunriseEpoch = 0;
+time_t g_sunsetEpoch = 0;
+time_t g_moonriseEpoch = 0;
+time_t g_moonsetEpoch = 0;
+//0-360 degrees (0=new, 180=full) -- the single authoritative value the
+//icon and illuminated-% text are both derived from; see
+//renderMoonPhaseIcon()'s own comment for the geometry.
+float g_moonPhaseAngle = 0;
+char g_moonPhaseName[24] = "";
+bool g_hasAlmanacData = false;
+unsigned long g_lastAlmanacDataMs = 0;
+bool g_almanacDataDirty = false; //set on new MQTT data, cleared once the Almanac screen's been refreshed from it
+
+#define MAX_DAYSOC_POINTS 96 //one point per 15-min bucket, full 24h day
+uint8_t g_daySocBucket[MAX_DAYSOC_POINTS];
+uint8_t g_daySocValue[MAX_DAYSOC_POINTS];   //SoC 0-100
+uint8_t g_daySocState[MAX_DAYSOC_POINTS];   //0 Idle, 1 Charging, 2 Discharging
+int g_daySocCount = 0;
+bool g_daySocDirty = false; //set on new MQTT data, cleared once the chart's been rebuilt from it
+
+uint8_t g_yesterdaySocBucket[MAX_DAYSOC_POINTS];
+uint8_t g_yesterdaySocValue[MAX_DAYSOC_POINTS];
+uint8_t g_yesterdaySocState[MAX_DAYSOC_POINTS];
+int g_yesterdaySocCount = 0;
+
+float g_batterySoC = -1.0; //-1 = no reading received yet
+int g_batteryState = 0;    //1 = Charging, -1 = Discharging, 0 = Idle/unknown
+float g_line1Power = -1.0; //-1 = no reading received yet; Unit 1's own feeder OUTPUT readback (Line1/Line2, not Set)
+float g_line2Power = -1.0;
+//Real signed per-line grid readings (Line1Set/Line2Set). Separate has-flags
+//because a signed value can legitimately be negative, so unlike the floats
+//above, "-1 = no data" doesn't work as a sentinel here.
+float g_line1GridPower = 0;
+bool g_hasLine1GridPower = false;
+float g_line2GridPower = 0;
+bool g_hasLine2GridPower = false;
+
+//last-received timestamps (millis()) per topic -- not surfaced in the UI
+//yet, just bookkeeping so a future "stale vs. never received" distinction
+//is possible. Relevant because Unit 1 doesn't run 24/7 today (it will,
+//eventually, once it has its own around-the-clock TOU schedule logic), so
+//"no data" during its off hours is expected, not a fault to report on.
+unsigned long g_lastBatterySoCMs = 0;
+unsigned long g_lastBatteryActionMs = 0;
+unsigned long g_lastLine1Ms = 0;
+unsigned long g_lastLine2Ms = 0;
+unsigned long g_lastLine1GridMs = 0;
+unsigned long g_lastLine2GridMs = 0;
+
+//---- color palette (matches design/mockups/*.svg exactly) ----
+#define COLOR_BG          lv_color_hex(0x0b0c0e)
+#define COLOR_TEXT        lv_color_hex(0xf2f2f0)
+#define COLOR_TEXT_MUTED  lv_color_hex(0x8a8d92)
+#define COLOR_TEXT_DIM    lv_color_hex(0x6b6e73)
+#define COLOR_TEAL        lv_color_hex(0x3fd6c8)
+#define COLOR_GREEN       lv_color_hex(0x4fbf7a)
+#define COLOR_AMBER       lv_color_hex(0xe8a53d)
+#define COLOR_RED         lv_color_hex(0xe2574c)
+#define COLOR_STATUS_OK   lv_color_hex(0x39d98a)
+#define COLOR_TRACK       lv_color_hex(0x242629)
+#define COLOR_PILL_AMBER  lv_color_hex(0x3a1f1c)
+#define COLOR_BLUE_TIDE   lv_color_hex(0x5dc8e8)
+#define COLOR_MOON_GRAY   lv_color_hex(0xc9cace)
+
+//Orbiting charge/discharge dot colors -- matched exactly to the physical
+//ESP32 FastLED fuel gauge strip's own traveling-highlight colors
+//(CRGB::Yellow / CRGB::Amethyst in ESP32_Fuel_Gauge.ino), so the two
+//devices read consistently if you're looking at both.
+#define COLOR_ORBIT_CHARGING     lv_color_hex(0xFFFF00)
+#define COLOR_ORBIT_DISCHARGING  lv_color_hex(0x9966CC)
+
+//battery-state color mapping (Idle=green, Discharging=blue, Charging=red --
+//deliberately different from the mockups' original green/amber scheme, per
+//explicit direction). Shared by the Battery panel and the Grid panel so the
+//two can't drift out of sync with each other.
+#define COLOR_STATE_IDLE         COLOR_GREEN
+#define COLOR_STATE_DISCHARGING  COLOR_BLUE_TIDE
+#define COLOR_STATE_CHARGING     COLOR_RED
+
+lv_color_t batteryStateColor(int state) {
+  return state == 1 ? COLOR_STATE_CHARGING : state == -1 ? COLOR_STATE_DISCHARGING : COLOR_STATE_IDLE;
+}
+
+const char* batteryStateText(int state) {
+  return state == 1 ? "Charging" : state == -1 ? "Discharging" : "Idle";
+}
+
+//---- Time-of-use rates and schedule (summer; display-only) ----
+//Real rates and hours as given 2026-07-13. Unit 2 has no control
+//authority over anything -- this only drives what's *displayed* here,
+//never what Unit 1 actually does with the battery.
+#define RATE_SUPER_OFF_PEAK 0.09469
+#define RATE_OFF_PEAK       0.43492
+#define RATE_ON_PEAK        0.65410
+
+//Real hardware limit, per the user: max battery DISCHARGE/output is
+//1800W -- charging has no such limit (battery can charge as fast as it
+//wants). This constant is ONLY a visual scale for the Battery ring's
+//gauge (0-1800W -> 0-360 degrees); it never caps the displayed watts
+//number itself, which always shows the real, unclamped value.
+#define MAX_BATTERY_POWER 1800.0
+
+//Real hardware limit, per the user: 22kW is the practical ceiling for
+//the Grid ring's gauge scale, not an actual cap -- the displayed grid
+//watts number is never clamped, only the ring's arc angle is scaled
+//against this so the gauge saturates at a sensible visual max instead
+//of the arc wrapping/looking broken for a real number this large.
+#define MAX_GRID_POWER 22000.0
+
+//Real hardware limit, per the user: the battery pack's usable capacity
+//is 18kWh. Used for the Saved Today calc below -- NOT a ring-visual
+//scale like the two constants above, this one directly represents real
+//energy (state-of-charge x capacity), not a gauge saturation point.
+#define BATTERY_CAPACITY_KWH 18.0
+
+//2026 TOU holiday dates (month, day), computed exactly with Python (not
+//by hand -- see conversation). None fall on a Sunday this year, so the
+//"shift to the following Monday" rule needs no code this pass.
+static const MonthDay TOU_HOLIDAYS_2026[] = {
+  { 1, 1 },    //New Year's Day
+  { 1, 19 },   //MLK Day
+  { 2, 16 },   //Presidents' Day
+  { 5, 25 },   //Memorial Day
+  { 7, 4 },    //Independence Day
+  { 9, 7 },    //Labor Day
+  { 11, 26 },  //Thanksgiving
+  { 12, 25 },  //Christmas Day
+};
+
+bool isTouHoliday(int month, int day) {
+  for (size_t i = 0; i < sizeof(TOU_HOLIDAYS_2026) / sizeof(TOU_HOLIDAYS_2026[0]); i++) {
+    if (TOU_HOLIDAYS_2026[i].month == month && TOU_HOLIDAYS_2026[i].day == day) return true;
+  }
+  return false;
+}
+
+//Single source of truth for the day's schedule shape, shared by both the
+//tier lookup (computeTouStatus) and the visual schedule bar
+//(buildTouSegments) so they can't drift out of sync with each other --
+//a real risk now that the shape is more complex than "one block per
+//tier". On-peak is 4pm-9pm every day. Weekday super off-peak is TWO
+//separate windows (12am-6am AND 10am-2pm) -- corrected 2026-07-13 after
+//an earlier version assumed weekdays had no super off-peak window at
+//all, which was wrong. Weekend/holiday super off-peak is a single
+//12am-2pm window. Off-peak fills whatever's left.
+int buildTouWindows(bool weekendOrHoliday, TouWindow* out) {
+  int n = 0;
+  if (weekendOrHoliday) {
+    out[n++] = { 0, 14, TOU_SUPER_OFF_PEAK };
+    out[n++] = { 14, 16, TOU_OFF_PEAK };
+    out[n++] = { 16, 21, TOU_ON_PEAK };
+    out[n++] = { 21, 24, TOU_OFF_PEAK };
+  } else {
+    out[n++] = { 0, 6, TOU_SUPER_OFF_PEAK };
+    out[n++] = { 6, 10, TOU_OFF_PEAK };
+    out[n++] = { 10, 14, TOU_SUPER_OFF_PEAK };
+    out[n++] = { 14, 16, TOU_OFF_PEAK };
+    out[n++] = { 16, 21, TOU_ON_PEAK };
+    out[n++] = { 21, 24, TOU_OFF_PEAK };
+  }
+  return n;
+}
+
+TouStatus computeTouStatus(int hour, int wday, int month, int day) {
+  TouStatus s;
+  s.weekendOrHoliday = (wday == 0 || wday == 6) || isTouHoliday(month, day);
+  TouWindow windows[6];
+  int n = buildTouWindows(s.weekendOrHoliday, windows);
+  for (int i = 0; i < n; i++) {
+    if (hour >= windows[i].startHour && hour < windows[i].endHour) {
+      s.tier = windows[i].tier;
+      s.nextBoundaryHour = windows[i].endHour;
+      break;
+    }
+  }
+  s.rate = touRate(s.tier);
+  return s;
+}
+
+double touRate(TouTier tier) {
+  return tier == TOU_ON_PEAK ? RATE_ON_PEAK : tier == TOU_SUPER_OFF_PEAK ? RATE_SUPER_OFF_PEAK : RATE_OFF_PEAK;
+}
+
+//Of the two tiers OTHER than the current one, which appears next going
+//forward in today's schedule, and which appears after that. Scans
+//buildTouWindows() forward from the current hour's window, treating the
+//day as a repeating cycle of its own windows (a reasonable simplification
+//since a tier change more than one day out isn't meaningfully "upcoming"
+//anyway). With exactly 3 possible tiers this always finds both within a
+//handful of steps.
+void findUpcomingTiers(TouTier current, bool weekendOrHoliday, int currentHour, TouTier* outNext, TouTier* outThird) {
+  TouWindow windows[6];
+  int n = buildTouWindows(weekendOrHoliday, windows);
+  int curIdx = 0;
+  for (int i = 0; i < n; i++) {
+    if (currentHour >= windows[i].startHour && currentHour < windows[i].endHour) {
+      curIdx = i;
+      break;
+    }
+  }
+  TouTier next = current, third = current;
+  bool foundNext = false;
+  for (int step = 1; step <= n; step++) {
+    TouTier t = windows[(curIdx + step) % n].tier;
+    if (t == current) continue;
+    if (!foundNext) {
+      next = t;
+      foundNext = true;
+    } else if (t != next) {
+      third = t;
+      break;
+    }
+  }
+  *outNext = next;
+  *outThird = third;
+}
+
+//Sums how many hours of on-peak and off-peak fall within [0, uptoHour)
+//of today's schedule (fractional, e.g. 2.5 hours), clipping the window
+//containing uptoHour to just its portion before that point. Super
+//off-peak time is intentionally not returned/accumulated anywhere --
+//that's charging time, not savings. Pass the current fractional hour to
+//get hours elapsed SO FAR today, or 24.0 to get the day's fixed total
+//on/off-peak hours regardless of the time of day (used by the Saved
+//Today rate blend below, which wants a stable blended rate all day, not
+//one that's 100% off-peak before the first on-peak window has started).
+//Purely a function of the clock + the schedule (both already known), so
+//it needs no persisted state and is automatically correct after a
+//reboot, at the cost of the "assume uniform consumption" simplification
+//the user asked for -- it doesn't track how discharge power actually
+//varied through the day, just tier hours within the window asked for.
+void computeElapsedTierHours(bool weekendOrHoliday, float uptoHour, float* outOnPeakHours, float* outOffPeakHours) {
+  TouWindow windows[6];
+  int n = buildTouWindows(weekendOrHoliday, windows);
+  float onPeak = 0, offPeak = 0;
+  for (int i = 0; i < n; i++) {
+    if (uptoHour <= windows[i].startHour) continue;  //hasn't started yet today
+    float elapsedEnd = (uptoHour < windows[i].endHour) ? uptoHour : windows[i].endHour;
+    float elapsed = elapsedEnd - windows[i].startHour;
+    if (elapsed <= 0) continue;
+    if (windows[i].tier == TOU_ON_PEAK) onPeak += elapsed;
+    else if (windows[i].tier == TOU_OFF_PEAK) offPeak += elapsed;
+  }
+  *outOnPeakHours = onPeak;
+  *outOffPeakHours = offPeak;
+}
+
+//Shared by Saved Today and Saved Yesterday (see the calcs in loop()):
+//walks a g_daySoc*-shaped curve and sums each discharging segment's SoC
+//drop, priced at the ACTUAL historical TOU tier for that segment's own
+//bucket -- so multiple charge/discharge cycles in one day all correctly
+//contribute (a single before/after snapshot only ever sees the LAST
+//cycle's state). If NO real discharge drop is found (only charging/idle
+//so far -- happens on a still-in-progress "today"; Saved Yesterday's
+//data is always a full closed day so this is extremely unlikely there),
+//falls back to valuing the net charged energy at the day's full blended
+//rate, as a forward-looking estimate of what it'll be worth once
+//discharged.
+float computeSavedFromSocCurve(uint8_t* bucketArr, uint8_t* valueArr, uint8_t* stateArr, int count, int wday, int month, int day, bool weekendOrHoliday) {
+  float saved = 0;
+  bool hadRealDischargeDrop = false;
+  for (int i = 1; i < count; i++) {
+    if (stateArr[i] != 2) continue;
+    int drop = (int)valueArr[i - 1] - (int)valueArr[i];
+    if (drop <= 0) continue;
+    hadRealDischargeDrop = true;
+    int bucketHour = constrain(bucketArr[i] / 4, 0, 23);
+    TouStatus bucketTou = computeTouStatus(bucketHour, wday, month, day);
+    saved += (drop / 100.0) * BATTERY_CAPACITY_KWH * bucketTou.rate;
+  }
+  if (!hadRealDischargeDrop && count > 0) {
+    int netCharged = (int)valueArr[count - 1] - (int)valueArr[0];
+    if (netCharged > 0) {
+      float onPeakHours, offPeakHours;
+      computeElapsedTierHours(weekendOrHoliday, 24.0, &onPeakHours, &offPeakHours);
+      float totalHours = onPeakHours + offPeakHours;
+      if (totalHours > 0) {
+        float blendedRate = (onPeakHours * RATE_ON_PEAK + offPeakHours * RATE_OFF_PEAK) / totalHours;
+        saved = (netCharged / 100.0) * BATTERY_CAPACITY_KWH * blendedRate;
+      }
+    }
+  }
+  return saved;
+}
+
+const char* touTierName(TouTier tier) {
+  return tier == TOU_ON_PEAK ? "On-peak" : tier == TOU_SUPER_OFF_PEAK ? "Super off-peak" : "Off-peak";
+}
+
+lv_color_t touTierColor(TouTier tier) {
+  return tier == TOU_ON_PEAK ? COLOR_RED : tier == TOU_SUPER_OFF_PEAK ? COLOR_GREEN : COLOR_AMBER;
+}
+
+//Formats an hour-of-day (0-24, 24 meaning midnight) as "H:00 AM/PM".
+void formatHourLabel(int hour24, char* buf, size_t bufSize) {
+  int h = hour24 % 24;
+  int displayHour = h % 12;
+  if (displayHour == 0) displayHour = 12;
+  const char* ampm = (h < 12) ? "AM" : "PM";
+  snprintf(buf, bufSize, "%d:00 %s", displayHour, ampm);
+}
+
+//Fills up to 6 (start,end,color) segments describing today's schedule
+//across 24 hours, for the Time & rates screen's schedule bar -- just
+//buildTouWindows() above with each window's tier mapped to its color, so
+//this can't disagree with what computeTouStatus() actually decides.
+//Returns the segment count (6 on weekdays, 4 on weekends/holidays).
+int buildTouSegments(bool weekendOrHoliday, TouSegment* out) {
+  TouWindow windows[6];
+  int n = buildTouWindows(weekendOrHoliday, windows);
+  for (int i = 0; i < n; i++) {
+    out[i].startHour = windows[i].startHour;
+    out[i].endHour = windows[i].endHour;
+    out[i].color = touTierColor(windows[i].tier);
+  }
+  return n;
+}
+
+//Grid ring color: blue while pulling power from the grid (>=0), red while
+//giving power away (<0) -- "we don't want to give power away" per
+//request. The label itself ("Grid In/Out") stays static regardless of
+//sign; only the ring/number color changes. Replaces the old 3-state
+//Consuming/Bypassing/Exporting text, dropped per request for now.
+lv_color_t gridFlowColor(float totalGridPower) {
+  return totalGridPower >= 0 ? COLOR_BLUE_TIDE : COLOR_RED;
+}
+
+//Battery ring label: unlike the Grid ring, this DOES change text with
+//state -- "In" while charging, "Out" while discharging, "Idle" otherwise.
+//Color reuses the existing, unchanged battery-state palette (Idle=green,
+//Discharging=blue, Charging=red).
+const char* batteryFlowLabel(int batteryState) {
+  return batteryState == 1 ? "Battery In" : batteryState == -1 ? "Battery Out" : "Battery Idle";
+}
+
+//---- screens (built once in setup(), switched with lv_scr_load) ----
+lv_obj_t* scr_home;
+lv_obj_t* scr_time;
+lv_obj_t* scr_connection;
+lv_obj_t* scr_battery;
+lv_obj_t* scr_grid;
+lv_obj_t* scr_almanac;
+lv_obj_t* scr_wifi_scan;
+lv_obj_t* scr_wifi_password;
+lv_obj_t* scr_mqtt_host;
+lv_obj_t* scr_mqtt_username;
+lv_obj_t* scr_mqtt_password;
+
+//---- WiFi setup flow state ----
+#define MAX_WIFI_SCAN_RESULTS 20
+char g_wifiScanSsid[MAX_WIFI_SCAN_RESULTS][33];
+bool g_wifiScanSecure[MAX_WIFI_SCAN_RESULTS];
+int32_t g_wifiScanRssi[MAX_WIFI_SCAN_RESULTS];
+int g_wifiScanCount = 0;
+
+char g_selectedWifiSsid[33] = "";
+bool g_selectedWifiSecure = false;
+
+//set true by setup() when it's blocked waiting on the manual setup flow
+//(both bounded connect attempts failed) -- the wait loop that checks
+//this lives in setup() itself, right where the fallback triggers, not
+//in the normal loop() tick.
+bool g_awaitingManualWifiSetup = false;
+//true only when the manual setup flow was entered via the Connection
+//screen's "Change WiFi" button (a working connection already exists in
+//that case) rather than setup()'s own boot-time fallback (no working
+//connection exists yet). Gates whether the scan screen's "< Cancel"
+//button actually exits the wait loop -- during boot-time setup there's
+//nothing valid to cancel back to, so Cancel there just changes the
+//visible screen as before; during a live "Change WiFi", the user already
+//has a real connection and Cancel should genuinely abandon the change.
+bool g_manualSetupIsRuntimeChange = false;
+//Set by onChangeWifiClicked() (a click-event callback), checked and
+//cleared by loop() itself. The actual scan/connect flow blocks inside
+//its own lv_timer_handler() wait loop, which is only safe to call from a
+//context that ISN'T already nested inside a call to lv_timer_handler() --
+//loop() is what CALLS lv_timer_handler() each iteration, never the
+//reverse, so running the flow from there (instead of directly inside the
+//click callback, which IS already nested inside an active
+//lv_timer_handler() call dispatching that very click) avoids re-entering
+//LVGL's own timer/event dispatch. Confirmed on real hardware: running it
+//directly in the click callback froze the board instantly on tap, and
+//deferring via lv_async_call() didn't help either -- LVGL's async
+//mechanism is itself just a zero-delay timer serviced by
+//lv_timer_handler(), so the deferred call was still nested inside
+//lv_timer_handler() one way or another, not genuinely outside it.
+bool g_wifiChangeRequested = false;
+
+//Same class of problem, one level deeper: onWifiNetworkSelected() (open
+//networks) and onWifiPasswordSubmit() (secured networks) are themselves
+//click/ready-event callbacks -- already nested inside the manual-setup
+//wait loop's own lv_timer_handler() call -- and used to call
+//attemptWifiConnectFromSetup() directly, which calls forcePaint() (more
+//lv_timer_handler() calls) before its own blocking connect attempt.
+//Confirmed on real hardware: froze on the password screen after tapping
+//submit. Same fix as g_wifiChangeRequested -- the event callbacks below
+//only record which network/password to try; the wait loop itself (see
+//both copies, in setup() and startChangeWifiFlow()) checks this flag and
+//makes the actual attempt from a non-nested context.
+bool g_pendingWifiAttempt = false;
+char g_pendingAttemptSsid[33];
+char g_pendingAttemptPassword[64];
+
+lv_obj_t* wifiScanList;
+lv_obj_t* wifiScanStatusLbl;
+lv_obj_t* wifiPasswordSsidLbl;
+lv_obj_t* wifiPasswordTextarea;
+lv_obj_t* wifiKeyboard;
+lv_obj_t* wifiConnectStatusLbl;
+
+//---- MQTT setup flow state (same architecture as the WiFi flow above --
+//see its comments for why the reentrancy-safe flag-deferred pattern is
+//needed at all). Three sequential screens (host -> username -> password)
+//instead of WiFi's scan-list-then-password, since there's no equivalent
+//of "scan for networks" for a broker -- the host has to be typed.
+bool g_awaitingManualMqttSetup = false;
+//Same purpose as g_manualSetupIsRuntimeChange: gates whether the host
+//screen's "< Cancel" actually exits the wait loop (only meaningful
+//during a live "Change MQTT", where a working connection already
+//exists to cancel back to).
+bool g_mqttManualSetupIsRuntimeChange = false;
+bool g_mqttChangeRequested = false;
+bool g_pendingMqttAttempt = false;
+char g_pendingMqttHost[64];
+char g_pendingMqttUser[33];
+char g_pendingMqttPass[64];
+
+lv_obj_t* mqttHostTextarea;
+lv_obj_t* mqttUsernameTextarea;
+lv_obj_t* mqttPasswordTextarea;
+lv_obj_t* mqttConnectStatusLbl;
+//Single keyboard SHARED across all three MQTT screens (reparented +
+//reconfigured on each transition -- see attachMqttKeyboard()) instead
+//of one full lv_keyboard per screen. Each lv_keyboard is a substantial
+//persistent object (a full button matrix, ~40+ buttons with their own
+//style/state records); three of them on top of the pre-existing
+//wifiKeyboard was real, avoidable memory pressure.
+lv_obj_t* mqttKeyboard;
+
+//labels/widgets that need periodic/live updates after screen build
+lv_obj_t* lbl_home_clock;
+lv_obj_t* lbl_home_date;
+lv_obj_t* weather_pill;
+//Shown instead of the real clock/date/weather/TOU pill while
+//WIFI_UI_CONNECTING is active -- those all depend on either NTP (clock/
+//date) or a value that's still meaningless before a connection exists
+//(weather's static regardless, but showing it standalone while the
+//other three are replaced would look broken), so swapping the whole
+//quadrant for one clear status message reads better than four
+//independently-stale placeholders. See setConnStatusIndicator().
+lv_obj_t* lbl_home_boot_status;
+//connection status dot+label pair, once each on the Home quadrant and the
+//Connection screen -- both used to be built once with a hardcoded green
+//dot and "Connected" text (never touched again after screen build), so
+//the UI claimed a live connection even while connectToWiFi() was still
+//mid-retry or had already given up. See setConnStatusIndicator().
+lv_obj_t* dot_home_conn;
+lv_obj_t* lbl_home_connState;
+lv_obj_t* dot_scr_conn;
+lv_obj_t* lbl_scr_connState;
+//shown/hidden together with the dot above it -- no SSID to show while
+//still attempting to connect, per request.
+lv_obj_t* lbl_home_ssid;
+lv_obj_t* lbl_conn_ssid;
+lv_obj_t* lbl_conn_rssi;
+lv_obj_t* lbl_conn_broker;
+lv_obj_t* lbl_conn_gateway;
+lv_obj_t* lbl_conn_ip;
+lv_obj_t* lbl_time_clock;
+lv_obj_t* lbl_time_date;
+lv_obj_t* ring_home_battery;
+lv_obj_t* dot_home_battery;
+lv_obj_t* lbl_home_battery_pct;
+lv_obj_t* lbl_home_battery_state;
+lv_obj_t* ring_batt_screen;
+lv_obj_t* dot_batt_screen;
+lv_obj_t* lbl_batt_pct;
+lv_obj_t* lbl_batt_state;
+lv_obj_t* ring_home_grid;
+lv_obj_t* lbl_home_grid_watts;
+lv_obj_t* lbl_home_grid_status;  //text set once ("Grid In/Out"), only color updates now
+//Home quadrant test: battery power ring next to the grid ring, short
+//"Batt"/"Grid" labels for now just to confirm they fit in the compact
+//396x236 quadrant space, per request.
+lv_obj_t* ring_home_batt_power;
+lv_obj_t* lbl_home_batt_watts;
+lv_obj_t* lbl_home_batt_label;
+//Grid screen: two rings side by side -- battery (left, L1+L2 feeder sum)
+//and grid (right, Line1Grid+Line2Grid sum), per request.
+lv_obj_t* ring_grid_battery;
+lv_obj_t* lbl_grid_battery_watts;
+lv_obj_t* lbl_grid_battery_label;  //dynamic: "Battery In"/"Battery Out"/"Battery Idle"
+lv_obj_t* ring_grid_grid;
+lv_obj_t* lbl_grid_grid_watts;
+lv_obj_t* lbl_grid_grid_label;  //text set once ("Grid In/Out"), only color updates now
+lv_obj_t* lbl_grid_l1_feeder;
+lv_obj_t* lbl_grid_l2_feeder;
+lv_obj_t* lbl_grid_l1_grid;
+lv_obj_t* lbl_grid_l2_grid;
+lv_obj_t* lbl_grid_saved;
+lv_obj_t* lbl_grid_saved_yesterday;
+lv_obj_t* pill_home_tou;
+lv_obj_t* pill_time_tou;
+lv_obj_t* pill_time_next;   //next-upcoming of the two other rates
+lv_obj_t* pill_time_third;  //the one after that
+lv_obj_t* schedule_bar_seg[6];  //6, not 4 -- weekdays now have more segments than weekends (two super off-peak windows)
+lv_obj_t* tide_line_obj;
+lv_obj_t* lbl_tide_left;   //positional (not content-fixed) -- see rebuildTideCurve()
+lv_obj_t* lbl_tide_right;
+lv_obj_t* lbl_almanac_weather;
+lv_obj_t* lbl_almanac_sunrise;
+lv_obj_t* lbl_almanac_sunset;
+lv_obj_t* lbl_almanac_moonrise;
+lv_obj_t* lbl_almanac_moonset;
+lv_obj_t* lbl_almanac_phase;
+//Column containers (not just the value labels above) for all four
+//rows -- needed so updateAlmanacScreen() can hide a column entirely (a
+//rise or set can be genuinely absent from a given calendar day -- see
+//almanac_data.py's header comment) and, for the two moon columns only,
+//swap which physical column (left/right) Moonrise vs. Moonset renders
+//in, so the chronologically earlier of the two always reads
+//left-to-right (see its own comment).
+lv_obj_t* col_sunrise;
+lv_obj_t* col_sunset;
+lv_obj_t* col_moonrise;
+lv_obj_t* col_moonset;
+//Accurate moon-phase icon, redrawn from real phase-angle data -- see
+//renderMoonPhaseIcon(). The SAME calculation now also drives the
+//Moonrise/Moonset column icons below (moonrise_icon_canvas/
+//moonset_icon_canvas) -- all three show the real current phase, not a
+//generic fixed-crescent glyph.
+lv_obj_t* moon_phase_canvas;
+lv_obj_t* moonrise_icon_canvas;
+lv_obj_t* moonset_icon_canvas;
+#define MOON_ICON_D 33  //1.5x the original 22px
+//1.5x the original 20px sun/moon time-column icons -- shared by
+//makeSunIcon() (Sunrise/Sunset) and the moon canvases (Moonrise/Moonset)
+//below so all four icons in that row stay the same visual size.
+#define ICON_D 30
+//RGB565 (16bpp), not ARGB8888 -- these icons are always fully opaque
+//(flat style, matching the rest of this dashboard), so no alpha channel
+//is needed. Raw byte buffer + LV_CANVAS_BUF_SIZE(), per LVGL 9's actual
+//canvas API -- NOT an lv_color_t array (a common but wrong assumption).
+static uint8_t moon_canvas_buf[LV_CANVAS_BUF_SIZE(MOON_ICON_D, MOON_ICON_D, 16, LV_DRAW_BUF_STRIDE_ALIGN)];
+static uint8_t moonrise_icon_buf[LV_CANVAS_BUF_SIZE(ICON_D, ICON_D, 16, LV_DRAW_BUF_STRIDE_ALIGN)];
+static uint8_t moonset_icon_buf[LV_CANVAS_BUF_SIZE(ICON_D, ICON_D, 16, LV_DRAW_BUF_STRIDE_ALIGN)];
+
+//---- NTP / clock (same approach as Unit 1's getLocaltime/setNtpTime) ----
+char* getLocaltime(char buffer[]) {
+  tm t;
+  _rtc_localtime(time(NULL), &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+  strftime(buffer, 32, "%I:%M:%S %p", &t);
+  return buffer;
+}
+
+//Same _rtc_localtime() call as above, but exposes the full tm struct
+//(hour/weekday/month/day/day-of-year) instead of just a formatted time
+//string -- used for TOU tier computation and tide-table lookup.
+void getLocalTm(tm& t) {
+  _rtc_localtime(time(NULL), &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+}
+
+//Yesterday's broken-down local time, for pricing the Saved Yesterday
+//curve's discharge segments at the TOU tier that actually applied on
+//that day (weekday/weekend and holiday status can differ from today's).
+//Subtracting a day from the epoch first (rather than subtracting 1 from
+//tm_mday by hand) means month/year rollovers are handled correctly by
+//_rtc_localtime() itself, not by fragile manual date arithmetic.
+void getYesterdayLocalTm(tm& t) {
+  time_t yesterday = time(NULL) - 86400;
+  _rtc_localtime(yesterday, &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+}
+
+//"Tuesday, July 14" -- real weekday/date, replacing the old build-time
+//placeholder ("Monday, July 13") that was never actually updated at
+//runtime. %A/%B are in newlib's built-in (non-locale-file) name tables,
+//same library this sketch already relies on for getLocaltime()'s %I/%p.
+char* getLocalDateStr(char buffer[]) {
+  tm t;
+  _rtc_localtime(time(NULL), &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+  strftime(buffer, 32, "%A, %B %d", &t);
+  return buffer;
+}
+
+unsigned long sendNTPpacket(const char* address) {
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  packetBuffer[0] = 0b11100011;
+  packetBuffer[1] = 0;
+  packetBuffer[2] = 6;
+  packetBuffer[3] = 0xEC;
+  packetBuffer[12] = 49;
+  packetBuffer[13] = 0x4E;
+  packetBuffer[14] = 49;
+  packetBuffer[15] = 52;
+  Udp.beginPacket(address, 123);
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+}
+
+unsigned long parseNtpPacket() {
+  if (!Udp.parsePacket()) return 0;
+  Udp.read(packetBuffer, NTP_PACKET_SIZE);
+  const unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+  const unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+  const unsigned long secsSince1900 = highWord << 16 | lowWord;
+  constexpr unsigned long seventyYears = 2208988800UL;
+  const unsigned long epoch = secsSince1900 - seventyYears;
+  const unsigned long new_epoch = epoch + (3600 * timezone);
+  set_time(new_epoch);
+  return epoch;
+}
+
+void setNtpTime() {
+  Udp.begin(localPort);
+  sendNTPpacket(timeServer);
+  delay(1000);
+  parseNtpPacket();
+}
+
+//---- WiFi ----
+//Bounded attempt helper -- tries WiFi.begin() up to maxAttempts times,
+//attemptDelayMs apart, returns as soon as one succeeds. Replaces the
+//old unconditional infinite retry loop, which had no way to ever fall
+//through to a fallback credential source.
+bool tryConnectWiFi(const char* s, const char* p, int maxAttempts, unsigned long attemptDelayMs) {
+  for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (verbosity > 0) {
+      Serial.print("Attempting to connect to SSID: ");
+      Serial.print(s);
+      Serial.print(" (attempt ");
+      Serial.print(attempt);
+      Serial.print("/");
+      Serial.print(maxAttempts);
+      Serial.println(")");
+    }
+    wifiStatus = WiFi.begin(s, p);
+    if (wifiStatus == WL_CONNECTED) return true;
+    delay(attemptDelayMs);
+    if (wifiStatus == WL_CONNECTED) return true;  //WiFi.begin() itself may block long enough to settle during the call above; re-check before waiting out a full extra delay
+  }
+  return false;
+}
+
+//Boot-time connect: secrets.h baseline first (3x15s), then the
+//KVStore-stored credentials from a previous manual setup if that fails
+//(3x15s) -- per request, so a manually-configured network survives a
+//cold boot or reflash without needing re-entry, while secrets.h stays
+//the primary default. Returns false if both fail; the manual
+//network-selection/keyboard setup flow (not yet wired in here) is what
+//should run next when that happens.
+bool connectToWiFi(void) {
+  if (WiFi.status() == WL_NO_MODULE) {
+    if (verbosity > 0) Serial.println("Communication with WiFi module failed!");
+    while (true);
+  }
+  if (WiFi.status() == WL_NO_SHIELD) {
+    if (verbosity > 0) Serial.println("Communication with WiFi module failed!");
+    while (true);
+  }
+
+  strncpy(ssid, SECRET_SSID, sizeof(ssid) - 1);
+  ssid[sizeof(ssid) - 1] = '\0';
+  strncpy(password, SECRET_PASS, sizeof(password) - 1);
+  password[sizeof(password) - 1] = '\0';
+  if (tryConnectWiFi(ssid, password, 3, 15000)) {
+    setNtpTime();
+    if (verbosity > 0) Serial.println("Connected to WiFi (secrets.h)");
+    return true;
+  }
+
+  char storedSsid[33], storedPass[64];
+  if (loadWifiCredentials(storedSsid, sizeof(storedSsid), storedPass, sizeof(storedPass))) {
+    if (verbosity > 0) Serial.println("secrets.h network not reachable -- trying stored credentials");
+    if (tryConnectWiFi(storedSsid, storedPass, 3, 15000)) {
+      strncpy(ssid, storedSsid, sizeof(ssid) - 1);
+      ssid[sizeof(ssid) - 1] = '\0';
+      strncpy(password, storedPass, sizeof(password) - 1);
+      password[sizeof(password) - 1] = '\0';
+      setNtpTime();
+      if (verbosity > 0) Serial.println("Connected to WiFi (stored credentials)");
+      return true;
+    }
+  } else if (verbosity > 0) {
+    Serial.println("secrets.h network not reachable, no stored credentials to fall back to");
+  }
+
+  return false;
+}
+
+//Single attempt, no retry loop -- mqttClient.connect() already has its
+//own internal timeout, and unlike WiFi this doesn't need a multi-attempt
+//settle window.
+bool tryConnectMqtt(const char* host, const char* user, const char* pass) {
+  mqttClient.setId("GigaYH_Unit2");
+  mqttClient.setUsernamePassword(user, pass);
+  return mqttClient.connect(host, port);
+}
+
+//Shared by the boot-time path and the manual MQTT setup flow, so both
+//stay in sync with whatever topics this sketch actually subscribes to.
+void subscribeAllMqttTopics() {
+  mqttClient.onMessage(onMqttMessage);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatterySoC); }
+  mqttClient.subscribe(subtopicBatterySoC);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryAction); }
+  mqttClient.subscribe(subtopicBatteryAction);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine1); }
+  mqttClient.subscribe(subtopicLine1);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine2); }
+  mqttClient.subscribe(subtopicLine2);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine1Grid); }
+  mqttClient.subscribe(subtopicLine1Grid);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicLine2Grid); }
+  mqttClient.subscribe(subtopicLine2Grid);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryDaySoc); }
+  mqttClient.subscribe(subtopicBatteryDaySoc);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicBatteryYesterdaySoc); }
+  mqttClient.subscribe(subtopicBatteryYesterdaySoc);
+
+  if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicAlmanacData); }
+  mqttClient.subscribe(subtopicAlmanacData);
+  //Subscribe-only -- no mqttClient.beginMessage()/publish anywhere in this
+  //sketch, on any topic. Unit 2 has no publish authority, by design.
+}
+
+//Boot-time MQTT connect. Deliberately the OPPOSITE priority order from
+//connectToWiFi(): tries the STORED (KVStore) broker settings FIRST,
+//falling back to secrets.h only if nothing's stored yet or the stored
+//settings fail. WiFi tries secrets.h first because a stale SSID just
+//means "try a different known network" -- but the scenario this exists
+//for is specifically "the broker's IP moved and secrets.h is now
+//stale," so a previously-corrected KVStore value should be trusted over
+//the compiled-in default, not the other way around.
+bool connectToMqttBroker(void) {
+  char storedHost[64], storedUser[33], storedPass[64];
+  if (loadMqttCredentials(storedHost, sizeof(storedHost), storedUser, sizeof(storedUser), storedPass, sizeof(storedPass))) {
+    if (tryConnectMqtt(storedHost, storedUser, storedPass)) {
+      strncpy(mqttHost, storedHost, sizeof(mqttHost) - 1); mqttHost[sizeof(mqttHost) - 1] = '\0';
+      strncpy(mqttUserRuntime, storedUser, sizeof(mqttUserRuntime) - 1); mqttUserRuntime[sizeof(mqttUserRuntime) - 1] = '\0';
+      strncpy(mqttPassRuntime, storedPass, sizeof(mqttPassRuntime) - 1); mqttPassRuntime[sizeof(mqttPassRuntime) - 1] = '\0';
+      if (verbosity > 0) Serial.println("Connected to MQTT broker (stored settings)");
+      return true;
+    }
+    if (verbosity > 0) Serial.println("Stored MQTT settings failed -- trying secrets.h");
+  }
+
+  strncpy(mqttHost, HOME_ASSISTANT_IP, sizeof(mqttHost) - 1); mqttHost[sizeof(mqttHost) - 1] = '\0';
+  strncpy(mqttUserRuntime, MQTT_USERNAME, sizeof(mqttUserRuntime) - 1); mqttUserRuntime[sizeof(mqttUserRuntime) - 1] = '\0';
+  strncpy(mqttPassRuntime, MQTT_PASSWORD, sizeof(mqttPassRuntime) - 1); mqttPassRuntime[sizeof(mqttPassRuntime) - 1] = '\0';
+  if (tryConnectMqtt(mqttHost, mqttUserRuntime, mqttPassRuntime)) {
+    if (verbosity > 0) Serial.println("Connected to MQTT broker (secrets.h)");
+    return true;
+  }
+  return false;
+}
+
+//---- touch input driver ----
+//Arduino_GigaDisplayTouch::getTouchPoints() is the documented API for this
+//library at time of writing -- verify against the installed library version
+//if touch doesn't register on real hardware, this is the first thing to check.
+//LVGL 9 API (the old lv_indev_drv_t struct-based registration from v8 was
+//removed -- confirmed by an actual compile against the installed lvgl 9.5.0).
+//No coordinate transform here -- the touch controller already reports
+//raw panel-space coordinates, which LVGL's own configured display
+//rotation converts to logical coordinates automatically (see
+//simTouchReadCb() below, which has to hand-invert that same rotation
+//for its own already-logical serial input, precisely because this
+//function must NOT do so itself). A same-day detour tried adding a
+//manual rotation here anyway, on a mistaken theory that raw coordinates
+//were never being converted -- confirmed on real hardware to make things
+//worse (double-rotated coordinates only accidentally landed correctly
+//near screen center, explaining why just one middle-of-keyboard key kept
+//working while everything else didn't). Reverted back to this, the
+//actual previously-working version.
+void touchpad_read(lv_indev_t* indev, lv_indev_data_t* data) {
+  GDTpoint_t points[5];
+  uint8_t contacts = TouchDetector.getTouchPoints(points);
+  if (contacts > 0) {
+    data->state = LV_INDEV_STATE_PRESSED;
+    data->point.x = points[0].x;
+    data->point.y = points[0].y;
+  } else {
+    data->state = LV_INDEV_STATE_RELEASED;
+  }
+}
+
+//---- simulated touch input (dev/debug only) ----
+//A second, independent LVGL pointer indev, fed from a serial command
+//instead of the real digitizer -- lets a PC-side script exercise real
+//taps (real LVGL hit-testing/click-bubbling, the same code path a
+//physical finger drives) for regression testing things like the
+//makeColumn() click-through bug, without needing hands on the board.
+//Registering a second POINTER indev alongside the real one is supported
+//by LVGL -- both feed the same active screen's input processing.
+volatile bool g_simTouchDown = false;
+volatile int16_t g_simTouchX = 0;
+volatile int16_t g_simTouchY = 0;
+unsigned long g_simTouchReleaseAt = 0;
+
+//g_simTouchX/Y are in the sketch's familiar logical 800x480 landscape
+//space (the same space every lv_obj_set_pos() call and the screen
+//exporter's PNGs use) -- but LVGL expects every pointer indev's raw
+//point in the DISPLAY's un-rotated base resolution and applies its own
+//lv_display_rotate_point() to every indev read (see lv_indev.c's
+//indev_pointer_proc()). Arduino_H7_Video creates the LVGL display at
+//the physical panel's native portrait 480x800 (Display(800,480) with
+//width>=height triggers _rotated=true -> lv_display_create(height(),
+//width()) = lv_display_create(480,800)) plus ROTATION_270. The real
+//touch driver (touchpad_read() above) works "for free" because the
+//touch controller already reports raw panel-space coordinates, which
+//LVGL's own rotation then converts. Feeding it already-logical
+//coordinates (as an earlier version of this function did) makes LVGL
+//rotate them a SECOND time, landing on the wrong point entirely --
+//this is why simulated taps parsed correctly but never hit any
+//on-screen object. Inverting ROTATION_270's transform by hand here
+//(raw_x = 479 - logical_y, raw_y = logical_x) makes the serial
+//protocol/PC script deal only in logical coordinates, same as
+//everything else in this sketch.
+void simTouchReadCb(lv_indev_t* indev, lv_indev_data_t* data) {
+  data->point.x = 479 - g_simTouchY;
+  data->point.y = g_simTouchX;
+  data->state = g_simTouchDown ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
+}
+
+//---- screen exporter (dev/debug only) ----
+//Dumps the live DSI framebuffer over Serial as raw RGB565 so a PC-side
+//script can reconstruct a real PNG of whatever's on screen right now --
+//lets layout be checked against the real rendered resolution/font metrics
+//without needing a hardware photo for every tweak. Triggered by sending the
+//single byte 'D' over the same Serial port already used for logging.
+//
+//The framebuffer here is in the *physical panel's native orientation*
+//(the Giga Display Shield's panel is physically portrait; this library
+//applies a 270 degree LVGL-side rotation so our 800x480 landscape logical
+//screen renders correctly on it -- see Arduino_H7_Video.cpp's _rotated
+//handling). dsi_getDisplayXSize()/YSize() report that native (rotated)
+//size, not our logical 800x480 -- the PC-side script un-rotates it back.
+void dumpFramebufferToSerial() {
+  uint32_t w = dsi_getDisplayXSize();
+  uint32_t h = dsi_getDisplayYSize();
+  const uint16_t* fb = (const uint16_t*)dsi_getActiveFrameBuffer();
+
+  //Flush any pending writes and force a fresh CPU read of the framebuffer
+  //memory (DMA2D writes it, so a stale D-cache line could otherwise be
+  //served back instead of what's actually on screen right now).
+  SCB_CleanInvalidateDCache();
+
+  Serial.println();
+  Serial.println("FBDUMP");
+  Serial.print(w);
+  Serial.print('x');
+  Serial.println(h);
+  Serial.println("RGB565");
+
+  uint32_t pixelCount = w * h;
+  Serial.write((const uint8_t*)fb, pixelCount * 2);
+
+  Serial.println();
+  Serial.println("FBEND");
+}
+
+//Shared parser for both subtopicBatteryDaySoc and subtopicBatteryYesterdaySoc
+//(same "bucket:soc:state,bucket:soc:state,..." encoding, see
+//battery_day_curve.py). Manual parse, not strtok -- strtok's shared
+//static state doesn't nest safely against anything else on this board
+//that might also parse a string between calls, and this format is
+//simple enough that hand-walking it is barely more code. Returns the
+//number of points parsed.
+int parseSocCurvePayload(const char* payload, uint8_t* bucketOut, uint8_t* valueOut, uint8_t* stateOut, int maxPoints) {
+  int count = 0;
+  const char* p = payload;
+  while (*p && count < maxPoints) {
+    int bucket = atoi(p);
+    const char* colon1 = strchr(p, ':');
+    if (!colon1) break;
+    int soc = atoi(colon1 + 1);
+    const char* colon2 = strchr(colon1 + 1, ':');
+    if (!colon2) break;
+    int state = atoi(colon2 + 1);
+    bucketOut[count] = (uint8_t)constrain(bucket, 0, 95);
+    valueOut[count] = (uint8_t)constrain(soc, 0, 100);
+    stateOut[count] = (uint8_t)constrain(state, 0, 2);
+    count++;
+    const char* comma = strchr(colon2, ',');
+    if (!comma) break;
+    p = comma + 1;
+  }
+  return count;
+}
+
+//Parses almanac_data.py's colon-delimited payload -- see
+//subtopicAlmanacData's own comment for the field order. Manual parse,
+//same convention as parseSocCurvePayload() above (no strtok). Returns
+//false (leaving all *Out params untouched) if the payload is malformed,
+//so a bad message can't silently zero out previously-good data.
+bool parseAlmanacPayload(const char* payload, char* conditionOut, size_t conditionCap,
+                          int* tempFOut, time_t* sunriseOut, time_t* sunsetOut,
+                          time_t* moonriseOut, time_t* moonsetOut,
+                          float* phaseAngleOut, char* phaseNameOut, size_t phaseNameCap) {
+  const char* p = payload;
+  float tempF = atof(p);
+
+  const char* c1 = strchr(p, ':');
+  if (!c1) return false;
+  const char* c2 = strchr(c1 + 1, ':');
+  if (!c2) return false;
+  size_t condLen = min((size_t)(c2 - (c1 + 1)), conditionCap - 1);
+  strncpy(conditionOut, c1 + 1, condLen);
+  conditionOut[condLen] = '\0';
+
+  const char* c3 = strchr(c2 + 1, ':');
+  if (!c3) return false;
+  time_t sunrise = (time_t)atol(c2 + 1);
+
+  const char* c4 = strchr(c3 + 1, ':');
+  if (!c4) return false;
+  time_t sunset = (time_t)atol(c3 + 1);
+
+  const char* c5 = strchr(c4 + 1, ':');
+  if (!c5) return false;
+  time_t moonrise = (time_t)atol(c4 + 1);
+
+  const char* c6 = strchr(c5 + 1, ':');
+  if (!c6) return false;
+  time_t moonset = (time_t)atol(c5 + 1);
+
+  const char* c7 = strchr(c6 + 1, ':');
+  if (!c7) return false;
+  float phaseAngle = atof(c6 + 1);
+
+  strncpy(phaseNameOut, c7 + 1, phaseNameCap - 1);
+  phaseNameOut[phaseNameCap - 1] = '\0';
+
+  *tempFOut = (int)(tempF + 0.5f); //round, not truncate
+  *sunriseOut = sunrise;
+  *sunsetOut = sunset;
+  *moonriseOut = moonrise;
+  *moonsetOut = moonset;
+  *phaseAngleOut = phaseAngle;
+  return true;
+}
+
+//---- MQTT message handler (subscribe-only -- this never publishes) ----
+void onMqttMessage(int messageSize) {
+  //1024, not the 256 every other topic here has gotten away with -- the
+  //DaySOC payload (see subtopicBatteryDaySoc) can run up to ~900 bytes
+  //for a full day at 15-min resolution ("bucket:soc:state," per point),
+  //comfortably fits with real margin. Shared across every branch below,
+  //same as before -- trivial stack cost on this board either way.
+  char tbuf[1024] = "";
+  int size = 0;
+  String topic = mqttClient.messageTopic();
+
+  if (topic.equals(subtopicBatterySoC)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read(); //discard anything beyond tbuf's capacity so the next message stays in sync
+    tbuf[size] = '\0';
+    //clamped the same way the fuel-gauge project's own SoC handler is, since
+    //an out-of-range value here would otherwise feed straight into an arc
+    //angle calculation with no bound of its own
+    g_batterySoC = constrain(atof(tbuf), 0.0, 100.0);
+    g_lastBatterySoCMs = millis();
+    if (trace) { Serial.print("Battery SoC = "); Serial.println(g_batterySoC, 1); }
+
+  } else if (topic.equals(subtopicBatteryAction)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    if (!strcmp(tbuf, "Charging")) g_batteryState = 1;
+    else if (!strcmp(tbuf, "Discharging")) g_batteryState = -1;
+    else if (!strcmp(tbuf, "Idle")) g_batteryState = 0;
+    g_lastBatteryActionMs = millis();
+    if (trace) { Serial.print("Battery Action = "); Serial.println(tbuf); }
+
+  } else if (topic.equals(subtopicLine1)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    g_line1Power = constrain(atof(tbuf), 0.0, 900.0); //900 = Unit 1's MAX_POWER ceiling
+    g_lastLine1Ms = millis();
+    if (trace) { Serial.print("Line1 = "); Serial.println(g_line1Power, 0); }
+
+  } else if (topic.equals(subtopicLine2)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    g_line2Power = constrain(atof(tbuf), 0.0, 900.0);
+    g_lastLine2Ms = millis();
+    if (trace) { Serial.print("Line2 = "); Serial.println(g_line2Power, 0); }
+
+  } else if (topic.equals(subtopicLine1Grid)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    //signed -- unlike Line1/Line2 (feeder output) above, negative here is
+    //a real reading (this line net-exporting), not out-of-range noise.
+    //Deliberately NOT constrained like Line1/Line2 above -- this is a real
+    //Home Assistant grid reading, not bounded by Unit 1's own 900W output
+    //ceiling, and per request should display whatever it actually is
+    //(the old +-900 constrain here silently capped combined L1+L2 grid
+    //consumption at 1800W, which is what surfaced this bug).
+    g_line1GridPower = atof(tbuf);
+    g_hasLine1GridPower = true;
+    g_lastLine1GridMs = millis();
+    if (trace) { Serial.print("Line1 grid = "); Serial.println(g_line1GridPower, 0); }
+
+  } else if (topic.equals(subtopicLine2Grid)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    g_line2GridPower = atof(tbuf);
+    g_hasLine2GridPower = true;
+    g_lastLine2GridMs = millis();
+    if (trace) { Serial.print("Line2 grid = "); Serial.println(g_line2GridPower, 0); }
+
+  } else if (topic.equals(subtopicBatteryDaySoc)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    g_daySocCount = parseSocCurvePayload(tbuf, g_daySocBucket, g_daySocValue, g_daySocState, MAX_DAYSOC_POINTS);
+    g_daySocDirty = true;
+    if (trace) { Serial.print("Battery DaySOC points = "); Serial.println(g_daySocCount); }
+
+  } else if (topic.equals(subtopicBatteryYesterdaySoc)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    g_yesterdaySocCount = parseSocCurvePayload(tbuf, g_yesterdaySocBucket, g_yesterdaySocValue, g_yesterdaySocState, MAX_DAYSOC_POINTS);
+    if (trace) { Serial.print("Battery YesterdaySOC points = "); Serial.println(g_yesterdaySocCount); }
+
+  } else if (topic.equals(subtopicAlmanacData)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    if (parseAlmanacPayload(tbuf, g_weatherCondition, sizeof(g_weatherCondition), &g_weatherTempF,
+                             &g_sunriseEpoch, &g_sunsetEpoch, &g_moonriseEpoch, &g_moonsetEpoch,
+                             &g_moonPhaseAngle, g_moonPhaseName, sizeof(g_moonPhaseName))) {
+      //Sentence case here, once per message -- Met.no's condition string
+      //arrives all-lowercase ("sunny"), and both the Home pill and the
+      //Almanac screen read this same global, so fixing it at the source
+      //(rather than in each display-update function) keeps them consistent
+      //regardless of which screen the user happens to visit first.
+      if (g_weatherCondition[0] >= 'a' && g_weatherCondition[0] <= 'z') {
+        g_weatherCondition[0] -= 32;
+      }
+      g_hasAlmanacData = true;
+      g_lastAlmanacDataMs = millis();
+      g_almanacDataDirty = true;
+      if (trace) { Serial.print("Almanac: "); Serial.print(g_weatherTempF); Serial.print("F "); Serial.print(g_weatherCondition); Serial.print(", phase="); Serial.println(g_moonPhaseName); }
+    }
+  }
+}
+
+//Drives the Home quadrant's and Connection screen's dot+label pair. Both
+//used to be built once at screen-construction time with a hardcoded
+//green dot and "Connected" text, so the UI claimed a live connection even
+//during connectToWiFi()'s multi-attempt retries (which run with scr_home
+//already loaded and visible, per setup()'s own flow) or after a
+//connection was never established at all. Called at every real state
+//transition instead -- before the first connect attempt, after each
+//attempt resolves, after a successful manual setup or Reset-network
+//round trip, and once per second from loop()'s existing periodic update
+//tick (this sketch has no active WiFi reconnect loop, so a runtime drop
+//correctly stays "Not connected" until the user acts, rather than being
+//silently missed).
+//A single lv_timer_handler() call queues a redraw but doesn't guarantee
+//it's actually reached the panel by the time execution continues into a
+//blocking call right after it -- confirmed on real hardware via a
+//screen-dump capture taken the instant a serial log line proved the
+//Arduino-side code had already executed past the state-change call: the
+//physical screen still showed the previous state. Several ticks with a
+//short real delay between them gives the display pipeline (this sketch
+//renders through a software 270-degree rotation, per dump_screen.py's
+//own docstring) actual wall-clock time to finish, not just queue, the
+//frame. Used anywhere a state needs to be visibly painted before a
+//blocking WiFi call -- "Connecting"/"Scanning..." etc.
+void forcePaint() {
+  for (int i = 0; i < 5; i++) {
+    lv_timer_handler();
+    delay(15);
+  }
+}
+
+//Regression signal: logs LVGL's own heap state (the SDRAM-backed
+//ea_malloc pool, see lv_conf.h) after every Change WiFi / Change MQTT
+//flow. free_size trending down across repeated invocations would point
+//to a leak; free_size steady while frag_pct climbs would point to
+//fragmentation from the child-array reallocs each screen rebuild does.
+void logMemStatus(const char* tag) {
+  lv_mem_monitor_t mon;
+  lv_mem_monitor(&mon);
+  Serial.print("MEM[");
+  Serial.print(tag);
+  Serial.print("] total=");
+  Serial.print(mon.total_size);
+  Serial.print(" free=");
+  Serial.print(mon.free_size);
+  Serial.print(" free_biggest=");
+  Serial.print(mon.free_biggest_size);
+  Serial.print(" used_pct=");
+  Serial.print(mon.used_pct);
+  Serial.print(" frag_pct=");
+  Serial.print(mon.frag_pct);
+  Serial.print(" max_used=");
+  Serial.println(mon.max_used);
+}
+
+//Connecting has no dot -- just two-line amber "Attempting\nto Connect"
+//text, per request. Connected/Not connected keep the dot + single-line
+//text as before.
+void setConnStatusIndicator(WifiUiState state) {
+  const char* text = state == WIFI_UI_CONNECTED ? "Connected" : state == WIFI_UI_CONNECTING ? "Attempting\nto Connect" : "Not connected";
+  lv_color_t textColor = state == WIFI_UI_CONNECTING ? COLOR_AMBER : COLOR_TEXT;
+  lv_label_set_text(lbl_home_connState, text);
+  lv_obj_set_style_text_color(lbl_home_connState, textColor, 0);
+  lv_label_set_text(lbl_scr_connState, text);
+  lv_obj_set_style_text_color(lbl_scr_connState, textColor, 0);
+
+  if (state == WIFI_UI_CONNECTING) {
+    lv_obj_add_flag(dot_home_conn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(dot_scr_conn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_home_ssid, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_color_t dotColor = state == WIFI_UI_CONNECTED ? COLOR_STATUS_OK : COLOR_RED;
+    lv_obj_clear_flag(dot_home_conn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(dot_scr_conn, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_bg_color(dot_home_conn, dotColor, 0);
+    lv_obj_set_style_bg_color(dot_scr_conn, dotColor, 0);
+    lv_obj_clear_flag(lbl_home_ssid, LV_OBJ_FLAG_HIDDEN);
+  }
+
+  //Top-left quadrant: swap the whole clock/date/weather/TOU group for one
+  //"Getting Time, Date, and Status" message while connecting, since the
+  //clock/date depend on NTP (meaningless before a connection exists) --
+  //see lbl_home_boot_status's own comment.
+  if (state == WIFI_UI_CONNECTING) {
+    lv_obj_clear_flag(lbl_home_boot_status, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_home_clock, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(lbl_home_date, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(weather_pill, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(pill_home_tou, LV_OBJ_FLAG_HIDDEN);
+  } else {
+    lv_obj_add_flag(lbl_home_boot_status, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(lbl_home_clock, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(lbl_home_date, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(weather_pill, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(pill_home_tou, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+//---- small widget helpers ----
+lv_obj_t* makeScreenRoot() {
+  lv_obj_t* scr = lv_obj_create(NULL);
+  lv_obj_set_style_bg_color(scr, COLOR_BG, 0);
+  lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(scr, 0, 0);
+  lv_obj_set_style_radius(scr, 0, 0);
+  //ROOT CAUSE of a real bug found through hours of exporter measurement:
+  //plain lv_obj_create() instances get the active theme's default padding
+  //(non-zero) unless explicitly zeroed. Every absolute-position and
+  //LV_ALIGN_TOP_MID child throughout this whole file assumed this screen's
+  //content area starts at literal (0,0) -- it didn't, it started ~20px
+  //down/in from that, silently shifting every child on every screen. Worse,
+  //because it also shrinks the effective content area, children near the
+  //bottom edge (like the Home screen's TOU pill) could get clipped by the
+  //screen's own real (padded, smaller-than-assumed) content boundary no
+  //matter what their OWN size was set to -- which is why changing that
+  //pill's height kept having zero visible effect until this was found.
+  lv_obj_set_style_pad_all(scr, 0, 0);
+  return scr;
+}
+
+lv_obj_t* makeLabel(lv_obj_t* parent, const char* text, lv_color_t color) {
+  lv_obj_t* lbl = lv_label_create(parent);
+  lv_label_set_text(lbl, text);
+  lv_obj_set_style_text_color(lbl, color, 0);
+  return lbl;
+}
+
+lv_obj_t* makeLabel(lv_obj_t* parent, const char* text, lv_color_t color, lv_coord_t x, lv_coord_t y) {
+  lv_obj_t* lbl = makeLabel(parent, text, color);
+  lv_obj_set_pos(lbl, x, y);
+  return lbl;
+}
+
+//right-aligned label in a fixed-width box ending at labelRight -- a
+//screen-exporter capture caught a "label at X, value at X+160" layout
+//overlapping because the real label text (e.g. "MQTT broker") was wider
+//than the guessed gap. Right-aligning within a known-width box means the
+//value column's start position is safe regardless of how wide any given
+//label's text actually renders, PROVIDED labelW is wide enough that it
+//doesn't wrap -- a first attempt at this used too narrow a labelW and the
+//exporter caught the opposite failure, text wrapping onto a second line
+//and colliding with the row below. CLIP mode makes that failure mode a
+//single-line clip instead of a row-height-breaking wrap if labelW is ever
+//still too narrow for some future label text.
+lv_obj_t* makeRowLabel(lv_obj_t* parent, const char* text, lv_coord_t labelRight, lv_coord_t y, lv_coord_t labelW) {
+  lv_obj_t* lbl = makeLabel(parent, text, COLOR_TEXT_MUTED);
+  lv_obj_set_width(lbl, labelW);
+  lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_CLIP);
+  lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_RIGHT, 0);
+  lv_obj_set_pos(lbl, labelRight - labelW, y);
+  return lbl;
+}
+
+lv_obj_t* makeDot(lv_obj_t* parent, lv_color_t color, lv_coord_t x, lv_coord_t y, lv_coord_t d) {
+  lv_obj_t* dot = lv_obj_create(parent);
+  lv_obj_set_size(dot, d, d);
+  lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(dot, color, 0);
+  lv_obj_set_style_border_width(dot, 0, 0);
+  lv_obj_set_pos(dot, x, y);
+  //Same click-through bug as makeColumn() (see its comment): lv_obj_create()
+  //is clickable by default. Harmless in practice for the existing static
+  //legend/status dots (tiny hit targets), but the new orbiting dot below
+  //moves around a clickable quadrant/screen, so this needs to be correct.
+  lv_obj_clear_flag(dot, LV_OBJ_FLAG_CLICKABLE);
+  return dot;
+}
+
+//Pill with content-sized WIDTH (auto, always measured correctly in every
+//capture so far) but a FIXED, generous height with the label centered
+//inside it -- deliberately NOT using LV_SIZE_CONTENT for height.
+//
+//Root cause found by measuring raw pixels from exporter captures across
+//several iterations: LV_SIZE_CONTENT height computed inconsistently
+//between pills using the exact same padding -- one (the clickable weather
+//pill) came out ~44px tall and rendered cleanly, another (a non-clickable
+//TOU pill) came out ~26px tall and clipped its own label's top and bottom
+//by several pixels. This was NOT a deferred-layout timing issue (forcing
+//an immediate lv_obj_update_layout() made no measurable difference); the
+//two pills' clickable state seems to be the actual differentiator via
+//whatever the active theme applies to interactive vs. plain lv_obj
+//instances, but rather than depend on understanding (or on being able to
+//keep depending on) that theme quirk, this sidesteps LV_SIZE_CONTENT
+//height entirely. A fixed height plus lv_obj_center() on the label is a
+//completely ordinary, well-defined LVGL layout with no ambiguity about
+//when its size is "real" -- it always is.
+lv_obj_t* makeAutoPill(lv_obj_t* parent, lv_color_t bg, lv_color_t textColor, const char* text, lv_coord_t padX, lv_coord_t height) {
+  //Never puts LV_SIZE_CONTENT on the pill itself -- three straight attempts
+  //at that (plain height override, update_layout-then-override, different
+  //call orderings) all measured byte-identical on real hardware, so
+  //whatever's happening is deeper than call ordering. Instead: measure a
+  //throwaway label's own natural width directly (a plain, ordinary
+  //lv_label operation, not the container content-sizing logic that's been
+  //the actual problem), then build the real pill with a fully explicit
+  //fixed width/height computed from that measurement. No LV_SIZE_CONTENT
+  //anywhere on the container at all.
+  lv_obj_t* probe = makeLabel(parent, text, textColor);
+  lv_obj_update_layout(probe);
+  lv_coord_t labelW = lv_obj_get_width(probe);
+  lv_obj_del(probe);
+
+  lv_obj_t* pill = lv_obj_create(parent);
+  lv_obj_set_size(pill, labelW + 2 * padX, height);
+  lv_obj_set_style_radius(pill, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(pill, bg, 0);
+  lv_obj_set_style_border_width(pill, 0, 0);
+  lv_obj_clear_flag(pill, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* lbl = makeLabel(pill, text, textColor);
+  //Only matters for multi-line text (a literal \n) -- a shorter second
+  //line would otherwise default to left-aligned under a wider first line
+  //instead of centered under it. No effect on ordinary single-line pills.
+  lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_center(lbl);
+  return pill;
+}
+
+//Re-fits an existing makeAutoPill() to new text, for pills whose text
+//length genuinely varies at runtime (unlike pill_home_tou/pill_time_tou,
+//where all real values happen to be the same length so the build-time
+//fixed width never needs to change). Needed for the weather pill: a
+//fixed width sized for the worst-case condition string ("Lightning-rainy")
+//made the pill wider than its own quadrant once centered, pushing past
+//the screen's left edge and triggering scr_home's default scrollable
+//behavior (a visible scrollbar) even though nothing was meant to scroll.
+//Sizing to each real value's own width instead keeps the pill snug, the
+//same way pill_home_tou's fixed "$0.65/kWh" width already reads as snug.
+//Both the pill and its inner label were built with a persistent
+//LV_ALIGN_TOP_MID/lv_obj_center (a style-based align, not a one-time
+//lv_obj_set_pos -- see lbl_almanac_weather's identical fix), so resizing
+//either one here re-centers it automatically on the next layout pass;
+//no explicit re-align call needed.
+void resizeAutoPillText(lv_obj_t* pill, const char* text, lv_coord_t padX) {
+  lv_obj_t* lbl = lv_obj_get_child(pill, 0);
+  lv_label_set_text(lbl, text);
+  lv_obj_update_layout(lbl);
+  lv_obj_set_width(pill, lv_obj_get_width(lbl) + 2 * padX);
+}
+
+lv_obj_t* makeRing(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t d, int16_t start_angle, int16_t end_angle, lv_color_t color) {
+  lv_obj_t* arc = lv_arc_create(parent);
+  lv_obj_set_size(arc, d, d);
+  lv_obj_set_pos(arc, x, y);
+  lv_arc_set_bg_angles(arc, 0, 360);
+  lv_arc_set_angles(arc, start_angle, end_angle);
+  lv_obj_set_style_arc_color(arc, COLOR_TRACK, LV_PART_MAIN);
+  lv_obj_set_style_arc_width(arc, 8, LV_PART_MAIN);
+  lv_obj_set_style_arc_color(arc, color, LV_PART_INDICATOR);
+  lv_obj_set_style_arc_width(arc, 8, LV_PART_INDICATOR);
+  //arcs are draggable sliders by default with a visible knob; make this a
+  //read-only display ring instead
+  lv_obj_set_style_bg_opa(arc, LV_OPA_TRANSP, LV_PART_KNOB);
+  lv_obj_set_style_border_width(arc, 0, LV_PART_KNOB);
+  lv_obj_set_style_pad_all(arc, 0, LV_PART_KNOB);
+  lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+  return arc;
+}
+
+//---- orbiting charge/discharge indicator dot ----
+//A small dot that orbits the SoC ring (ring_home_battery / ring_batt_screen),
+//layered on top without touching the ring's own SoC-driven arc length or
+//color -- the ring stays exactly as it was (teal, starts at the east/
+//3-o'clock position). The dot alone carries two additional, independent
+//pieces of information the ring doesn't: which direction power is
+//currently flowing (color + spin direction) and how fast (spin rate).
+//Angle is tracked as a float here rather than read back from LVGL, so a
+//mid-spin direction/rate change can restart smoothly from wherever the
+//dot currently is instead of snapping back to the east starting point
+//every time real data updates.
+//lastDirection: -2 = uninitialized (forces the first update through),
+//0 = idle, 1 = charging (CW), -1 = discharging (CCW).
+OrbitDot orbitHomeBattery = { nullptr, 0, 0, 0, 0.0f, -2, -1.0f };
+OrbitDot orbitBattScreen = { nullptr, 0, 0, 0, 0.0f, -2, -1.0f };
+
+void orbitDotExecCb(void* var, int32_t angleTenths) {
+  OrbitDot* o = (OrbitDot*)var;
+  o->currentAngleDeg = angleTenths / 10.0f;
+  float rad = o->currentAngleDeg * (float)M_PI / 180.0f;
+  lv_coord_t diam = lv_obj_get_width(o->dot);
+  lv_obj_set_pos(o->dot, o->cx + (int)(o->r * cosf(rad)) - diam / 2,
+                  o->cy + (int)(o->r * sinf(rad)) - diam / 2);
+}
+
+//direction: 1 = charging (yellow, clockwise), -1 = discharging (amethyst,
+//counter-clockwise), 0 = idle (hidden, not spinning). percent: 0-100,
+//maps to spin rate, 100% = one full rotation/second. Only touches the
+//running animation when direction or percent actually changed, so the
+//1-second tick doesn't restart (and visually stutter) a spin that's
+//already correct.
+void updateOrbitDot(OrbitDot* o, int direction, float percent) {
+  bool directionChanged = (direction != o->lastDirection);
+  bool percentChanged = fabs(percent - o->lastPercent) > 1.0;
+  if (!directionChanged && !percentChanged) return;
+  o->lastDirection = direction;
+  o->lastPercent = percent;
+
+  lv_anim_delete(o, orbitDotExecCb);
+
+  if (direction == 0 || percent <= 0) {
+    lv_obj_add_flag(o->dot, LV_OBJ_FLAG_HIDDEN);
+    return;
+  }
+  lv_obj_clear_flag(o->dot, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_set_style_bg_color(o->dot, direction == 1 ? COLOR_ORBIT_CHARGING : COLOR_ORBIT_DISCHARGING, 0);
+
+  float hz = constrain(percent, 0.0, 100.0) / 100.0;
+  float fromAngle = o->currentAngleDeg;
+  float toAngle = fromAngle + (direction == 1 ? 360.0f : -360.0f);
+
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, o);
+  lv_anim_set_exec_cb(&a, orbitDotExecCb);
+  lv_anim_set_values(&a, (int32_t)(fromAngle * 10), (int32_t)(toAngle * 10));
+  lv_anim_set_duration(&a, (uint32_t)(1000.0 / hz));
+  lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+  lv_anim_set_path_cb(&a, lv_anim_path_linear);
+  lv_anim_start(&a);
+}
+
+//plain container for group layout -- no background/border of its own, used
+//as an alignment anchor so children can be centered with lv_obj_align
+//regardless of their actual rendered text width, instead of guessing X.
+lv_obj_t* makeColumn(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h) {
+  lv_obj_t* col = lv_obj_create(parent);
+  lv_obj_set_size(col, w, h);
+  lv_obj_set_pos(col, x, y);
+  lv_obj_set_style_bg_opa(col, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(col, 0, 0);
+  lv_obj_set_style_pad_all(col, 0, 0);
+  lv_obj_clear_flag(col, LV_OBJ_FLAG_SCROLLABLE);
+  //lv_obj_create() is clickable by default -- this is a plain alignment
+  //container, never meant to be interactive itself. Left clickable, a
+  //column placed over a clickable ancestor (e.g. the Home screen's q_grid
+  //quadrant, which navigates on tap) silently swallows the tap instead of
+  //letting it bubble up: LVGL only sends the click to the actual object
+  //hit, not automatically up to parent handlers. This is why tapping the
+  //Home quadrant's Batt/Grid ring columns stopped navigating to the Grid
+  //screen once those columns were added.
+  lv_obj_clear_flag(col, LV_OBJ_FLAG_CLICKABLE);
+  return col;
+}
+
+//horizontal flex row for legend-style dot+label groups (auto-spaced by
+//LVGL's flex layout, so items can't overlap regardless of rendered text
+//width -- the root cause of the legend overlap bugs found on real hardware)
+lv_obj_t* makeFlexRow(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t w, lv_coord_t h, lv_coord_t gap) {
+  lv_obj_t* row = lv_obj_create(parent);
+  lv_obj_set_size(row, w, h);
+  lv_obj_set_pos(row, x, y);
+  lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(row, 0, 0);
+  lv_obj_set_style_pad_all(row, 0, 0);
+  lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(row, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(row, gap, 0);
+  lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+  return row;
+}
+
+//one dot+label pair sized to its own content, meant as a child of makeFlexRow
+void makeLegendItem(lv_obj_t* row, lv_color_t dotColor, const char* text) {
+  lv_obj_t* item = lv_obj_create(row);
+  lv_obj_set_size(item, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_opa(item, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(item, 0, 0);
+  lv_obj_set_style_pad_all(item, 0, 0);
+  lv_obj_set_flex_flow(item, LV_FLEX_FLOW_ROW);
+  lv_obj_set_flex_align(item, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_set_style_pad_column(item, 8, 0);
+  lv_obj_clear_flag(item, LV_OBJ_FLAG_SCROLLABLE);
+  lv_obj_t* dot = lv_obj_create(item);
+  lv_obj_set_size(dot, 10, 10);
+  lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+  lv_obj_set_style_bg_color(dot, dotColor, 0);
+  lv_obj_set_style_border_width(dot, 0, 0);
+  makeLabel(item, text, COLOR_TEXT_MUTED);
+}
+
+//Sun icon shape, reusing the exact geometry from design/mockups/06_almanac.svg
+//(circle + 4 tick marks). Positioned by top-left corner of a (d x d)
+//bounding box, like the other make* helpers. The moon's equivalent is no
+//longer a fixed glyph -- see renderMoonPhaseIcon().
+void makeSunIcon(lv_obj_t* parent, lv_coord_t x, lv_coord_t y, lv_coord_t d) {
+  lv_coord_t r = d / 2;
+  lv_coord_t cx = x + r, cy = y + r;
+  makeDot(parent, COLOR_AMBER, x, y, d);
+  lv_coord_t tick = r / 2; //tick length, scaled off the icon radius
+  makeDot(parent, COLOR_AMBER, cx - 1, y - tick - 2, 2);          //top
+  makeDot(parent, COLOR_AMBER, cx - 1, y + d + 2, 2);             //bottom
+  makeDot(parent, COLOR_AMBER, x - tick - 2, cy - 1, 2);          //left
+  makeDot(parent, COLOR_AMBER, x + d + 2, cy - 1, 2);             //right
+}
+
+//navigate by loading a different pre-built screen; called from touch event callbacks
+void navHome(lv_event_t* e) { lv_scr_load(scr_home); }
+void navTime(lv_event_t* e) { lv_scr_load(scr_time); }
+void navConnection(lv_event_t* e) {
+  //Also used as the WiFi scan screen's "< Cancel" button -- see
+  //g_manualSetupIsRuntimeChange's own comment for why this only exits
+  //the manual-setup wait loop during a live "Change WiFi", not during
+  //setup()'s boot-time fallback.
+  if (g_manualSetupIsRuntimeChange) {
+    g_manualSetupIsRuntimeChange = false;
+    g_awaitingManualWifiSetup = false;
+  }
+  //Same pattern, for the MQTT host screen's "< Cancel" button.
+  if (g_mqttManualSetupIsRuntimeChange) {
+    g_mqttManualSetupIsRuntimeChange = false;
+    g_awaitingManualMqttSetup = false;
+  }
+  lv_scr_load(scr_connection);
+}
+void navBattery(lv_event_t* e) {
+  lv_scr_load(scr_battery);
+  rebuildBatteryDayCurve(); //always fresh on entry, same reasoning as populateWifiScanList()
+  g_daySocDirty = false;
+}
+void navGrid(lv_event_t* e) { lv_scr_load(scr_grid); }
+void navAlmanac(lv_event_t* e) {
+  lv_scr_load(scr_almanac);
+  updateAlmanacScreen(); //always fresh on entry, same reasoning as navBattery()
+  g_almanacDataDirty = false;
+}
+
+void makeBackButton(lv_obj_t* parent) {
+  lv_obj_t* back = lv_label_create(parent);
+  lv_label_set_text(back, "< Home");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 30);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navHome, LV_EVENT_CLICKED, NULL);
+}
+
+//---- WiFi manual setup: network scan + password/keyboard ----
+//Reached only when both bounded connectToWiFi() attempts (secrets.h,
+//then stored KVStore credentials) fail, or via the Connection screen's
+//"Change WiFi" button. Blocking connect attempts here (tryConnectWiFi
+//inside attemptWifiConnectFromSetup) are deliberate -- this is a rare,
+//user-attended setup flow, not a hot path, and every other WiFi attempt
+//in this sketch already blocks for the same reason.
+
+void navWifiScanRescan(lv_event_t* e) {
+  populateWifiScanList();
+  lv_scr_load(scr_wifi_scan);
+}
+
+//Connection screen's "Change WiFi" button. Doesn't touch the current
+//connection or its stored KVStore credentials up front -- just opens the
+//same network-scan/password flow used at boot. A successful new
+//connection overwrites the stored credentials itself (see
+//attemptWifiConnectFromSetup below), and canceling out (the scan
+//screen's "< Cancel", which actually exits this wait loop here -- see
+//g_manualSetupIsRuntimeChange) leaves the existing connection untouched.
+//
+//This flow's blocking wait loop (lv_timer_handler() in a while loop) is
+//only safe to run from a context that ISN'T already nested inside a call
+//to lv_timer_handler(). Confirmed on real hardware, twice: running it
+//directly in the click event callback froze the board instantly on tap
+//(the callback is itself already running *inside* lv_timer_handler(),
+//since LVGL dispatches click events as part of its own timer/refresh
+//cycle, so calling lv_timer_handler() again from within it re-enters
+//LVGL's own dispatch while it's still on the call stack); deferring via
+//lv_async_call() didn't help either, since that's just a zero-delay LVGL
+//timer serviced BY lv_timer_handler(), not something that actually runs
+//outside of it. setup()'s identical while-loop pattern is only safe
+//because it runs before loop() -- and hence before any event dispatch --
+//ever starts. The actual fix: the click handler below only sets a flag;
+//loop() itself (which calls lv_timer_handler(), never the reverse) is
+//what checks the flag and runs the real flow, from a genuinely top-level
+//context.
+//Only ever called from loop()'s g_wifiChangeRequested check below --
+//i.e. only from the Connection screen's "Change WiFi" button, always a
+//live runtime change with a real prior connection. Boot-time fallback
+//(setup()'s own inline wait loop) never calls this.
+void startChangeWifiFlow() {
+  //Captured before populateWifiScanList()'s own WiFi.disconnect()
+  //(needed for a clean scan) tears down whatever connection existed
+  //before the user made any choice -- lets the post-loop code reconnect
+  //to what was actually working, instead of leaving a live connection
+  //dead just because the user opened this screen and backed out.
+  char priorSsid[sizeof(ssid)];
+  char priorPassword[sizeof(password)];
+  strncpy(priorSsid, ssid, sizeof(priorSsid));
+  priorSsid[sizeof(priorSsid) - 1] = '\0';
+  strncpy(priorPassword, password, sizeof(priorPassword));
+  priorPassword[sizeof(priorPassword) - 1] = '\0';
+
+  g_manualSetupIsRuntimeChange = true;
+  g_awaitingManualWifiSetup = true;
+  populateWifiScanList();
+  lv_scr_load(scr_wifi_scan);
+  while (g_awaitingManualWifiSetup) {
+    lv_timer_handler();
+    serviceDevCommands();
+    if (g_pendingWifiAttempt) {
+      g_pendingWifiAttempt = false;
+      attemptWifiConnectFromSetup(g_pendingAttemptSsid, g_pendingAttemptPassword);
+    }
+    delay(5);
+  }
+  //Not connected here means either a cancel or every attempt failed --
+  //never a successful new connection (that path already returns
+  //connected). Reconnect to what was working before rather than leaving
+  //the board disconnected over a cancelled/failed change.
+  if (WiFi.status() != WL_CONNECTED && priorSsid[0] != '\0') {
+    tryConnectWiFi(priorSsid, priorPassword, 3, 15000);
+  }
+  //Reflects whatever's actually true now rather than assuming success --
+  //covers a genuinely new connection, a restored prior one, and the
+  //rare case where even that reconnect attempt failed.
+  setConnStatusIndicator(WiFi.status() == WL_CONNECTED ? WIFI_UI_CONNECTED : WIFI_UI_NOT_CONNECTED);
+
+  //populateWifiScanList()'s WiFi.disconnect() above tears down the TCP
+  //socket the MQTT client was using, regardless of whether this flow ends
+  //in a cancel, a failed attempt, or a genuinely new connection -- and
+  //this sketch has no standing MQTT reconnect loop (see loop()'s own
+  //comment on lbl_conn_broker), so without this the broker connection
+  //stays dead until the user separately visits Change MQTT, even though
+  //nothing about the MQTT config itself changed. Same "only disconnect if
+  //an actual change happened" principle as the WiFi restore above, applied
+  //to MQTT: reconnect with whatever credentials were already in effect
+  //(mqttHost/mqttUserRuntime/mqttPassRuntime), not new ones.
+  if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
+    if (tryConnectMqtt(mqttHost, mqttUserRuntime, mqttPassRuntime)) {
+      subscribeAllMqttTopics();
+    }
+  }
+  logMemStatus("after ChangeWifi");
+}
+
+void onChangeWifiClicked(lv_event_t* e) {
+  g_wifiChangeRequested = true;
+}
+
+//Called only from the manual-setup wait loop itself (see
+//g_pendingWifiAttempt), never directly from an event callback anymore --
+//forcePaint() here is safe again now that the call site itself isn't
+//nested inside an active lv_timer_handler()/event dispatch (same
+//nesting depth as the wait loop's own lv_timer_handler() calls).
+void attemptWifiConnectFromSetup(const char* s, const char* p) {
+  lv_obj_clear_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_text(wifiConnectStatusLbl, "Connecting...");
+  lv_obj_set_style_text_color(wifiConnectStatusLbl, COLOR_AMBER, 0);
+  lv_scr_load(scr_wifi_password);  //open-network path can call this straight from the scan screen -- show the status somewhere it'll be seen
+  forcePaint();                    //paint "Connecting..." before the blocking attempt below
+
+  if (tryConnectWiFi(s, p, 3, 15000)) {
+    strncpy(ssid, s, sizeof(ssid) - 1);
+    ssid[sizeof(ssid) - 1] = '\0';
+    strncpy(password, p, sizeof(password) - 1);
+    password[sizeof(password) - 1] = '\0';
+    saveWifiCredentials(s, p);
+    setNtpTime();
+    g_awaitingManualWifiSetup = false;
+    //Was only ever reset on the Cancel path (navConnection()) -- left
+    //true forever after a SUCCESSFUL runtime change, a real bug (found
+    //2026-07-17) though not confirmed as the cause of the "works once,
+    //not afterwards" hang reported on real hardware. Reset here too for
+    //correctness regardless.
+    g_manualSetupIsRuntimeChange = false;
+    lv_scr_load(scr_home);
+  } else {
+    lv_label_set_text(wifiConnectStatusLbl, "Couldn't connect. Check the password and try again.");
+    lv_obj_set_style_text_color(wifiConnectStatusLbl, COLOR_RED, 0);
+  }
+}
+
+//Only records what to try -- see g_pendingWifiAttempt's comment for why
+//this can't call attemptWifiConnectFromSetup() directly anymore.
+void onWifiPasswordSubmit(lv_event_t* e) {
+  const char* pw = lv_textarea_get_text(wifiPasswordTextarea);
+  strncpy(g_pendingAttemptSsid, g_selectedWifiSsid, sizeof(g_pendingAttemptSsid) - 1);
+  g_pendingAttemptSsid[sizeof(g_pendingAttemptSsid) - 1] = '\0';
+  strncpy(g_pendingAttemptPassword, pw, sizeof(g_pendingAttemptPassword) - 1);
+  g_pendingAttemptPassword[sizeof(g_pendingAttemptPassword) - 1] = '\0';
+  g_pendingWifiAttempt = true;
+}
+
+void onWifiNetworkSelected(lv_event_t* e) {
+  int idx = (int)(intptr_t)lv_event_get_user_data(e);
+  strncpy(g_selectedWifiSsid, g_wifiScanSsid[idx], sizeof(g_selectedWifiSsid) - 1);
+  g_selectedWifiSsid[sizeof(g_selectedWifiSsid) - 1] = '\0';
+  g_selectedWifiSecure = g_wifiScanSecure[idx];
+
+  if (g_selectedWifiSecure) {
+    char hdr[48];
+    snprintf(hdr, sizeof(hdr), "Enter password for %s", g_selectedWifiSsid);
+    lv_label_set_text(wifiPasswordSsidLbl, hdr);
+    lv_textarea_set_text(wifiPasswordTextarea, "");
+    lv_obj_add_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+    lv_scr_load(scr_wifi_password);
+  } else {
+    //Open network -- no password screen, but still deferred to the wait
+    //loop rather than called directly (see g_pendingWifiAttempt).
+    strncpy(g_pendingAttemptSsid, g_selectedWifiSsid, sizeof(g_pendingAttemptSsid) - 1);
+    g_pendingAttemptSsid[sizeof(g_pendingAttemptSsid) - 1] = '\0';
+    g_pendingAttemptPassword[0] = '\0';
+    g_pendingWifiAttempt = true;
+  }
+}
+
+//---- MQTT manual setup: host + username + password, three screens ----
+//Reached when connectToMqttBroker() fails both its attempts (stored
+//settings, then secrets.h), or via the Connection screen's "Change
+//MQTT" button. Same reentrancy-safe flag-deferred pattern as the WiFi
+//flow throughout -- see g_wifiChangeRequested's comment for why.
+
+void navMqttHostScreen(lv_event_t* e) {
+  attachMqttKeyboard(scr_mqtt_host, mqttHostTextarea, LV_KEYBOARD_MODE_NUMBER);
+  lv_scr_load(scr_mqtt_host);
+}
+void navMqttUsernameScreen(lv_event_t* e) {
+  attachMqttKeyboard(scr_mqtt_username, mqttUsernameTextarea, LV_KEYBOARD_MODE_TEXT_LOWER);
+  lv_scr_load(scr_mqtt_username);
+}
+
+void onChangeMqttClicked(lv_event_t* e) {
+  g_mqttChangeRequested = true;
+}
+
+//Connection screen's "Change MQTT" button, run from loop() (see the
+//g_mqttChangeRequested check there) -- never called directly from the
+//click callback itself, same reason as startChangeWifiFlow().
+void startChangeMqttFlow() {
+  g_mqttManualSetupIsRuntimeChange = true;
+  g_awaitingManualMqttSetup = true;
+  lv_textarea_set_text(mqttHostTextarea, mqttHost);  //prefill with the current value for editing
+  //Re-attach to the host screen in NUMBER mode -- a prior use of this
+  //flow may have left the shared keyboard parented to the password
+  //screen in TEXT_LOWER mode.
+  attachMqttKeyboard(scr_mqtt_host, mqttHostTextarea, LV_KEYBOARD_MODE_NUMBER);
+  lv_scr_load(scr_mqtt_host);
+  while (g_awaitingManualMqttSetup) {
+    lv_timer_handler();
+    serviceDevCommands();
+    //This blocking loop replaces loop()'s own top-level mqttClient.poll()
+    //call for as long as the user sits on the host/username/password
+    //screens (loop() itself is suspended on the call that got us here) --
+    //without this, poll()'s keepalive PINGREQ never goes out, so a broker
+    //that's stricter about its keepalive window can silently drop the
+    //still-good, unrelated MQTT session while the user is just looking at
+    //(or cancelling out of) this screen, well before any connect() attempt
+    //ever runs. Root cause of "cancelling Change MQTT still disconnects
+    //MQTT" -- connect() itself is provably not the culprit here, since it's
+    //never called at all on the cancel path.
+    mqttClient.poll();
+    if (g_pendingMqttAttempt) {
+      g_pendingMqttAttempt = false;
+      attemptMqttConnectFromSetup(g_pendingMqttHost, g_pendingMqttUser, g_pendingMqttPass);
+    }
+    delay(5);
+  }
+  //Safety net alongside the poll() fix above -- covers any other reason
+  //the session could have dropped during the wait (e.g. a real network
+  //hiccup) on the cancel path, where nothing else in this function
+  //reconnects. The success path already leaves mqttClient connected with
+  //the NEW credentials by this point, so this is a no-op there; the
+  //failed-attempt path already reconnects with the prior credentials
+  //inside attemptMqttConnectFromSetup() itself. Same "only disconnect if
+  //an actual change happened" principle as startChangeWifiFlow()'s
+  //identical check.
+  if (!mqttClient.connected()) {
+    if (tryConnectMqtt(mqttHost, mqttUserRuntime, mqttPassRuntime)) {
+      subscribeAllMqttTopics();
+    }
+  }
+  logMemStatus("after ChangeMqtt");
+}
+
+//Called only from the manual-setup wait loop itself (see
+//g_pendingMqttAttempt), never directly from an event callback -- same
+//nesting hazard as attemptWifiConnectFromSetup().
+void attemptMqttConnectFromSetup(const char* host, const char* user, const char* pass) {
+  lv_obj_clear_flag(mqttConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_text(mqttConnectStatusLbl, "Connecting...");
+  lv_obj_set_style_text_color(mqttConnectStatusLbl, COLOR_AMBER, 0);
+  lv_scr_load(scr_mqtt_password);  //status is shown wherever the flow ends up, same as the WiFi password screen
+  forcePaint();
+
+  if (tryConnectMqtt(host, user, pass)) {
+    strncpy(mqttHost, host, sizeof(mqttHost) - 1); mqttHost[sizeof(mqttHost) - 1] = '\0';
+    strncpy(mqttUserRuntime, user, sizeof(mqttUserRuntime) - 1); mqttUserRuntime[sizeof(mqttUserRuntime) - 1] = '\0';
+    strncpy(mqttPassRuntime, pass, sizeof(mqttPassRuntime) - 1); mqttPassRuntime[sizeof(mqttPassRuntime) - 1] = '\0';
+    saveMqttCredentials(host, user, pass);
+    subscribeAllMqttTopics();
+    g_awaitingManualMqttSetup = false;
+    //Same fix/rationale as the identical line in attemptWifiConnectFromSetup().
+    g_mqttManualSetupIsRuntimeChange = false;
+    lv_scr_load(scr_home);
+  } else {
+    lv_label_set_text(mqttConnectStatusLbl, "Couldn't connect. Check the broker IP and try again.");
+    lv_obj_set_style_text_color(mqttConnectStatusLbl, COLOR_RED, 0);
+    //MqttClient::connect() (inside tryConnectMqtt() above) unconditionally
+    //tears down any existing session before attempting the new one, even
+    //if that attempt then fails -- so reconnect to the prior, still-valid
+    //credentials (only overwritten on success above) and restore
+    //subscriptions (a fresh session has none), rather than leaving the
+    //board disconnected over a failed change. Boot fallback has no prior
+    //connection to restore, hence the runtime-change guard.
+    if (g_mqttManualSetupIsRuntimeChange) {
+      if (tryConnectMqtt(mqttHost, mqttUserRuntime, mqttPassRuntime)) {
+        subscribeAllMqttTopics();
+      }
+    }
+  }
+}
+
+//Only records what to try -- see g_pendingMqttAttempt's comment for why
+//this can't call attemptMqttConnectFromSetup() directly.
+void onMqttHostSubmit(lv_event_t* e) {
+  const char* h = lv_textarea_get_text(mqttHostTextarea);
+  strncpy(g_pendingMqttHost, h, sizeof(g_pendingMqttHost) - 1);
+  g_pendingMqttHost[sizeof(g_pendingMqttHost) - 1] = '\0';
+  lv_textarea_set_text(mqttUsernameTextarea, mqttUserRuntime);  //prefill with the current value
+  attachMqttKeyboard(scr_mqtt_username, mqttUsernameTextarea, LV_KEYBOARD_MODE_TEXT_LOWER);
+  lv_scr_load(scr_mqtt_username);
+}
+
+void onMqttUsernameSubmit(lv_event_t* e) {
+  const char* u = lv_textarea_get_text(mqttUsernameTextarea);
+  strncpy(g_pendingMqttUser, u, sizeof(g_pendingMqttUser) - 1);
+  g_pendingMqttUser[sizeof(g_pendingMqttUser) - 1] = '\0';
+  lv_textarea_set_text(mqttPasswordTextarea, mqttPassRuntime);  //prefill with the current value
+  lv_obj_add_flag(mqttConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  attachMqttKeyboard(scr_mqtt_password, mqttPasswordTextarea, LV_KEYBOARD_MODE_TEXT_LOWER);
+  lv_scr_load(scr_mqtt_password);
+}
+
+void onMqttPasswordSubmit(lv_event_t* e) {
+  const char* p = lv_textarea_get_text(mqttPasswordTextarea);
+  strncpy(g_pendingMqttPass, p, sizeof(g_pendingMqttPass) - 1);
+  g_pendingMqttPass[sizeof(g_pendingMqttPass) - 1] = '\0';
+  g_pendingMqttAttempt = true;
+}
+
+//Clears and rebuilds the scrollable row list from a fresh
+//WiFi.scanNetworks() -- called on entry to the scan screen and every
+//time the user backs into it, since results go stale (networks
+//appear/disappear, signal changes) and there's no reason to cache them
+//across a rare, user-attended setup flow.
+void populateWifiScanList() {
+  lv_obj_clean(wifiScanList);
+  lv_obj_clear_flag(wifiScanStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  lv_label_set_text(wifiScanStatusLbl, "Scanning...");
+  lv_obj_set_style_text_color(wifiScanStatusLbl, COLOR_TEXT_MUTED, 0);
+  forcePaint();  //paint "Scanning..." before the blocking scan below
+
+  //Confirmed on real hardware: calling WiFi.scanNetworks() while still
+  //associated to an AP (only possible via the Connection screen's
+  //"Change WiFi" button -- every boot-time call here happens before any
+  //connection exists) hung the board completely, with no way to recover
+  //short of a physical reset. Adding WiFi.disconnect() alone did NOT fix
+  //it -- still hung, confirmed on real hardware a second time -- because
+  //scanNetworks() was called immediately after, before the module's
+  //firmware had actually finished tearing down the old association. This
+  //radio needs real wall-clock settling time after a disconnect before
+  //it can scan cleanly. A no-op delay when already disconnected, so safe
+  //for every caller.
+  WiFi.disconnect();
+  delay(1000);
+  int n = WiFi.scanNetworks();
+  g_wifiScanCount = (n > 0) ? min(n, MAX_WIFI_SCAN_RESULTS) : 0;
+
+  if (g_wifiScanCount == 0) {
+    lv_label_set_text(wifiScanStatusLbl, "No networks found. Tap Cancel and back in to rescan.");
+    return;
+  }
+  lv_obj_add_flag(wifiScanStatusLbl, LV_OBJ_FLAG_HIDDEN);
+
+  for (int i = 0; i < g_wifiScanCount; i++) {
+    String s = WiFi.SSID(i);
+    //hidden/non-broadcasting networks surface as a scan result with an
+    //empty SSID -- skip building a row for them, since there's nothing
+    //meaningful to tap (this manual-setup flow doesn't support typing an
+    //SSID by hand for a hidden network). g_wifiScanSsid[i] stays
+    //zeroed/unused for this slot, so it can never be selected.
+    if (s.length() == 0) continue;
+    s.toCharArray(g_wifiScanSsid[i], sizeof(g_wifiScanSsid[i]));
+    g_wifiScanSecure[i] = WiFi.encryptionType(i) != ENC_TYPE_NONE;
+    g_wifiScanRssi[i] = WiFi.RSSI(i);
+
+    lv_obj_t* row = lv_obj_create(wifiScanList);
+    //width lv_pct(100) of the list's own content area, not a hardcoded
+    //720 -- a hardcoded row width equal to the *list's outer* width
+    //overflowed past the list's 4px side padding, which combined with the
+    //"Secured"/"Open" label below pushed text past the physical 800px
+    //screen edge (caught by a real screen-dump capture, text rendered as
+    //"Secure" with the trailing "d" clipped off).
+    lv_obj_set_width(row, lv_pct(100));
+    lv_obj_set_height(row, 60);
+    lv_obj_set_style_bg_color(row, lv_color_hex(0x17191c), 0);
+    lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(row, 0, 0);
+    lv_obj_set_style_radius(row, 8, 0);
+    lv_obj_set_style_pad_all(row, 0, 0);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(row, onWifiNetworkSelected, LV_EVENT_CLICKED, (void*)(intptr_t)i);
+
+    makeLabel(row, g_wifiScanSsid[i], COLOR_TEXT, 20, 18);
+
+    //signal bars: 4 small rects, increasing height, lit up to the
+    //RSSI-derived level -- matches the mockup's design, built from plain
+    //lv_obj rects rather than an icon font, same convention as the rest
+    //of this sketch.
+    int level = g_wifiScanRssi[i] > -50 ? 4 : g_wifiScanRssi[i] > -60 ? 3 : g_wifiScanRssi[i] > -70 ? 2 : 1;
+    for (int b = 0; b < 4; b++) {
+      lv_coord_t barH = 6 + b * 3;
+      lv_obj_t* bar = lv_obj_create(row);
+      lv_obj_set_size(bar, 5, barH);
+      lv_obj_set_pos(bar, 560 + b * 9, 30 - barH);
+      lv_obj_set_style_bg_color(bar, b < level ? COLOR_TEAL : COLOR_TRACK, 0);
+      lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+      lv_obj_set_style_border_width(bar, 0, 0);
+      lv_obj_set_style_radius(bar, 1, 0);
+      lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+      lv_obj_clear_flag(bar, LV_OBJ_FLAG_CLICKABLE);
+    }
+
+    //"Secured"/"Open" shortened to "Lock"/"Open" -- both words need to fit
+    //in the narrow gap between the signal bars (ending at row-relative
+    //x=592) and the row's own right edge (~712 at this row width), and
+    //"Secured" (7 chars) doesn't fit that gap at this sketch's font size
+    //(confirmed: it clipped). makeRowLabel's right-aligned fixed-width box
+    //(same pattern used on the Connection screen) keeps the text's right
+    //edge pinned regardless of exact glyph width.
+    makeRowLabel(row, g_wifiScanSecure[i] ? "Lock" : "Open", 702, 18, 95);
+  }
+}
+
+void buildWifiScanScreen() {
+  scr_wifi_scan = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_wifi_scan);
+  lv_label_set_text(back, "< Cancel");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 30);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navConnection, LV_EVENT_CLICKED, NULL);
+
+  makeLabel(scr_wifi_scan, "Select WiFi network", COLOR_TEXT_MUTED, 40, 70);
+
+  wifiScanStatusLbl = makeLabel(scr_wifi_scan, "", COLOR_TEXT_MUTED, 40, 110);
+  lv_obj_add_flag(wifiScanStatusLbl, LV_OBJ_FLAG_HIDDEN);
+
+  wifiScanList = lv_obj_create(scr_wifi_scan);
+  lv_obj_set_pos(wifiScanList, 40, 110);
+  lv_obj_set_size(wifiScanList, 720, 340);
+  lv_obj_set_style_bg_opa(wifiScanList, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(wifiScanList, 0, 0);
+  lv_obj_set_style_pad_all(wifiScanList, 4, 0);
+  lv_obj_set_style_pad_row(wifiScanList, 10, 0);
+  lv_obj_set_flex_flow(wifiScanList, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(wifiScanList, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+}
+
+void buildWifiPasswordScreen() {
+  scr_wifi_password = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_wifi_password);
+  lv_label_set_text(back, "< Back");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 18);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navWifiScanRescan, LV_EVENT_CLICKED, NULL);
+
+  //y-offsets nudged down a few px at each step (was 50/82/137, back-to-label
+  //and label-to-textarea nearly touched/overlapped on real hardware -- the
+  //original deltas assumed a shorter line height than this default font
+  //actually renders) so Back/the caption/the text entry read as visibly
+  //separate rows instead of squished together.
+  wifiPasswordSsidLbl = makeLabel(scr_wifi_password, "Enter password for", COLOR_TEXT_MUTED, 40, 58);
+
+  wifiPasswordTextarea = lv_textarea_create(scr_wifi_password);
+  lv_obj_set_size(wifiPasswordTextarea, 720, 46);
+  lv_obj_set_pos(wifiPasswordTextarea, 40, 98);
+  //Plain text, not password-masked -- per request, so what's typed on
+  //the on-screen keyboard is directly checkable against the real network
+  //password instead of trusting a dot count.
+  lv_textarea_set_one_line(wifiPasswordTextarea, true);
+  lv_textarea_set_max_length(wifiPasswordTextarea, 63);
+  //fires on the keyboard's OK/checkmark key AND on Enter typed directly
+  //(lv_keyboard.c sends LV_EVENT_READY to the bound textarea in both
+  //cases) -- one attachment point covers both.
+  lv_obj_add_event_cb(wifiPasswordTextarea, onWifiPasswordSubmit, LV_EVENT_READY, NULL);
+
+  wifiConnectStatusLbl = makeLabel(scr_wifi_password, "", COLOR_RED, 40, 153);
+  //makeLabel() sets no width/wrap, so long status text (the "Couldn't
+  //connect..." error) was silently running off the 800px screen edge
+  //with no wrapping at all -- caught on real hardware testing the MQTT
+  //setup screens below, which share this exact pattern. Explicit width +
+  //wrap fixes both.
+  lv_obj_set_width(wifiConnectStatusLbl, 720);
+  lv_label_set_long_mode(wifiConnectStatusLbl, LV_LABEL_LONG_MODE_WRAP);
+  lv_obj_add_flag(wifiConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+
+  wifiKeyboard = lv_keyboard_create(scr_wifi_password);
+  lv_obj_set_size(wifiKeyboard, 800, 260);
+  lv_keyboard_set_textarea(wifiKeyboard, wifiPasswordTextarea);
+  //lv_keyboard_create()'s own constructor bottom-docks the keyboard via
+  //lv_obj_align(BOTTOM_MID) against its *default* 50%-height size, before
+  //this call ever resizes it to 260px. That alignment is sticky (LVGL
+  //re-applies it on later internal layout passes, e.g. inside
+  //lv_keyboard_set_textarea()'s own row/font recalculation) and was
+  //observed re-firing against a stale intermediate height, landing the
+  //keyboard at y=440 instead of y=220 -- only its first ~40px row was
+  //then visible above the physical 480px screen bottom, with the other
+  //three rows rendered off-screen (confirmed via lv_obj_get_y() reading
+  //440 despite lv_obj_get_height() correctly reading 260, and via a
+  //screen-dump capture showing only one keyboard row). Re-asserting the
+  //bottom alignment here, after every size/textarea call that could have
+  //perturbed it, forces one final recalculation against the real 260px
+  //height instead of fighting the widget's own docking behavior with a
+  //fixed lv_obj_set_pos.
+  lv_obj_align(wifiKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+}
+
+//---- MQTT manual setup: host + username + password screens ----
+//Host uses a numeric/phone-pad keyboard (LV_KEYBOARD_MODE_NUMBER --
+//digits, ".", backspace, OK) instead of the full alphanumeric one,
+//since a broker IP is only ever digits and dots. accepted_chars is a
+//second layer on top of that (belt-and-suspenders against the
+//keyboard's own "ABC" mode-switch button).
+//
+//All three screens share ONE mqttKeyboard object (see its declaration
+//comment for why) rather than each creating their own -- attached via
+//attachMqttKeyboard() on every screen transition instead of at build
+//time.
+void attachMqttKeyboard(lv_obj_t* screen, lv_obj_t* textarea, lv_keyboard_mode_t mode) {
+  lv_obj_set_parent(mqttKeyboard, screen);
+  lv_keyboard_set_mode(mqttKeyboard, mode);
+  lv_keyboard_set_textarea(mqttKeyboard, textarea);
+  //Sticky-bottom-alignment fix -- see the identical comment on wifiKeyboard.
+  lv_obj_align(mqttKeyboard, LV_ALIGN_BOTTOM_MID, 0, 0);
+}
+
+void buildMqttHostScreen() {
+  scr_mqtt_host = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_mqtt_host);
+  lv_label_set_text(back, "< Cancel");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 18);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navConnection, LV_EVENT_CLICKED, NULL);
+
+  //Same y-offset nudge (50/82 -> 58/98) as buildWifiPasswordScreen()/
+  //buildMqttPasswordScreen() -- identical squished Cancel/caption/text
+  //entry rows on this screen too.
+  makeLabel(scr_mqtt_host, "MQTT broker IP address", COLOR_TEXT_MUTED, 40, 58);
+
+  mqttHostTextarea = lv_textarea_create(scr_mqtt_host);
+  lv_obj_set_size(mqttHostTextarea, 720, 46);
+  lv_obj_set_pos(mqttHostTextarea, 40, 98);
+  lv_textarea_set_one_line(mqttHostTextarea, true);
+  lv_textarea_set_max_length(mqttHostTextarea, 63);
+  lv_textarea_set_accepted_chars(mqttHostTextarea, "0123456789.");
+  lv_obj_add_event_cb(mqttHostTextarea, onMqttHostSubmit, LV_EVENT_READY, NULL);
+
+  //The one shared keyboard is created here (host screen builds first)
+  //and reparented to whichever MQTT screen needs it from here on.
+  mqttKeyboard = lv_keyboard_create(scr_mqtt_host);
+  lv_obj_set_size(mqttKeyboard, 800, 260);
+  attachMqttKeyboard(scr_mqtt_host, mqttHostTextarea, LV_KEYBOARD_MODE_NUMBER);
+}
+
+void buildMqttUsernameScreen() {
+  scr_mqtt_username = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_mqtt_username);
+  lv_label_set_text(back, "< Back");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 18);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navMqttHostScreen, LV_EVENT_CLICKED, NULL);
+
+  //Same y-offset nudge (50/82 -> 58/98) as the other MQTT/WiFi setup
+  //screens -- identical squished Back/caption/text entry rows.
+  makeLabel(scr_mqtt_username, "MQTT username", COLOR_TEXT_MUTED, 40, 58);
+
+  mqttUsernameTextarea = lv_textarea_create(scr_mqtt_username);
+  lv_obj_set_size(mqttUsernameTextarea, 720, 46);
+  lv_obj_set_pos(mqttUsernameTextarea, 40, 98);
+  lv_textarea_set_one_line(mqttUsernameTextarea, true);
+  lv_textarea_set_max_length(mqttUsernameTextarea, 32);
+  lv_obj_add_event_cb(mqttUsernameTextarea, onMqttUsernameSubmit, LV_EVENT_READY, NULL);
+  //Keyboard itself is attached on transition into this screen (see
+  //onMqttHostSubmit()), not here -- it doesn't exist yet at this point
+  //in setup() (buildMqttHostScreen() creates it, and build order across
+  //these three isn't guaranteed relative to each other beyond host-first).
+}
+
+void buildMqttPasswordScreen() {
+  scr_mqtt_password = makeScreenRoot();
+  lv_obj_t* back = lv_label_create(scr_mqtt_password);
+  lv_label_set_text(back, "< Back");
+  lv_obj_set_style_text_color(back, COLOR_TEXT_MUTED, 0);
+  lv_obj_set_pos(back, 40, 18);
+  lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(back, navMqttUsernameScreen, LV_EVENT_CLICKED, NULL);
+
+  //Same y-offset nudge (50/82/137 -> 58/98/153) as buildWifiPasswordScreen()
+  //-- identical squished-row issue on this screen, same fix.
+  makeLabel(scr_mqtt_password, "MQTT password", COLOR_TEXT_MUTED, 40, 58);
+
+  mqttPasswordTextarea = lv_textarea_create(scr_mqtt_password);
+  lv_obj_set_size(mqttPasswordTextarea, 720, 46);
+  lv_obj_set_pos(mqttPasswordTextarea, 40, 98);
+  //Plain text, not password-masked -- same rationale/precedent as the
+  //WiFi password field (see buildWifiPasswordScreen()'s comment).
+  lv_textarea_set_one_line(mqttPasswordTextarea, true);
+  lv_textarea_set_max_length(mqttPasswordTextarea, 63);
+  lv_obj_add_event_cb(mqttPasswordTextarea, onMqttPasswordSubmit, LV_EVENT_READY, NULL);
+
+  mqttConnectStatusLbl = makeLabel(scr_mqtt_password, "", COLOR_RED, 40, 153);
+  //See the identical fix/comment on wifiConnectStatusLbl -- makeLabel()
+  //sets no width/wrap, so this ran off the screen edge uncaught until a
+  //real-hardware capture showed it clipping mid-sentence.
+  lv_obj_set_width(mqttConnectStatusLbl, 720);
+  lv_label_set_long_mode(mqttConnectStatusLbl, LV_LABEL_LONG_MODE_WRAP);
+  lv_obj_add_flag(mqttConnectStatusLbl, LV_OBJ_FLAG_HIDDEN);
+  //Keyboard attached on transition into this screen (see
+  //onMqttUsernameSubmit()), same reasoning as the username screen above.
+}
+
+//---- Home screen ----
+void buildHomeScreen() {
+  scr_home = makeScreenRoot();
+
+  //top-left quadrant: time / weather / TOU -- tap navigates to Time screen
+  lv_obj_t* q_time = lv_obj_create(scr_home);
+  lv_obj_set_size(q_time, 396, 236);
+  lv_obj_set_pos(q_time, 2, 2);
+  lv_obj_set_style_bg_opa(q_time, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(q_time, 0, 0);
+  //same default-padding issue as makeScreenRoot() -- see that function's
+  //comment. This one mattered most: it's where the TOU pill clipping was
+  //actually traced to.
+  lv_obj_set_style_pad_all(q_time, 0, 0);
+  lv_obj_add_flag(q_time, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(q_time, navTime, LV_EVENT_CLICKED, NULL);
+
+  lbl_home_clock = makeLabel(q_time, "6:07 PM", COLOR_TEXT);
+  lv_obj_align(lbl_home_clock, LV_ALIGN_TOP_MID, 0, 55);
+  lbl_home_date = makeLabel(q_time, "Monday, July 13", COLOR_TEXT_MUTED);
+  lv_obj_align(lbl_home_date, LV_ALIGN_TOP_MID, 0, 92);
+
+  //pushed down from 122 -- the date label above has descenders (the 'y' in
+  //"Monday"/"July") that this pill's opaque background was clipping into
+  //Just an ordinary build-time placeholder here, not a worst-case one --
+  //unlike pill_home_tou (all three real rate strings are the same length,
+  //so its fixed width never needs to change), the weather condition
+  //varies a lot in length ("Sunny" vs "Lightning-rainy"). Sizing the pill
+  //for the worst case made it wider than its own quadrant once centered,
+  //pushing past the screen's left edge and triggering scr_home's default
+  //scrollable behavior. resizeAutoPillText() (see its own comment) instead
+  //re-fits this pill to each real value's own width every update.
+  weather_pill = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_TEXT, "Cloudy, 68\xC2\xB0""F >", 16, 40);
+  lv_obj_align(weather_pill, LV_ALIGN_TOP_MID, 0, 134);
+  lv_obj_add_flag(weather_pill, LV_OBJ_FLAG_CLICKABLE);
+  //LVGL doesn't bubble click events to parents unless LV_OBJ_FLAG_EVENT_BUBBLE
+  //is set (it isn't, here), so this fires on its own without also triggering
+  //q_time's navTime handler -- matches the mockup's "weather links to Almanac,
+  //not Time" behavior with no extra plumbing needed.
+  lv_obj_add_event_cb(weather_pill, navAlmanac, LV_EVENT_CLICKED, NULL);
+
+  //widened the gap from the weather pill above (was 40px pill-top-to-pill-top,
+  //not enough clearance on real hardware -- the two pills' text visibly
+  //collided in a hardware photo) to a clearer ~56px
+  //shorter than the Time detail screen's version on purpose -- a
+  //screen-exporter capture showed the full "On-peak - $0.38/kWh" text
+  //overflowing past this quadrant's 396px width even after the auto-pill
+  //fix (the pill itself no longer clips its own text, but nothing clips
+  //the pill to the quadrant, so an oversized pill spills into the
+  //neighboring quadrant/screen edge instead). The rate color already
+  //conveys "peak" without spelling it out at this compact scale; the full
+  //phrase still appears on the dedicated Time & rates screen, which has
+  //room for it.
+  //Background switched from the old fixed COLOR_PILL_AMBER to the same
+  //neutral dark shade as the weather pill above it -- now that the tier
+  //(and its text color) is real and can be green/amber/red, a fixed
+  //amber-ish "warning" background behind green text would look wrong.
+  //Real text/color set every second in loop(); this placeholder is just
+  //sized correctly ($0.XX/kWh is the same length for all three rates).
+  pill_home_tou = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_RED, "$0.65/kWh", 16, 40);
+  lv_obj_align(pill_home_tou, LV_ALIGN_TOP_MID, 0, 190);
+
+  //Hidden by default -- setConnStatusIndicator(WIFI_UI_CONNECTING), called
+  //very early in setup() right after this screen is built, shows this and
+  //hides the four widgets above instead. Kept hidden here (rather than
+  //relying solely on that first call) so there's no frame where the
+  //build-time placeholder text ("6:07 PM" etc.) could flash briefly.
+  lbl_home_boot_status = makeLabel(q_time, "--:--:--\nGetting Time, Date,\nand Status", COLOR_AMBER);
+  lv_obj_set_style_text_align(lbl_home_boot_status, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(lbl_home_boot_status, LV_ALIGN_TOP_MID, 0, 55);
+  lv_obj_add_flag(lbl_home_boot_status, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(lbl_home_clock, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(lbl_home_date, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(weather_pill, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(pill_home_tou, LV_OBJ_FLAG_HIDDEN);
+
+  //top-right quadrant: connection -- tap navigates to Connection screen
+  lv_obj_t* q_conn = lv_obj_create(scr_home);
+  lv_obj_set_size(q_conn, 396, 236);
+  lv_obj_set_pos(q_conn, 402, 2);
+  lv_obj_set_style_bg_opa(q_conn, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(q_conn, 0, 0);
+  lv_obj_set_style_pad_all(q_conn, 0, 0);
+  lv_obj_add_flag(q_conn, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(q_conn, navConnection, LV_EVENT_CLICKED, NULL);
+
+  //Height 60, not 30 -- tall enough for the two-line "Attempting\nto
+  //Connect" text (see setConnStatusIndicator) without it clipping against
+  //the row's own bottom edge; a real capture caught exactly that
+  //clipping at the old 30px height. Harmless for the single-line
+  //Connected/Not-connected states, which just end up with a bit more
+  //vertical centering room.
+  lv_obj_t* conn_row = makeFlexRow(q_conn, 0, 78, 396, 60, 10);
+  lv_obj_set_style_bg_opa(conn_row, LV_OPA_TRANSP, 0);
+  dot_home_conn = makeDot(conn_row, COLOR_STATUS_OK, 0, 0, 10);
+  lbl_home_connState = makeLabel(conn_row, "Connected", COLOR_TEXT);
+
+  //Hidden by default, shown/hidden together with the dot above (see
+  //setConnStatusIndicator) -- no SSID worth showing while still
+  //attempting to connect.
+  lbl_home_ssid = makeLabel(q_conn, "---", COLOR_TEXT_MUTED);
+  lv_obj_align(lbl_home_ssid, LV_ALIGN_TOP_MID, 0, 145);
+  lv_obj_add_flag(lbl_home_ssid, LV_OBJ_FLAG_HIDDEN);
+
+  //bottom-left quadrant: battery -- tap navigates to Battery screen
+  lv_obj_t* q_batt = lv_obj_create(scr_home);
+  lv_obj_set_size(q_batt, 396, 236);
+  lv_obj_set_pos(q_batt, 2, 242);
+  lv_obj_set_style_bg_opa(q_batt, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(q_batt, 0, 0);
+  lv_obj_set_style_pad_all(q_batt, 0, 0);
+  lv_obj_add_flag(q_batt, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(q_batt, navBattery, LV_EVENT_CLICKED, NULL);
+
+  ring_home_battery = makeRing(q_batt, 90, 55, 84, 0, 0, COLOR_TEAL); //angle set live once a reading arrives
+  //Track color per request -- red instead of the default neutral dark
+  //gray, purely cosmetic, doesn't affect the teal SoC arc drawn on top.
+  lv_obj_set_style_arc_color(ring_home_battery, COLOR_RED, LV_PART_MAIN);
+  //Orbiting charge/discharge dot, hidden until real state data arrives.
+  //Orbit center/radius derived from the ring's own x/y/diameter above
+  //(90,55,84): center = (90+42, 55+42), radius = 42 - half the ring's
+  //8px arc width, so the dot rides the arc's own centerline.
+  dot_home_battery = makeDot(q_batt, COLOR_ORBIT_CHARGING, 0, 0, 10);
+  lv_obj_add_flag(dot_home_battery, LV_OBJ_FLAG_HIDDEN);
+  orbitHomeBattery.dot = dot_home_battery;
+  orbitHomeBattery.cx = 132;
+  orbitHomeBattery.cy = 97;
+  orbitHomeBattery.r = 38;
+  //pct and state share the same X (left-justified at "the 100% position"),
+  //per feedback -- these are NOT centered, unlike the connection/grid text.
+  lbl_home_battery_pct = makeLabel(q_batt, "--", COLOR_TEXT, 195, 75);
+  //shorter than "Waiting for data" on purpose -- a screen-exporter capture
+  //showed that string clipped (q_batt is only 396 wide, and this label is
+  //deliberately left-justified at x=195, not centered, leaving just ~200px
+  //before the quadrant's edge)
+  lbl_home_battery_state = makeLabel(q_batt, "No data yet", COLOR_TEXT_MUTED, 195, 105);
+
+  //bottom-right quadrant: grid flow -- tap navigates to Grid flow screen
+  lv_obj_t* q_grid = lv_obj_create(scr_home);
+  lv_obj_set_size(q_grid, 396, 236);
+  lv_obj_set_pos(q_grid, 402, 242);
+  lv_obj_set_style_bg_opa(q_grid, LV_OPA_TRANSP, 0);
+  lv_obj_set_style_border_width(q_grid, 0, 0);
+  lv_obj_set_style_pad_all(q_grid, 0, 0);
+  lv_obj_add_flag(q_grid, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(q_grid, navGrid, LV_EVENT_CLICKED, NULL);
+
+  //Two small rings side by side -- battery power next to grid power --
+  //to test whether they fit in this compact quadrant. Short "Batt"/"Grid"
+  //labels for now, per request, purely to check the fit before refining.
+  //Column height (and the offsets within it) got a real hardware capture
+  //showing genuine clipping at 130px -- that was actually LESS than the
+  //bare-minimum space ring+watts+label needs with zero margin, not just a
+  //tight fit. Widened to 190px with real gaps between each element this
+  //time, not just enough to theoretically clear.
+  const lv_coord_t hColW = 185, hRingD = 65;
+  lv_obj_t* col_home_batt = makeColumn(q_grid, 10, 15, hColW, 190);
+  ring_home_batt_power = makeRing(col_home_batt, (hColW - hRingD) / 2, 0, hRingD, 0, 0, COLOR_TEAL);  //angle set live once battery data arrives
+  lbl_home_batt_watts = makeLabel(col_home_batt, "-- W", COLOR_TEXT);
+  lv_obj_align(lbl_home_batt_watts, LV_ALIGN_TOP_MID, 0, 78);
+  lbl_home_batt_label = makeLabel(col_home_batt, "Battery", COLOR_TEXT_MUTED);
+  lv_obj_align(lbl_home_batt_label, LV_ALIGN_TOP_MID, 0, 118);
+  //Static caption clarifying what this ring measures (feeder power, same
+  //source as the Grid screen's L1/L2 Feeder columns) -- plain text, no
+  //data dependency, so it always shows regardless of whether Unit 1 is
+  //currently publishing. Same +40px rhythm as the ring->watts->label
+  //spacing above it.
+  lv_obj_t* feederCaption = makeLabel(col_home_batt, "Feeder", COLOR_TEXT_DIM);
+  lv_obj_align(feederCaption, LV_ALIGN_TOP_MID, 0, 158);
+
+  lv_obj_t* col_home_grid = makeColumn(q_grid, 200, 15, hColW, 190);
+  ring_home_grid = makeRing(col_home_grid, (hColW - hRingD) / 2, 0, hRingD, 60, 120, COLOR_BLUE_TIDE); //placeholder angle; real needle gauge is a later spiral
+  lbl_home_grid_watts = makeLabel(col_home_grid, "-- W", COLOR_TEXT);
+  lv_obj_align(lbl_home_grid_watts, LV_ALIGN_TOP_MID, 0, 78);
+  //text set ONCE here, never updated -- same static label idea as the
+  //full Grid screen's right-hand ring, only the color changes now that
+  //the 3-state Consuming/Bypassing/Exporting text is retired.
+  lbl_home_grid_status = makeLabel(col_home_grid, "Grid", COLOR_TEXT_MUTED);
+  lv_obj_align(lbl_home_grid_status, LV_ALIGN_TOP_MID, 0, 118);
+}
+
+//---- Time & rates screen ----
+void buildTimeScreen() {
+  scr_time = makeScreenRoot();
+  makeBackButton(scr_time);
+
+  lbl_time_clock = makeLabel(scr_time, "6:07 PM", COLOR_TEXT);
+  lv_obj_align(lbl_time_clock, LV_ALIGN_TOP_MID, 0, 95);
+  lbl_time_date = makeLabel(scr_time, "Monday, July 13", COLOR_TEXT_MUTED);
+  lv_obj_align(lbl_time_date, LV_ALIGN_TOP_MID, 0, 148);
+
+  //Real schedule bar: 6 pre-created segments (weekends/holidays only use
+  //4 of them, the rest hidden), each repositioned/recolored every second
+  //in loop() from buildTouSegments(). Bar geometry unchanged: x=100,
+  //600px wide over 24 hours = 25px/hour. Segments get a small uniform
+  //corner radius rather than only-the-outer-edges rounding -- a minor,
+  //acceptable cosmetic simplification versus the old single fully-rounded
+  //bar.
+  for (int i = 0; i < 6; i++) {
+    schedule_bar_seg[i] = lv_obj_create(scr_time);
+    lv_obj_set_size(schedule_bar_seg[i], 1, 16);
+    lv_obj_set_pos(schedule_bar_seg[i], 100, 210);
+    lv_obj_set_style_radius(schedule_bar_seg[i], 4, 0);
+    lv_obj_set_style_bg_color(schedule_bar_seg[i], COLOR_GREEN, 0);
+    lv_obj_set_style_border_width(schedule_bar_seg[i], 0, 0);
+  }
+
+  //height widened from 30 to 40 -- same too-short-container bug as the
+  //Battery/Almanac legend rows, fixed proactively here since it's the
+  //identical makeFlexRow+makeLegendItem pattern rather than waiting for
+  //it to be separately reported.
+  lv_obj_t* legend = makeFlexRow(scr_time, 0, 248, 800, 40, 40);
+  makeLegendItem(legend, COLOR_GREEN, "Super off-peak");
+  makeLegendItem(legend, COLOR_AMBER, "Off-peak");
+  makeLegendItem(legend, COLOR_RED, "On-peak");
+
+  //Placeholder text is deliberately the WORST-CASE length ("Super
+  //off-peak" is the longest tier name, "12:00 AM" the longest boundary
+  //time) so the pill's build-time fixed width (see makeAutoPill's
+  //fixed-size design, 1.0.26) is correctly sized from the start --
+  //real text set every second in loop() could otherwise be longer than
+  //a shorter placeholder and overflow the pill.
+  pill_time_tou = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_RED, "Super off-peak - $0.09/kWh - until 12:00 AM", 20, 44);
+  lv_obj_align(pill_time_tou, LV_ALIGN_TOP_MID, 0, 295);
+
+  //The other two rates, no "until" time -- ordered by whichever comes
+  //next in the schedule first, per request. Stacked one per row (not
+  //side by side -- a side-by-side pair ran off both edges of the
+  //screen, since "Super off-peak - $0.09/kWh" is long enough that two
+  //of them plus a gap don't fit in 800px). Each is its own
+  //individually-centered pill, same pattern as the main pill above.
+  //Placeholder text is again the worst-case length so build-time sizing
+  //is correct no matter which tier ends up in which pill at runtime.
+  pill_time_next = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_AMBER, "Super off-peak - $0.09/kWh", 20, 40);
+  lv_obj_align(pill_time_next, LV_ALIGN_TOP_MID, 0, 350);
+  pill_time_third = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_GREEN, "Super off-peak - $0.09/kWh", 20, 40);
+  lv_obj_align(pill_time_third, LV_ALIGN_TOP_MID, 0, 401);
+}
+
+//---- Connection screen (fully live this spiral) ----
+void buildConnectionScreen() {
+  scr_connection = makeScreenRoot();
+  makeBackButton(scr_connection);
+
+  //Height 60, not 30 -- see the identical comment on the Home quadrant's
+  //conn_row for why (fits the two-line "Attempting\nto Connect" text
+  //without clipping).
+  lv_obj_t* conn_row = makeFlexRow(scr_connection, 0, 82, 800, 60, 10);
+  dot_scr_conn = makeDot(conn_row, COLOR_STATUS_OK, 0, 0, 12);
+  lbl_scr_connState = makeLabel(conn_row, "Connected", COLOR_TEXT);
+
+  //two side-by-side column regions instead of one cramped vertical list --
+  //left column: what network we're on; right column: broker/addressing.
+  //Labels are right-aligned in a fixed-width box ending at *LabelRight (see
+  //makeRowLabel) rather than placed at a guessed X, after a screen-exporter
+  //capture showed "MQTT broker"/"IP address" overlapping their own values
+  //at the gap this used to use.
+  lv_coord_t leftLabelRight = 240, leftLabelW = 140, leftValueX = 260;
+  //rightLabelW widened from an initial 140 (the exporter caught "MQTT
+  //broker"/"IP address" wrapping onto a second line at that width) but the
+  //first widening pushed rightValueX far enough right that values like
+  //"Connected"/a full IP address then ran off the 800px screen edge --
+  //caught by re-capturing. The attempted fix for THAT then shrank
+  //rightLabelW back down to 180, which was one more re-capture away from
+  //being caught too: 180 isn't enough for "MQTT broker" either, and
+  //LV_LABEL_LONG_MODE_CLIP on a right-aligned label clips from the left,
+  //so it silently ate the leading "M" instead of visibly wrapping.
+  //rightLabelW=210 was already confirmed to fit "MQTT broker" on one line
+  //(that's the value this started at); this only shifts the column,
+  //keeping that same confirmed-good width instead of re-guessing it.
+  lv_coord_t rightLabelRight = 580, rightLabelW = 210, rightValueX = 600;
+
+  makeRowLabel(scr_connection, "SSID", leftLabelRight, 170, leftLabelW);
+  lbl_conn_ssid = makeLabel(scr_connection, "---", COLOR_TEXT, leftValueX, 170);
+
+  makeRowLabel(scr_connection, "Signal", leftLabelRight, 216, leftLabelW);
+  lbl_conn_rssi = makeLabel(scr_connection, "---", COLOR_TEXT, leftValueX, 216);
+
+  makeRowLabel(scr_connection, "MQTT broker", rightLabelRight, 170, rightLabelW);
+  lbl_conn_broker = makeLabel(scr_connection, "---", COLOR_TEXT_MUTED, rightValueX, 170);
+
+  makeRowLabel(scr_connection, "Router", rightLabelRight, 216, rightLabelW);
+  lbl_conn_gateway = makeLabel(scr_connection, "---", COLOR_TEXT, rightValueX, 216);
+
+  makeRowLabel(scr_connection, "IP address", rightLabelRight, 262, rightLabelW);
+  lbl_conn_ip = makeLabel(scr_connection, "---", COLOR_TEXT, rightValueX, 262);
+
+  makeRowLabel(scr_connection, "Firmware", rightLabelRight, 308, rightLabelW);
+  makeLabel(scr_connection, "V" VERSION_DASHBOARD, COLOR_TEXT, rightValueX, 308);
+
+  //Opens the manual network-select flow immediately -- for switching to a
+  //different network without a full reflash. Two-line label, so the pill
+  //already needs more height than the single-line pills elsewhere;
+  //sized generously past the text's own minimum per request, for a
+  //bigger, easier-to-hit touch target.
+  lv_obj_t* changeWifiPill = makeAutoPill(scr_connection, lv_color_hex(0x17191c), COLOR_TEXT_MUTED, "Change\nWiFi", 20, 90);
+  lv_obj_align(changeWifiPill, LV_ALIGN_BOTTOM_LEFT, 40, -30);
+  lv_obj_add_flag(changeWifiPill, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(changeWifiPill, onChangeWifiClicked, LV_EVENT_CLICKED, NULL);
+
+  //Same pattern, for correcting a moved broker IP or changed MQTT auth
+  //without a reflash -- placed bottom-right, mirroring Change WiFi's
+  //bottom-left position.
+  lv_obj_t* changeMqttPill = makeAutoPill(scr_connection, lv_color_hex(0x17191c), COLOR_TEXT_MUTED, "Change\nMQTT", 20, 90);
+  lv_obj_align(changeMqttPill, LV_ALIGN_BOTTOM_RIGHT, -40, -30);
+  lv_obj_add_flag(changeMqttPill, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(changeMqttPill, onChangeMqttClicked, LV_EVENT_CLICKED, NULL);
+}
+
+//---- Battery screen ----
+//Real per-15-minute-bucket curve, replacing the old static two-polyline
+//mockup placeholder (design/mockups/04_battery.svg's example data) --
+//see g_daySocBucket/Value/State and subtopicBatteryDaySoc. Chart bounds
+//chosen to closely match the old placeholder's own visual proportions
+//(it used roughly x=100-553, y=264-395 for its fixed example curve) but
+//widened to genuinely span the full 24h day (bucket 0-95), not just
+//stop wherever that one static example happened to end.
+#define BATT_CHART_X0 100   //bucket 0  (12 AM)
+#define BATT_CHART_X1 700   //bucket 95 (~11:45 PM)
+#define BATT_CHART_Y_SOC0 400   //pixel Y for 0% SoC (bottom)
+#define BATT_CHART_Y_SOC100 260 //pixel Y for 100% SoC (top)
+//At most ~2 charge cycles/day in practice (charge/idle/discharge per
+//cycle, plus real margin) -- see the discussion that settled on this,
+//not a hard protocol limit.
+#define MAX_BATT_CHART_SEGMENTS 8
+lv_obj_t* battDaySegment[MAX_BATT_CHART_SEGMENTS];
+//Each segment needs its OWN persistent point buffer -- lv_line_set_points()
+//stores a pointer, it does not copy the data, so a shared/temporary buffer
+//would have every segment silently pointing at whatever the LAST segment
+//built happened to leave behind.
+lv_point_precise_t battDaySegmentPoints[MAX_BATT_CHART_SEGMENTS][MAX_DAYSOC_POINTS];
+
+void buildBatteryScreen() {
+  scr_battery = makeScreenRoot();
+  makeBackButton(scr_battery);
+
+  ring_batt_screen = makeRing(scr_battery, 260, 60, 120, 0, 0, COLOR_TEAL); //angle set live once a reading arrives
+  //Track color per request -- red instead of the default neutral dark
+  //gray, purely cosmetic, doesn't affect the teal SoC arc drawn on top.
+  lv_obj_set_style_arc_color(ring_batt_screen, COLOR_RED, LV_PART_MAIN);
+  //Orbiting charge/discharge dot, hidden until real state data arrives.
+  //Orbit center/radius derived from the ring's own x/y/diameter above
+  //(260,60,120): center = (260+60, 60+60), radius = 60 - half the
+  //ring's 8px arc width, so the dot rides the arc's own centerline.
+  dot_batt_screen = makeDot(scr_battery, COLOR_ORBIT_CHARGING, 0, 0, 14);
+  lv_obj_add_flag(dot_batt_screen, LV_OBJ_FLAG_HIDDEN);
+  orbitBattScreen.dot = dot_batt_screen;
+  orbitBattScreen.cx = 320;
+  orbitBattScreen.cy = 120;
+  orbitBattScreen.r = 56;
+  //pct and state share the same X (left-justified), per feedback
+  lbl_batt_pct = makeLabel(scr_battery, "--", COLOR_TEXT, 400, 95);
+  lbl_batt_state = makeLabel(scr_battery, "Waiting for data", COLOR_TEXT_MUTED, 400, 125);
+
+  //plain ASCII hyphen, not a Unicode en-dash -- a screen-exporter capture
+  //showed the en-dash rendering as a missing-glyph box, since the default
+  //LVGL font here doesn't include it
+  lv_obj_t* caption = makeLabel(scr_battery, "Today", COLOR_TEXT_DIM);
+  lv_obj_set_style_text_align(caption, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(caption, LV_ALIGN_TOP_MID, 0, 178);
+
+  //Pre-created hidden, populated/shown/hidden per real data by
+  //rebuildBatteryDayCurve() -- no static example points here anymore.
+  for (int i = 0; i < MAX_BATT_CHART_SEGMENTS; i++) {
+    battDaySegment[i] = lv_line_create(scr_battery);
+    lv_obj_set_style_line_width(battDaySegment[i], 3, 0);
+    lv_obj_set_style_line_rounded(battDaySegment[i], true, 0);
+    lv_obj_add_flag(battDaySegment[i], LV_OBJ_FLAG_HIDDEN);
+  }
+
+  //No fixed "now" dot/label anymore -- the old one was pinned to the
+  //static placeholder's own fixed end-of-data point (x=548, "Now" label
+  //at x=660), which would just be silently wrong once this axis spans a
+  //real, continuously-growing full day instead of one fixed example.
+  makeLabel(scr_battery, "12 AM", COLOR_TEXT_DIM, 100, 405);
+  lv_obj_t* midnight_lbl = makeLabel(scr_battery, "Midnight", COLOR_TEXT_DIM);
+  lv_obj_set_pos(midnight_lbl, 640, 405);
+
+  //Per request: Charging Blue, Discharging Red -- deliberately the
+  //OPPOSITE of this app's usual Charging=red/Discharging=blue convention
+  //used everywhere else (Battery/Grid screens' state text and rings) --
+  //so this uses the raw color constants directly rather than the
+  //semantically-named COLOR_STATE_CHARGING/DISCHARGING (which would read
+  //backwards here). Idle segments share the same blue as Charging (not a
+  //3rd color) -- deliberate simplification, per request.
+  //height widened from 30 to 40 and nudged up from y=445 to keep it within
+  //the 480px screen -- same class of bug as the Almanac fixes above: 30px
+  //was clipping the bottom of "Charging (super off-peak)"/"Discharging".
+  lv_obj_t* legend = makeFlexRow(scr_battery, 0, 436, 800, 40, 40);
+  makeLegendItem(legend, COLOR_BLUE_TIDE, "Charging");
+  makeLegendItem(legend, COLOR_RED, "Discharging");
+}
+
+//---- Grid flow screen ("the consumption page") ----
+//Two rings side by side, per request: Battery (left, L1+L2 feeder sum --
+//how much power is moving into/out of the battery) and Grid (right,
+//Line1Grid+Line2Grid sum -- the real whole-household net grid flow).
+//Each ring uses a column container as its centering anchor, same pattern
+//as every other multi-item row on this dashboard, so the ring+number+
+//label group centers within its half of the screen regardless of actual
+//rendered text width.
+void buildGridScreen() {
+  scr_grid = makeScreenRoot();
+  makeBackButton(scr_grid);
+
+  //column height widened from 185 to 200 -- "Battery" has a descending
+  //'y', and 185 clipped it against the column's own bottom edge (same
+  //too-short-container bug caught several times earlier today).
+  const lv_coord_t colW = 380, ringD = 110;
+  lv_obj_t* col_battery = makeColumn(scr_grid, 20, 55, colW, 200);
+  ring_grid_battery = makeRing(col_battery, (colW - ringD) / 2, 0, ringD, 0, 0, COLOR_TEAL);  //angle set live once battery data arrives
+  lbl_grid_battery_watts = makeLabel(col_battery, "-- W", COLOR_TEXT);
+  lv_obj_align(lbl_grid_battery_watts, LV_ALIGN_TOP_MID, 0, 118);
+  lbl_grid_battery_label = makeLabel(col_battery, "Battery Idle", COLOR_TEXT_MUTED);
+  lv_obj_align(lbl_grid_battery_label, LV_ALIGN_TOP_MID, 0, 152);
+
+  lv_obj_t* col_grid = makeColumn(scr_grid, 400, 55, colW, 200);  //matches col_battery's height for symmetry
+  ring_grid_grid = makeRing(col_grid, (colW - ringD) / 2, 0, ringD, 60, 120, COLOR_BLUE_TIDE);  //placeholder angle; real needle gauge is a later spiral
+  lbl_grid_grid_watts = makeLabel(col_grid, "-- W", COLOR_TEXT);
+  lv_obj_align(lbl_grid_grid_watts, LV_ALIGN_TOP_MID, 0, 118);
+  //text set ONCE here, never updated -- per request, no per-sign relabeling,
+  //only the ring/number/label COLOR changes (see gridFlowColor())
+  lbl_grid_grid_label = makeLabel(col_grid, "Grid In/Out", COLOR_TEXT_MUTED);
+  lv_obj_align(lbl_grid_grid_label, LV_ALIGN_TOP_MID, 0, 152);
+
+  //Four stat columns: L1/L2 Feeder (Unit 1's own output readback, renamed
+  //from the old plain "L1"/"L2" for clarity that it's feeder output, not
+  //a grid reading) and L1/L2 Grid (the real independent per-line grid
+  //readings feeding the ring above). 180px width matches the
+  //already-confirmed-safe width from the Connection/Saved-today columns
+  //earlier this session, rather than re-guessing a smaller one for these
+  //shorter-but-not-that-short labels.
+  //row y nudged from 255 to 265 -- the ring columns above grew taller
+  //(185->200, to fix the "Battery" descender clip) and now end exactly
+  //at 255 with zero gap otherwise.
+  lv_obj_t* col_l1f = makeColumn(scr_grid, 10, 265, 180, 68);
+  lbl_grid_l1_feeder = makeLabel(col_l1f, "--", COLOR_TEXT);
+  lv_obj_align(lbl_grid_l1_feeder, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_t* l1f_lbl = makeLabel(col_l1f, "L1 Feeder", COLOR_TEXT_DIM);
+  lv_obj_align(l1f_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+  lv_obj_t* col_l2f = makeColumn(scr_grid, 210, 265, 180, 68);
+  lbl_grid_l2_feeder = makeLabel(col_l2f, "--", COLOR_TEXT);
+  lv_obj_align(lbl_grid_l2_feeder, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_t* l2f_lbl = makeLabel(col_l2f, "L2 Feeder", COLOR_TEXT_DIM);
+  lv_obj_align(l2f_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+  lv_obj_t* col_l1g = makeColumn(scr_grid, 410, 265, 180, 68);
+  lbl_grid_l1_grid = makeLabel(col_l1g, "--", COLOR_TEXT);
+  lv_obj_align(lbl_grid_l1_grid, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_t* l1g_lbl = makeLabel(col_l1g, "L1 Grid", COLOR_TEXT_DIM);
+  lv_obj_align(l1g_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+  lv_obj_t* col_l2g = makeColumn(scr_grid, 610, 265, 180, 68);
+  lbl_grid_l2_grid = makeLabel(col_l2g, "--", COLOR_TEXT);
+  lv_obj_align(lbl_grid_l2_grid, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_t* l2g_lbl = makeLabel(col_l2g, "L2 Grid", COLOR_TEXT_DIM);
+  lv_obj_align(l2g_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+  //Saved Today -- walks the real g_daySoc* curve now (see the calc in
+  //loop()) instead of a single instantaneous snapshot, so multiple
+  //charge/discharge cycles in one day all correctly contribute. Column
+  //narrowed/moved left (was centered at 250,300) to make room for Saved
+  //Yesterday alongside it.
+  lv_obj_t* col_saved = makeColumn(scr_grid, 100, 350, 280, 68);
+  lbl_grid_saved = makeLabel(col_saved, "$0.00", COLOR_STATUS_OK);
+  lv_obj_align(lbl_grid_saved, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_t* saved_lbl = makeLabel(col_saved, "Saved today", COLOR_TEXT_DIM);
+  lv_obj_align(saved_lbl, LV_ALIGN_TOP_MID, 0, 34);
+
+  //Saved Yesterday -- now a real computed value too (see the calc in
+  //loop()), walking g_yesterdaySoc* the same way Saved Today walks
+  //g_daySoc*, just against a full closed day instead of one still in
+  //progress. subtopicBatteryYesterdaySoc is published by the same
+  //pyscript automation as today's curve.
+  lv_obj_t* col_saved_yesterday = makeColumn(scr_grid, 420, 350, 280, 68);
+  lbl_grid_saved_yesterday = makeLabel(col_saved_yesterday, "$0.00", COLOR_STATUS_OK);
+  lv_obj_align(lbl_grid_saved_yesterday, LV_ALIGN_TOP_MID, 0, 0);
+  lv_obj_t* saved_yesterday_lbl = makeLabel(col_saved_yesterday, "Saved yesterday", COLOR_TEXT_DIM);
+  lv_obj_align(saved_yesterday_lbl, LV_ALIGN_TOP_MID, 0, 34);
+}
+
+//---- Almanac screen ----
+//Real tide curve/High-Low labels, computed from TIDE_EVENTS_2026 (see
+//tide_data_2026.h) instead of the old static SVG-mockup polyline.
+//(TidePoint itself is declared at the top of the file, alongside the
+//other custom types -- see the comment there for why.)
+
+//Linear-searches TIDE_EVENTS_2026 (sorted by day, from NOAA) for today's
+//high/low events. Returns the count found (typically 3-4 for this mixed
+//semidiurnal-tide station).
+int getTodaysTideEvents(int dayOfYear, TidePoint* out, int maxOut) {
+  int count = 0;
+  for (int i = 0; i < TIDE_EVENT_COUNT && count < maxOut; i++) {
+    if (TIDE_EVENTS_2026[i].dayOfYear == dayOfYear) {
+      out[count].minuteOfDay = TIDE_EVENTS_2026[i].minuteOfDay;
+      out[count].heightFeet = TIDE_EVENTS_2026[i].heightTenths / 10.0;
+      out[count].isHigh = TIDE_EVENTS_2026[i].isHigh;
+      count++;
+    } else if (TIDE_EVENTS_2026[i].dayOfYear > dayOfYear) {
+      break;  //table is sorted by day; no more matches possible
+    }
+  }
+  return count;
+}
+
+//Formats a minute-of-day (0-1439) as "H:MM AM/PM".
+void formatMinuteOfDay(int minuteOfDay, char* buf, size_t bufSize) {
+  int hour = (minuteOfDay / 60) % 24;
+  int minute = minuteOfDay % 60;
+  int displayHour = hour % 12;
+  if (displayHour == 0) displayHour = 12;
+  const char* ampm = (hour < 12) ? "AM" : "PM";
+  snprintf(buf, bufSize, "%d:%02d %s", displayHour, minute, ampm);
+}
+
+//Chart geometry matches the space the old SVG-derived polyline used:
+//x 150-650 spans the 24-hour day, y 374-414 is the plotted height range
+//(inverted -- LVGL/SVG y grows downward, so a higher tide is a smaller y).
+//Y nudged down 4px from the original 370-410 along with the rest of this
+//screen's rows below the Sunrise/Sunset/Moonrise/Moonset columns, when
+//those grew taller for the 1.5x icon size (see buildAlmanacTimeColumn()).
+#define TIDE_CHART_X0 150
+#define TIDE_CHART_X1 650
+#define TIDE_CHART_Y_HIGH 374
+#define TIDE_CHART_Y_LOW 414
+#define TIDE_CURVE_MAX_POINTS 48
+static lv_point_precise_t g_tideCurvePoints[TIDE_CURVE_MAX_POINTS];
+int g_tideCurvePointCount = 0;
+
+//Rebuilds today's tide curve (cosine-eased interpolation between
+//consecutive real high/low events -- a standard, reasonable
+//approximation of a real tide curve's shape) and the High/Low labels.
+//Only needs to run once a day; loop() calls it periodically to catch a
+//midnight rollover, not on every tick.
+void rebuildTideCurve() {
+  tm t;
+  getLocalTm(t);
+  int dayOfYear = t.tm_yday + 1;
+
+  TidePoint events[6];
+  int n = getTodaysTideEvents(dayOfYear, events, 6);
+  if (n == 0) {
+    g_tideCurvePointCount = 0;
+    return;
+  }
+
+  float minH = events[0].heightFeet, maxH = events[0].heightFeet;
+  int highIdx = events[0].isHigh ? 0 : -1;
+  int lowIdx = events[0].isHigh ? -1 : 0;
+  for (int i = 1; i < n; i++) {
+    if (events[i].heightFeet < minH) minH = events[i].heightFeet;
+    if (events[i].heightFeet > maxH) maxH = events[i].heightFeet;
+    if (events[i].isHigh) {
+      if (highIdx < 0 || events[i].heightFeet > events[highIdx].heightFeet) highIdx = i;
+    } else {
+      if (lowIdx < 0 || events[i].heightFeet < events[lowIdx].heightFeet) lowIdx = i;
+    }
+  }
+  if (maxH - minH < 0.1) maxH = minH + 0.1;  //avoid a divide-by-zero on a near-flat day
+
+  int idx = 0;
+  const int STEPS = 6;
+  //flat lead-in from midnight to the first event
+  for (int s = 0; s <= STEPS && idx < TIDE_CURVE_MAX_POINTS; s++) {
+    float minuteOfDay = events[0].minuteOfDay * (float)s / STEPS;
+    float frac = (events[0].heightFeet - minH) / (maxH - minH);
+    g_tideCurvePoints[idx].x = TIDE_CHART_X0 + (int)(minuteOfDay / 1440.0 * (TIDE_CHART_X1 - TIDE_CHART_X0));
+    g_tideCurvePoints[idx].y = TIDE_CHART_Y_LOW - (int)(frac * (TIDE_CHART_Y_LOW - TIDE_CHART_Y_HIGH));
+    idx++;
+  }
+  //cosine-eased interpolation between each consecutive pair of events
+  for (int i = 0; i < n - 1 && idx < TIDE_CURVE_MAX_POINTS; i++) {
+    for (int s = 1; s <= STEPS && idx < TIDE_CURVE_MAX_POINTS; s++) {
+      float frac_t = (float)s / STEPS;
+      float ease = (1.0 - cos(frac_t * PI)) / 2.0;
+      float minuteOfDay = events[i].minuteOfDay + (events[i + 1].minuteOfDay - events[i].minuteOfDay) * frac_t;
+      float height = events[i].heightFeet + (events[i + 1].heightFeet - events[i].heightFeet) * ease;
+      float frac = (height - minH) / (maxH - minH);
+      g_tideCurvePoints[idx].x = TIDE_CHART_X0 + (int)(minuteOfDay / 1440.0 * (TIDE_CHART_X1 - TIDE_CHART_X0));
+      g_tideCurvePoints[idx].y = TIDE_CHART_Y_LOW - (int)(frac * (TIDE_CHART_Y_LOW - TIDE_CHART_Y_HIGH));
+      idx++;
+    }
+  }
+  //flat lead-out from the last event to midnight
+  float mLast = events[n - 1].minuteOfDay;
+  for (int s = 1; s <= STEPS && idx < TIDE_CURVE_MAX_POINTS; s++) {
+    float minuteOfDay = mLast + (1440 - mLast) * (float)s / STEPS;
+    float frac = (events[n - 1].heightFeet - minH) / (maxH - minH);
+    g_tideCurvePoints[idx].x = TIDE_CHART_X0 + (int)(minuteOfDay / 1440.0 * (TIDE_CHART_X1 - TIDE_CHART_X0));
+    g_tideCurvePoints[idx].y = TIDE_CHART_Y_LOW - (int)(frac * (TIDE_CHART_Y_LOW - TIDE_CHART_Y_HIGH));
+    idx++;
+  }
+  g_tideCurvePointCount = idx;
+  lv_line_set_points(tide_line_obj, g_tideCurvePoints, g_tideCurvePointCount);
+
+  //Chronological, not fixed High=left/Low=right -- caught by the user:
+  //the curve above runs left-to-right by time of day, so whichever
+  //event (high or low) happens EARLIER belongs on the left to match,
+  //regardless of which one is "High" vs "Low".
+  char timeBuf[12];
+  char highBuf[24] = "", lowBuf[24] = "";
+  if (highIdx >= 0) {
+    formatMinuteOfDay(events[highIdx].minuteOfDay, timeBuf, sizeof(timeBuf));
+    snprintf(highBuf, sizeof(highBuf), "High %s", timeBuf);
+  }
+  if (lowIdx >= 0) {
+    formatMinuteOfDay(events[lowIdx].minuteOfDay, timeBuf, sizeof(timeBuf));
+    snprintf(lowBuf, sizeof(lowBuf), "Low %s", timeBuf);
+  }
+  if (highIdx >= 0 && lowIdx >= 0) {
+    bool highIsEarlier = events[highIdx].minuteOfDay <= events[lowIdx].minuteOfDay;
+    lv_label_set_text(lbl_tide_left, highIsEarlier ? highBuf : lowBuf);
+    lv_label_set_text(lbl_tide_right, highIsEarlier ? lowBuf : highBuf);
+  } else if (highIdx >= 0) {
+    lv_label_set_text(lbl_tide_left, highBuf);
+  } else if (lowIdx >= 0) {
+    lv_label_set_text(lbl_tide_left, lowBuf);
+  }
+}
+
+//Rebuilds the Battery screen's real per-15-min-bucket curve from the
+//latest g_daySoc arrays (see subtopicBatteryDaySoc/onMqttMessage above).
+//Walks the parsed points in order, splitting into a new lv_line segment
+//every time the Charging/Idle-vs-Discharging classification changes (see
+//buildBatteryScreen()'s comment on the deliberate 2-color scheme) -- so
+//any number of real charge/discharge cycles in a day renders correctly,
+//not just one fixed arc like the old placeholder assumed. Consecutive
+//segments share their boundary point so the rendered curve has no visual
+//gap at a color change.
+void rebuildBatteryDayCurve() {
+  for (int i = 0; i < MAX_BATT_CHART_SEGMENTS; i++) {
+    lv_obj_add_flag(battDaySegment[i], LV_OBJ_FLAG_HIDDEN);
+  }
+  if (g_daySocCount == 0) return;
+
+  int segIdx = 0;
+  int ptIdx = 1;
+  bool segIsDischarging = (g_daySocState[0] == 2);
+  battDaySegmentPoints[0][0].x = BATT_CHART_X0 + (int)((float)g_daySocBucket[0] / 95.0 * (BATT_CHART_X1 - BATT_CHART_X0));
+  battDaySegmentPoints[0][0].y = BATT_CHART_Y_SOC0 - (int)((float)g_daySocValue[0] / 100.0 * (BATT_CHART_Y_SOC0 - BATT_CHART_Y_SOC100));
+
+  for (int i = 1; i < g_daySocCount; i++) {
+    bool isDischarging = (g_daySocState[i] == 2);
+    int x = BATT_CHART_X0 + (int)((float)g_daySocBucket[i] / 95.0 * (BATT_CHART_X1 - BATT_CHART_X0));
+    int y = BATT_CHART_Y_SOC0 - (int)((float)g_daySocValue[i] / 100.0 * (BATT_CHART_Y_SOC0 - BATT_CHART_Y_SOC100));
+
+    if (isDischarging != segIsDischarging) {
+      if (segIdx < MAX_BATT_CHART_SEGMENTS) {
+        lv_line_set_points(battDaySegment[segIdx], battDaySegmentPoints[segIdx], ptIdx);
+        lv_obj_set_style_line_color(battDaySegment[segIdx], segIsDischarging ? COLOR_RED : COLOR_BLUE_TIDE, 0);
+        lv_obj_clear_flag(battDaySegment[segIdx], LV_OBJ_FLAG_HIDDEN);
+      }
+      int prevSegIdx = segIdx;
+      int prevLastPt = ptIdx - 1;
+      segIdx++;
+      if (segIdx >= MAX_BATT_CHART_SEGMENTS) break; //past the segment cap -- stop rather than overflow
+      segIsDischarging = isDischarging;
+      battDaySegmentPoints[segIdx][0] = battDaySegmentPoints[prevSegIdx][prevLastPt]; //shared boundary point
+      ptIdx = 1;
+    }
+
+    if (ptIdx < MAX_DAYSOC_POINTS) {
+      battDaySegmentPoints[segIdx][ptIdx].x = x;
+      battDaySegmentPoints[segIdx][ptIdx].y = y;
+      ptIdx++;
+    }
+  }
+  if (segIdx < MAX_BATT_CHART_SEGMENTS) {
+    lv_line_set_points(battDaySegment[segIdx], battDaySegmentPoints[segIdx], ptIdx);
+    lv_obj_set_style_line_color(battDaySegment[segIdx], segIsDischarging ? COLOR_RED : COLOR_BLUE_TIDE, 0);
+    lv_obj_clear_flag(battDaySegment[segIdx], LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+//one sunrise/sunset/moonrise/moonset column: icon, then value, then caption,
+//all centered on cx via a fixed-width column container so text-anchor=middle
+//from the mockup survives regardless of actual rendered text width.
+//Returns the value label so callers can update it at runtime (see
+//updateAlmanacScreen()) -- this function only builds the static
+//structure once. colOut (optional) returns the column container itself --
+//needed for the two moon columns, whose left/right position can swap at
+//update time (see updateAlmanacScreen()). moonCanvasOut/moonCanvasBuf
+//(both required together, only for isSun==false) wire up a real,
+//phase-accurate icon instead of a generic glyph -- see
+//renderMoonPhaseIcon().
+lv_obj_t* buildAlmanacTimeColumn(lv_obj_t* parent, lv_coord_t cx, bool isSun, const char* value, const char* caption,
+                                  lv_obj_t** colOut, lv_obj_t** moonCanvasOut, uint8_t* moonCanvasBuf) {
+  const lv_coord_t w = 150;
+  //value-to-caption gap widened from an initial 23px to 30px, matching the
+  //Grid screen's stat columns -- both used the same too-tight pattern,
+  //caught when you flagged the Grid one as visually cramped.
+  //
+  //Column height widened from 95 to 115, then further to 119 when the
+  //icons grew from 20px to ICON_D (30px, 1.5x) -- kept the same
+  //value-to-caption gap and bottom margin that were already tuned to
+  //avoid clipping caption descenders against the column's own bottom
+  //edge (caught by you pointing out specific glyph damage -- "u" missing
+  //its bottom curve -- that plain ink-vs-background pixel scanning
+  //couldn't distinguish from a font just ending there naturally, since
+  //the clipping color and background are identical); the icon-to-value
+  //gap shrank a bit (12px -> 6px) to keep this screen's later rows
+  //(phase/tide) from all needing to shift down by the icon's full 10px
+  //growth.
+  lv_obj_t* col = makeColumn(parent, cx - w / 2, 178, w, 119);
+  if (isSun) {
+    makeSunIcon(col, w / 2 - ICON_D / 2, 8, ICON_D);
+  } else {
+    lv_obj_t* canvas = lv_canvas_create(col);
+    lv_canvas_set_buffer(canvas, moonCanvasBuf, ICON_D, ICON_D, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_pos(canvas, w / 2 - ICON_D / 2, 8);
+    *moonCanvasOut = canvas;
+  }
+  lv_obj_t* val = makeLabel(col, value, lv_color_hex(0xd6d7d9));
+  lv_obj_align(val, LV_ALIGN_TOP_MID, 0, 44);
+  lv_obj_t* cap = makeLabel(col, caption, COLOR_TEXT_DIM);
+  lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 78);
+  if (colOut) *colOut = col;
+  return val;
+}
+
+void buildAlmanacScreen() {
+  scr_almanac = makeScreenRoot();
+  makeBackButton(scr_almanac);
+
+  //Placeholder text sized for the worst case ("68°F  Partlycloudy") so the
+  //label's own build-time layout doesn't need to change once real data
+  //(from almanac_data.py, see subtopicAlmanacData) replaces it. Positioned
+  //via a persistent LV_ALIGN_TOP_MID (style-based, re-centers automatically
+  //whenever the label's own width changes -- see makeAutoPill's inner-label
+  //centering for the same mechanism) instead of a fixed x -- an earlier
+  //version used a hardcoded x assuming a specific text width, which drifted
+  //visibly off-center once real, variable-length condition text replaced
+  //the placeholder.
+  //One font size up from this screen's default (Montserrat 34, the next
+  //size actually compiled in -- see lv_conf.h) to make temperature/
+  //condition more prominent than the smaller sunrise/sunset/moon captions
+  //below it.
+  lbl_almanac_weather = makeLabel(scr_almanac, "68\xC2\xB0""F  Partlycloudy", COLOR_TEXT);
+  lv_obj_set_style_text_font(lbl_almanac_weather, &lv_font_montserrat_34, 0);
+  lv_obj_align(lbl_almanac_weather, LV_ALIGN_TOP_MID, 0, 95);
+
+  //pushed down from the original layout (which collided with the moon-phase
+  //row below it once rendered on real hardware) and widened into columns
+  //that center regardless of text width. Sun columns don't need a
+  //moon-canvas (nullptr for those two params) -- only the moon columns
+  //need a phase-accurate icon -- but all four need colOut now, so
+  //updateAlmanacScreen() can hide/recenter one that's absent for today
+  //(see almanac_data.py's header comment).
+  lbl_almanac_sunrise = buildAlmanacTimeColumn(scr_almanac, 160, true, "5:58 AM", "Sunrise", &col_sunrise, nullptr, nullptr);
+  lbl_almanac_sunset = buildAlmanacTimeColumn(scr_almanac, 320, true, "8:41 PM", "Sunset", &col_sunset, nullptr, nullptr);
+  lbl_almanac_moonrise = buildAlmanacTimeColumn(scr_almanac, 480, false, "9:14 PM", "Moonrise", &col_moonrise, &moonrise_icon_canvas, moonrise_icon_buf);
+  lbl_almanac_moonset = buildAlmanacTimeColumn(scr_almanac, 640, false, "6:37 AM", "Moonset", &col_moonset, &moonset_icon_canvas, moonset_icon_buf);
+
+  //height widened from 30 to 40 -- 30 was clipping the descenders on the
+  //two g's in "Waxing gibbous" against the row's own bottom edge (you
+  //caught this by pointing out specific glyph damage in a zoomed crop:
+  //a "u" missing its bottom curve elsewhere on this screen, the same
+  //class of bug). y nudged down 4px from the columns above growing by
+  //the same amount (see buildAlmanacTimeColumn()) to preserve the same
+  //gap to the Tide label/chart below.
+  lv_obj_t* phase_row = makeFlexRow(scr_almanac, 0, 302, 800, 40, 10);
+  //Real, phase-accurate icon (see renderMoonPhaseIcon()) instead of the
+  //fixed generic crescent used elsewhere on this screen -- built once as
+  //an lv_canvas here, redrawn whenever real phase data arrives.
+  moon_phase_canvas = lv_canvas_create(phase_row);
+  lv_canvas_set_buffer(moon_phase_canvas, moon_canvas_buf, MOON_ICON_D, MOON_ICON_D, LV_COLOR_FORMAT_RGB565);
+  //plain hyphen instead of a Unicode middle-dot -- same missing-glyph issue
+  //as the battery caption's en-dash above. Worst-case-width placeholder
+  //("Waning crescent - 100% lit") so the flex row's layout doesn't shift
+  //once real data replaces it.
+  lbl_almanac_phase = makeLabel(phase_row, "Waning crescent - 100% lit", COLOR_MOON_GRAY);
+
+  //Same +4px nudge as phase_row above.
+  lv_obj_t* tide_lbl = makeLabel(scr_almanac, "Tide", COLOR_BLUE_TIDE);
+  lv_obj_align(tide_lbl, LV_ALIGN_TOP_MID, 0, 348);
+
+  //Built with zero points initially -- rebuildTideCurve() fills this in
+  //once the clock is NTP-synced (real dates need real time), called once
+  //from setup() and periodically from loop() to catch a midnight rollover.
+  tide_line_obj = lv_line_create(scr_almanac);
+  lv_obj_set_style_line_color(tide_line_obj, COLOR_BLUE_TIDE, 0);
+  lv_obj_set_style_line_width(tide_line_obj, 3, 0);
+  lv_obj_set_style_line_rounded(tide_line_obj, true, 0);
+
+  //Same +4px nudge as phase_row/tide_lbl above.
+  lbl_tide_left = makeLabel(scr_almanac, "High --:-- --", COLOR_TEXT, 150, 434);
+  lbl_tide_right = makeLabel(scr_almanac, "Low --:-- --", COLOR_TEXT);
+  lv_obj_align(lbl_tide_right, LV_ALIGN_TOP_RIGHT, -150, 434);
+}
+
+//"5:58 AM" -- same %I:%M %p convention as the main clock, for an
+//arbitrary epoch (not necessarily "now") coming from almanac_data.py's
+//MQTT payload.
+//
+//The +3600*timezone adjustment matters here specifically: this board's
+//RTC is set (see parseNtpPacket()'s identical adjustment) to an
+//already-local-shifted epoch, not true UTC -- time(NULL)/_rtc_localtime()
+//elsewhere in this file work without any further adjustment because
+//they're reading that same pre-shifted clock. almanac_data.py's payload
+//is genuine UTC (Python's tz-aware .timestamp()), so it needs the same
+//shift applied here before _rtc_localtime() can treat it consistently
+//with every other displayed time on this dashboard.
+char* formatEpochTime(time_t epoch, char buffer[]) {
+  tm t;
+  time_t adjusted = epoch + (3600 * timezone);
+  _rtc_localtime(adjusted, &t, RTC_FULL_LEAP_YEAR_SUPPORT);
+  strftime(buffer, 16, "%I:%M %p", &t);
+  return buffer;
+}
+
+//Redraws any of the three moon canvases (the phase-row icon, plus the
+//Moonrise/Moonset column icons) as a real, geometrically-accurate phase
+//icon from g_moonPhaseAngle (0=new, 180=full, 0-360 covering a full
+//waxing+waning cycle) -- not one of a fixed set of 8 pictures, and not
+//a generic "this is about the moon" glyph either. All three show the
+//SAME real phase, just at different sizes (d), since it's the same real
+//moon in all three places.
+//
+//A moon phase's illuminated region is the disk intersected/unioned with
+//an ellipse whose horizontal half-width is the disk's own half-width at
+//that row, scaled by cos(theta) (theta = phase angle folded into 0-180,
+//see thetaForFormula below). This is the standard, exact construction
+//most moon-phase widgets use -- at theta=0 (new) the ellipse collapses
+//to the disk's edge (nothing lit); at theta=90 (quarter) it collapses to
+//a flat vertical line (exactly half lit); at theta=180 (full) it
+//collapses to the far edge (everything lit) -- one continuous formula
+//covers crescent, quarter, and gibbous with no special-casing.
+//
+//limbSign picks which side is lit for waxing vs. waning (an arbitrary
+//but consistent left/right convention -- flip both signs below if it
+//reads backwards for your hemisphere/preference).
+void renderMoonPhaseIcon(lv_obj_t* canvas, lv_coord_t d) {
+  float angle = g_moonPhaseAngle;
+  bool waxing = (angle <= 180.0f);
+  float thetaForFormula = waxing ? angle : (360.0f - angle);
+  float cosTheta = cosf(radians(thetaForFormula));
+  float limbSign = waxing ? 1.0f : -1.0f;
+
+  const float R = d / 2.0f;
+  lv_canvas_fill_bg(canvas, COLOR_BG, LV_OPA_COVER);
+
+  for (int y = 0; y < d; y++) {
+    float ny = (y + 0.5f - R) / R;
+    if (fabsf(ny) > 1.0f) continue;
+    float diskHalfWidth = sqrtf(1.0f - ny * ny);
+    float terminatorX = cosTheta * diskHalfWidth;
+
+    for (int x = 0; x < d; x++) {
+      float nx = (x + 0.5f - R) / R;
+      if (nx * nx + ny * ny > 1.0f) continue; //outside the disk -- leave as background
+      bool illuminated = (nx * limbSign) >= terminatorX;
+      lv_canvas_set_px(canvas, x, y,
+                        illuminated ? COLOR_MOON_GRAY : lv_color_hex(0x232428),
+                        LV_OPA_COVER);
+    }
+  }
+  lv_obj_invalidate(canvas);
+}
+
+//Shows/positions or hides a rise+set column pair for today's Almanac row.
+//epoch==0 means that event doesn't occur on today's calendar day at all
+//(see almanac_data.py's header comment -- a real, if uncommon, case for
+//the moon) -- hides that column and centers the other one in the space
+//both would have shared, rather than leaving a "--" placeholder for
+//something that isn't merely unknown but genuinely doesn't exist today.
+//allowSwap (moon only) additionally swaps which physical column each
+//renders in when the set genuinely happens before the rise in absolute
+//time -- both are today's real events, but "rise" and "set" don't imply
+//a left-to-right time order the way they do for the sun (see the moon
+//columns' own call site below).
+void layoutEventPair(lv_obj_t* colRise, lv_obj_t* colSet, time_t riseEpoch, time_t setEpoch,
+                      lv_coord_t riseCx, lv_coord_t setCx, bool allowSwap) {
+  const lv_coord_t colW = 150;
+  bool hasRise = (riseEpoch != 0);
+  bool hasSet = (setEpoch != 0);
+
+  if (hasRise && hasSet) {
+    if (allowSwap && setEpoch < riseEpoch) {
+      lv_coord_t tmp = riseCx;
+      riseCx = setCx;
+      setCx = tmp;
+    }
+    lv_obj_clear_flag(colRise, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(colSet, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(colRise, riseCx - colW / 2);
+    lv_obj_set_x(colSet, setCx - colW / 2);
+  } else if (hasRise) {
+    lv_obj_clear_flag(colRise, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(colSet, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(colRise, (riseCx + setCx) / 2 - colW / 2);
+  } else if (hasSet) {
+    lv_obj_add_flag(colRise, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(colSet, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_x(colSet, (riseCx + setCx) / 2 - colW / 2);
+  } else {
+    lv_obj_add_flag(colRise, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(colSet, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+//Refreshes every Almanac screen element from the latest g_*Epoch/
+//g_moonPhase*/g_weather* globals (see subtopicAlmanacData/onMqttMessage
+//above) -- called on navigating to the screen and, from loop(), when
+//fresh data arrives while already on it (same pattern as
+//rebuildBatteryDayCurve()/g_daySocDirty).
+void updateAlmanacScreen() {
+  if (!g_hasAlmanacData) return;
+
+  char buf[24];
+  //Degree symbol (U+00B0) is one of the few non-ASCII codepoints this
+  //project's Montserrat font subset actually includes (see
+  //lv_font_montserrat_32.c's own generation comment: "-r 0x20-0x7F,0xB0,
+  //0x2022") -- safe to use directly, unlike the en-dash/middle-dot glyphs
+  //this dashboard has hit missing-glyph boxes on elsewhere.
+  snprintf(buf, sizeof(buf), "%d\xC2\xB0""F  %s", g_weatherTempF, g_weatherCondition);
+  lv_label_set_text(lbl_almanac_weather, buf);
+
+  //0 means that event doesn't happen today at all (see layoutEventPair()'s
+  //own comment) -- skip setting text for it; the column gets hidden
+  //entirely below, so stale-but-hidden text is harmless, but this avoids
+  //ever formatting a bogus time out of a 0 epoch.
+  char timeBuf[16];
+  if (g_sunriseEpoch != 0) lv_label_set_text(lbl_almanac_sunrise, formatEpochTime(g_sunriseEpoch, timeBuf));
+  if (g_sunsetEpoch != 0) lv_label_set_text(lbl_almanac_sunset, formatEpochTime(g_sunsetEpoch, timeBuf));
+  if (g_moonriseEpoch != 0) lv_label_set_text(lbl_almanac_moonrise, formatEpochTime(g_moonriseEpoch, timeBuf));
+  if (g_moonsetEpoch != 0) lv_label_set_text(lbl_almanac_moonset, formatEpochTime(g_moonsetEpoch, timeBuf));
+
+  //Sun: never swaps (the sun only ever rises before it sets within a
+  //calendar day at this latitude) but can still in principle be absent
+  //(polar day/night elsewhere) -- see layoutEventPair()'s own comment.
+  layoutEventPair(col_sunrise, col_sunset, g_sunriseEpoch, g_sunsetEpoch, 160, 320, false);
+  //Moon: both are today's real calendar-day events, but "rise" and "set"
+  //don't imply a left-to-right time order for the moon the way they do
+  //for the sun -- e.g. near full moon the moon can still be up from the
+  //previous evening, set in the early morning, then rise again that same
+  //night, so Set legitimately reads before Rise for that day.
+  layoutEventPair(col_moonrise, col_moonset, g_moonriseEpoch, g_moonsetEpoch, 480, 640, true);
+
+  //Illuminated % derived from the phase angle here (not sent separately
+  //over MQTT) -- see renderMoonPhaseIcon()'s comment for why the angle
+  //alone is authoritative for both the icons and this number.
+  float k = (1.0f - cosf(radians(g_moonPhaseAngle))) / 2.0f;
+  char phaseBuf[40];
+  snprintf(phaseBuf, sizeof(phaseBuf), "%s - %d%% lit", g_moonPhaseName, (int)(k * 100.0f + 0.5f));
+  lv_label_set_text(lbl_almanac_phase, phaseBuf);
+
+  //Same real phase, three places -- see renderMoonPhaseIcon()'s own comment.
+  renderMoonPhaseIcon(moon_phase_canvas, MOON_ICON_D);
+  renderMoonPhaseIcon(moonrise_icon_canvas, ICON_D);
+  renderMoonPhaseIcon(moonset_icon_canvas, ICON_D);
+}
+
+//This sketch's own directory also has an mbed_app.json (arduino-cli
+//picks it up automatically) raising rtos.main-thread-stack-size to
+//128KB, up from this core's own 32KB default -- too small for this
+//app's LVGL object creation, causing a silent stack overflow. If a
+//future change needs more headroom, raise that value rather than
+//assuming a hang is a heap/pool issue -- see also LV_MEM_SIZE's own
+//comment in lv_conf.h.
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+
+  Serial.print("Giga YH Dashboard - Unit 2 (remote display) - V");
+  Serial.println(VERSION_DASHBOARD);
+
+  //Must run before Display.begin() (which calls lv_init() internally) --
+  //LVGL's memory pool is ea_malloc()-backed (see lv_conf.h), and
+  //ea_malloc() has nothing to hand out until the SDRAM block is
+  //registered. SDRAM.begin() itself is idempotent (checks the FMC
+  //controller's own state register before re-initializing), so this is
+  //safe even if something else also initializes SDRAM later.
+  if (!SDRAM.begin()) {
+    Serial.println("SDRAM.begin() failed! LVGL's memory pool won't be available.");
+  }
+
+  Display.begin();
+  TouchDetector.begin();
+
+  lv_indev_t* indev = lv_indev_create();
+  lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(indev, touchpad_read);
+
+  lv_indev_t* simIndev = lv_indev_create();
+  lv_indev_set_type(simIndev, LV_INDEV_TYPE_POINTER);
+  lv_indev_set_read_cb(simIndev, simTouchReadCb);
+
+  buildHomeScreen();
+  buildTimeScreen();
+  buildConnectionScreen();
+  buildBatteryScreen();
+  buildGridScreen();
+  buildAlmanacScreen();
+  buildWifiScanScreen();
+  buildWifiPasswordScreen();
+  buildMqttHostScreen();
+  buildMqttUsernameScreen();
+  buildMqttPasswordScreen();
+  lv_scr_load(scr_home);
+  lv_timer_handler(); //don't leave the screen dark while WiFi connects
+  //Home is already visible at this point, so the dot/label would still
+  //show whatever build-time text/color the screen was constructed with
+  //(previously a hardcoded green "Connected", even though nothing has
+  //connected yet) for the entire multi-attempt retry window below unless
+  //set explicitly here first.
+  setConnStatusIndicator(WIFI_UI_CONNECTING);
+  forcePaint(); //paint "Connecting" before the blocking attempts below
+
+  //Manual setup flow: shown only if both bounded attempts above (secrets.h,
+  //then stored KVStore credentials) fail. attemptWifiConnectFromSetup()
+  //(fired from a network-row tap or the keyboard's OK key) sets
+  //g_awaitingManualWifiSetup = false and lv_scr_load(scr_home) on success --
+  //this loop just keeps the UI alive and responsive to touch until then.
+  if (!connectToWiFi()) {
+    if (verbosity > 0) Serial.println("Both secrets.h and stored WiFi credentials failed -- showing manual setup");
+    setConnStatusIndicator(WIFI_UI_NOT_CONNECTED);
+    g_awaitingManualWifiSetup = true;
+    populateWifiScanList();
+    lv_scr_load(scr_wifi_scan);
+    while (g_awaitingManualWifiSetup) {
+      lv_timer_handler();
+      serviceDevCommands();  //keep 'D' screen-dump / 'P' sim-touch working during setup too
+      if (g_pendingWifiAttempt) {
+        g_pendingWifiAttempt = false;
+        attemptWifiConnectFromSetup(g_pendingAttemptSsid, g_pendingAttemptPassword);
+      }
+      delay(5);
+    }
+  }
+  //Reachable only once actually connected -- either connectToWiFi() above
+  //succeeded directly, or the wait loop only exits via a successful
+  //attemptWifiConnectFromSetup().
+  setConnStatusIndicator(WIFI_UI_CONNECTED);
+
+  //Real dates need real (NTP-synced) time, so this has to happen after
+  //connectToWiFi() above, not alongside the other screen-building calls.
+  rebuildTideCurve();
+
+  if (verbosity > 0) Serial.println("Attempting to connect to the MQTT broker...");
+
+  //Bounded attempts (stored settings, then secrets.h -- see
+  //connectToMqttBroker()'s comment for why that order, reversed from
+  //WiFi's), then the manual host/username/password setup flow if both
+  //fail -- same shape as the WiFi fallback above. This is what actually
+  //fixes the "host moved IP or auth changed" case instead of just
+  //showing a permanent, unfixable "Not connected" on the Connection
+  //screen (the old behavior, before this existed).
+  if (!connectToMqttBroker()) {
+    if (verbosity > 0) Serial.println("Both stored and secrets.h MQTT settings failed -- showing manual MQTT setup");
+    g_awaitingManualMqttSetup = true;
+    lv_textarea_set_text(mqttHostTextarea, mqttHost);  //prefill with whatever secrets.h resolved to
+    lv_scr_load(scr_mqtt_host);
+    while (g_awaitingManualMqttSetup) {
+      lv_timer_handler();
+      serviceDevCommands();
+      if (g_pendingMqttAttempt) {
+        g_pendingMqttAttempt = false;
+        attemptMqttConnectFromSetup(g_pendingMqttHost, g_pendingMqttUser, g_pendingMqttPass);
+      }
+      delay(5);
+    }
+  } else {
+    subscribeAllMqttTopics();
+  }
+}
+
+//Serial dev/debug commands: 'D' dumps the current screen (see
+//dumpFramebufferToSerial() above); 'H'/'T'/'C'/'B'/'G'/'M' force-navigate
+//to Home/Time/Connection/Battery/Grid/alManac without touching the
+//screen, so every screen can be captured by the exporter from a PC
+//script without needing physical access to the board; 'P' + 6 ASCII
+//digits (3-digit x, 3-digit y, zero-padded -- e.g. "P402242" for
+//x=402,y=242) simulates a real tap at that point via the sim touch
+//indev above, auto-releasing ~80ms later so LVGL sees a normal
+//press-then-release click cycle.
+//
+//Factored out of loop() and also called from setup()'s manual WiFi
+//setup wait loop -- the screen-dump/sim-touch dev tools need to keep
+//working during that flow too (that's exactly the flow they're most
+//useful for testing), not just once the dashboard's normal loop() is
+//running.
+void serviceDevCommands() {
+  if (Serial.available()) {
+    switch (Serial.read()) {
+      case 'D': dumpFramebufferToSerial(); break;
+      case 'H': lv_scr_load(scr_home); break;
+      case 'T': lv_scr_load(scr_time); break;
+      case 'C': lv_scr_load(scr_connection); break;
+      case 'B': lv_scr_load(scr_battery); break;
+      case 'G': lv_scr_load(scr_grid); break;
+      case 'M': lv_scr_load(scr_almanac); break;
+      case 'P': {
+        char coordBuf[6];
+        if (Serial.readBytes(coordBuf, 6) == 6) {
+          char xBuf[4] = { coordBuf[0], coordBuf[1], coordBuf[2], '\0' };
+          char yBuf[4] = { coordBuf[3], coordBuf[4], coordBuf[5], '\0' };
+          g_simTouchX = atoi(xBuf);
+          g_simTouchY = atoi(yBuf);
+          g_simTouchDown = true;
+          g_simTouchReleaseAt = millis() + 80;
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+
+  //Release the simulated tap ~80ms after it started -- checked every
+  //call (not gated behind any tick) so the press-release cycle stays
+  //short enough for LVGL to register it as a click, not a long-press
+  //or drag.
+  if (g_simTouchDown && millis() >= g_simTouchReleaseAt) {
+    g_simTouchDown = false;
+  }
+}
+
+unsigned long lastClockUpdate = 0;
+unsigned long lastTideUpdate = 0;
+
+void loop() {
+  lv_timer_handler();
+  mqttClient.poll();
+
+  //Runs the "Change WiFi" flow here, not in the button's own click
+  //callback -- see startChangeWifiFlow()'s comment for why running its
+  //blocking lv_timer_handler() wait loop from inside a click callback
+  //(itself dispatched by lv_timer_handler()) froze the board. This is a
+  //genuinely top-level call site, not nested inside lv_timer_handler(),
+  //so it's safe here.
+  if (g_wifiChangeRequested) {
+    g_wifiChangeRequested = false;
+    startChangeWifiFlow();
+  }
+
+  //Same reasoning as the WiFi change above -- see startChangeMqttFlow().
+  if (g_mqttChangeRequested) {
+    g_mqttChangeRequested = false;
+    startChangeMqttFlow();
+  }
+
+  //Rebuild the Battery screen's curve when fresh data arrives WHILE
+  //already looking at that screen -- navBattery() handles the "just
+  //navigated there" case itself, so this only needs to cover staying on
+  //the screen as a new 30-min HA update comes in. Per request: no need
+  //to redraw a screen nobody's currently looking at.
+  if (g_daySocDirty && lv_scr_act() == scr_battery) {
+    g_daySocDirty = false;
+    rebuildBatteryDayCurve();
+  }
+
+  //Same reasoning as the Battery screen curve above -- navAlmanac()
+  //handles the "just navigated there" case itself, this only covers
+  //staying on the screen as a new 6-hour almanac update arrives.
+  if (g_almanacDataDirty && lv_scr_act() == scr_almanac) {
+    g_almanacDataDirty = false;
+    updateAlmanacScreen();
+  }
+
+  //Tide data only changes once a day; re-checking every minute (not
+  //every second, like the clock/TOU tick below) is plenty to catch a
+  //midnight rollover without doing this relatively heavier computation
+  //needlessly often.
+  unsigned long nowTide = millis();
+  if (nowTide - lastTideUpdate >= 60000) {
+    lastTideUpdate = nowTide;
+    rebuildTideCurve();
+  }
+
+  serviceDevCommands();
+
+  unsigned long now = millis();
+  if (now - lastClockUpdate >= 1000) {
+    lastClockUpdate = now;
+    char buf[16];
+    getLocaltime(buf);
+    lv_label_set_text(lbl_home_clock, buf);
+    lv_label_set_text(lbl_time_clock, buf);
+
+    char dateBuf[32];
+    getLocalDateStr(dateBuf);
+    lv_label_set_text(lbl_home_date, dateBuf);
+    lv_label_set_text(lbl_time_date, dateBuf);
+
+    //Real weather instead of the build-time "Cloudy, 68F >" placeholder --
+    //g_weatherCondition is already sentence-cased at MQTT-arrival time (see
+    //onMqttMessage()). resizeAutoPillText() (not a plain lv_label_set_text)
+    //re-fits the pill itself to the text's actual width -- condition text
+    //length varies enough ("Sunny" vs "Lightning-rainy") that a fixed
+    //build-time width either clips short text or, sized for the worst
+    //case, overflows the quadrant and triggers scr_home's default
+    //scrollbar. Only called when the text actually changed (g_weatherTempF
+    //ticks with every MQTT update, but the almanac topic only publishes
+    //every 6 hours -- see almanac_data.py -- so in steady state this
+    //string is identical second to second): calling this unconditionally
+    //every second, forever, hung the board on real hardware within a
+    //couple seconds of boot -- this device has a documented lv_realloc()
+    //fragility (see lvgl_patches/README.md, lvgl/lvgl#9794) and that much
+    //needless per-second label/layout churn was enough to trigger it.
+    static char lastWeatherBuf[32] = "";
+    if (g_hasAlmanacData) {
+      char weatherBuf[32];
+      snprintf(weatherBuf, sizeof(weatherBuf), "%s, %d\xC2\xB0""F >", g_weatherCondition, g_weatherTempF);
+      if (strcmp(weatherBuf, lastWeatherBuf) != 0) {
+        resizeAutoPillText(weather_pill, weatherBuf, 16);
+        strncpy(lastWeatherBuf, weatherBuf, sizeof(lastWeatherBuf) - 1);
+        lastWeatherBuf[sizeof(lastWeatherBuf) - 1] = '\0';
+      }
+    }
+
+    //Real TOU tier/rate, once per second -- same cadence as the clock.
+    //Display-only: this never touches Unit 1 or its RS485/battery
+    //control, it only decides what these two pills/the schedule bar show.
+    tm localTm;
+    getLocalTm(localTm);
+    TouStatus tou = computeTouStatus(localTm.tm_hour, localTm.tm_wday, localTm.tm_mon + 1, localTm.tm_mday);
+    lv_color_t touColor = touTierColor(tou.tier);
+
+    char homeTouBuf[16];
+    sprintf(homeTouBuf, "$%.2f/kWh", tou.rate);
+    lv_obj_t* homeTouLbl = lv_obj_get_child(pill_home_tou, 0);
+    lv_label_set_text(homeTouLbl, homeTouBuf);
+    lv_obj_set_style_text_color(homeTouLbl, touColor, 0);
+
+    char untilBuf[12];
+    formatHourLabel(tou.nextBoundaryHour, untilBuf, sizeof(untilBuf));
+    char timeTouBuf[48];
+    sprintf(timeTouBuf, "%s - $%.2f/kWh - until %s", touTierName(tou.tier), tou.rate, untilBuf);
+    lv_obj_t* timeTouLbl = lv_obj_get_child(pill_time_tou, 0);
+    lv_label_set_text(timeTouLbl, timeTouBuf);
+    lv_obj_set_style_text_color(timeTouLbl, touColor, 0);
+
+    TouTier nextTier, thirdTier;
+    findUpcomingTiers(tou.tier, tou.weekendOrHoliday, localTm.tm_hour, &nextTier, &thirdTier);
+
+    char nextBuf[32];
+    sprintf(nextBuf, "%s - $%.2f/kWh", touTierName(nextTier), touRate(nextTier));
+    lv_obj_t* nextLbl = lv_obj_get_child(pill_time_next, 0);
+    lv_label_set_text(nextLbl, nextBuf);
+    lv_obj_set_style_text_color(nextLbl, touTierColor(nextTier), 0);
+
+    char thirdBuf[32];
+    sprintf(thirdBuf, "%s - $%.2f/kWh", touTierName(thirdTier), touRate(thirdTier));
+    lv_obj_t* thirdLbl = lv_obj_get_child(pill_time_third, 0);
+    lv_label_set_text(thirdLbl, thirdBuf);
+    lv_obj_set_style_text_color(thirdLbl, touTierColor(thirdTier), 0);
+
+    TouSegment segs[6];
+    int segCount = buildTouSegments(tou.weekendOrHoliday, segs);
+    for (int i = 0; i < 6; i++) {
+      if (i < segCount) {
+        lv_coord_t x = 100 + segs[i].startHour * 25;
+        lv_coord_t w = (segs[i].endHour - segs[i].startHour) * 25;
+        lv_obj_set_pos(schedule_bar_seg[i], x, 210);
+        lv_obj_set_size(schedule_bar_seg[i], w, 16);
+        lv_obj_set_style_bg_color(schedule_bar_seg[i], segs[i].color, 0);
+        lv_obj_clear_flag(schedule_bar_seg[i], LV_OBJ_FLAG_HIDDEN);
+      } else {
+        lv_obj_add_flag(schedule_bar_seg[i], LV_OBJ_FLAG_HIDDEN);
+      }
+    }
+
+    lv_label_set_text(lbl_home_ssid, WiFi.SSID());
+    lv_label_set_text(lbl_conn_ssid, WiFi.SSID());
+    //This sketch has no active WiFi reconnect loop, so a real runtime drop
+    //(router reboot, moved out of range) has nothing retrying it -- WiFi.
+    //status() will just sit at whatever it dropped to. Reflecting that
+    //here means the dot/label correctly show "Not connected" instead of a
+    //stale "Connected" left over from setup(), the same class of bug this
+    //whole indicator was added to fix.
+    setConnStatusIndicator(WiFi.status() == WL_CONNECTED ? WIFI_UI_CONNECTED : WIFI_UI_NOT_CONNECTED);
+
+    char rssiBuf[16];
+    sprintf(rssiBuf, "%ld dBm", WiFi.RSSI());
+    lv_label_set_text(lbl_conn_rssi, rssiBuf);
+
+    bool connected = mqttClient.connected();
+    lv_label_set_text(lbl_conn_broker, connected ? "Connected" : "Not connected");
+    lv_obj_set_style_text_color(lbl_conn_broker, connected ? COLOR_STATUS_OK : COLOR_RED, 0);
+
+    lv_label_set_text(lbl_conn_gateway, WiFi.gatewayIP().toString().c_str());
+    lv_label_set_text(lbl_conn_ip, WiFi.localIP().toString().c_str());
+
+    if (g_batterySoC >= 0) {
+      char pctBuf[8];
+      sprintf(pctBuf, "%.0f%%", g_batterySoC);
+      lv_label_set_text(lbl_home_battery_pct, pctBuf);
+      lv_label_set_text(lbl_batt_pct, pctBuf);
+
+      int16_t angle = (int16_t)(g_batterySoC / 100.0 * 360);
+      lv_arc_set_angles(ring_home_battery, 0, angle);
+      lv_arc_set_angles(ring_batt_screen, 0, angle);
+
+      //g_batteryState defaults to 0 (Idle) at boot and there's no MQTT
+      //staleness/failsafe timeout on this device by design (see
+      //CLAUDE.md) -- so if the Battery/Action topic isn't retained by
+      //its publisher, a freshly booted/reflashed Unit 2 has no way to
+      //learn the CURRENT state until the next real transition, and
+      //shows a false "Idle" the whole time. g_lastBatteryActionMs (only
+      //ever set inside the Action MQTT handler) doubles as a has-data
+      //flag here, same "-1/0 means never received" convention used
+      //elsewhere in this file, so it shows an honest "waiting for
+      //data" instead of a guess.
+      if (g_lastBatteryActionMs > 0) {
+        const char* stateText = batteryStateText(g_batteryState);
+        lv_color_t stateColor = batteryStateColor(g_batteryState);
+        lv_label_set_text(lbl_home_battery_state, stateText);
+        lv_obj_set_style_text_color(lbl_home_battery_state, stateColor, 0);
+        lv_label_set_text(lbl_batt_state, stateText);
+        lv_obj_set_style_text_color(lbl_batt_state, stateColor, 0);
+      }
+    }
+
+    //L1/L2 Feeder -- Unit 1's own output readback (unchanged source,
+    //renamed labels for clarity that this isn't a grid reading).
+    if (g_line1Power >= 0) {
+      char l1Buf[12];
+      sprintf(l1Buf, "%.0f W", g_line1Power);
+      lv_label_set_text(lbl_grid_l1_feeder, l1Buf);
+    }
+    if (g_line2Power >= 0) {
+      char l2Buf[12];
+      sprintf(l2Buf, "%.0f W", g_line2Power);
+      lv_label_set_text(lbl_grid_l2_feeder, l2Buf);
+    }
+
+    //L1/L2 Grid -- the real independent per-line grid readings. Each
+    //shown as soon as ITS OWN reading has arrived, independent of the
+    //other line (unlike the ring below, which needs both).
+    if (g_hasLine1GridPower) {
+      char buf[12];
+      sprintf(buf, "%.0f W", g_line1GridPower);
+      lv_label_set_text(lbl_grid_l1_grid, buf);
+    }
+    if (g_hasLine2GridPower) {
+      char buf[12];
+      sprintf(buf, "%.0f W", g_line2GridPower);
+      lv_label_set_text(lbl_grid_l2_grid, buf);
+    }
+
+    //Battery power ring, both the full Grid screen and the Home quadrant's
+    //new test ring: L1+L2 feeder sum, dynamic In/Out/Idle label and the
+    //existing, unchanged battery-state color scheme (Home quadrant uses
+    //the short "Batt" label). Note this is a DIFFERENT ring from the
+    //existing SoC-percentage battery ring in the Home screen's bottom-left
+    //quadrant (ring_home_battery) -- that one is unrelated/unchanged.
+    if (g_line1Power >= 0 && g_line2Power >= 0) {
+      float batteryPower = g_line1Power + g_line2Power;
+
+      char buf[16];
+      sprintf(buf, "%.0f W", batteryPower);
+      lv_label_set_text(lbl_grid_battery_watts, buf);
+      lv_label_set_text(lbl_home_batt_watts, buf);
+
+      const char* battLabel = batteryFlowLabel(g_batteryState);
+      lv_color_t battColor = batteryStateColor(g_batteryState);
+      lv_label_set_text(lbl_grid_battery_label, battLabel);
+      lv_obj_set_style_text_color(lbl_grid_battery_label, battColor, 0);
+      lv_obj_set_style_arc_color(ring_grid_battery, battColor, LV_PART_INDICATOR);
+      lv_obj_set_style_text_color(lbl_home_batt_label, battColor, 0);
+      lv_obj_set_style_arc_color(ring_home_batt_power, battColor, LV_PART_INDICATOR);
+      //Real gauge, not a placeholder arc: magnitude of L1+L2 (batteryPower
+      //can be negative in principle, hence fabs) as a fraction of the real
+      //1800W max discharge/output limit.
+      int16_t battAngle = (int16_t)constrain(fabs(batteryPower) / MAX_BATTERY_POWER * 360.0, 0, 360);
+      lv_arc_set_angles(ring_grid_battery, 0, battAngle);
+      lv_arc_set_angles(ring_home_batt_power, 0, battAngle);
+    }
+
+    //Grid ring (both Home quadrant and full screen): sum of the two
+    //independent real per-line readings -- the genuine whole-household
+    //net grid flow, per the L1Set/L2Set correction earlier this session.
+    //Label text is static ("Grid In/Out", set once at build); only the
+    //color reflects the sign now (blue = pulling from grid, red = giving
+    //power away), per request -- the old 3-state Consuming/Bypassing/
+    //Exporting text is retired.
+    if (g_hasLine1GridPower && g_hasLine2GridPower) {
+      float totalGrid = g_line1GridPower + g_line2GridPower;
+      char wattsBuf[16];
+      sprintf(wattsBuf, "%.0f W", totalGrid);
+      lv_label_set_text(lbl_home_grid_watts, wattsBuf);
+      lv_label_set_text(lbl_grid_grid_watts, wattsBuf);
+
+      lv_color_t flowColor = gridFlowColor(totalGrid);
+      lv_obj_set_style_text_color(lbl_home_grid_status, flowColor, 0);
+      lv_obj_set_style_text_color(lbl_grid_grid_label, flowColor, 0);
+      lv_obj_set_style_text_color(lbl_grid_grid_watts, flowColor, 0);
+      lv_obj_set_style_arc_color(ring_home_grid, flowColor, LV_PART_INDICATOR);
+      lv_obj_set_style_arc_color(ring_grid_grid, flowColor, LV_PART_INDICATOR);
+
+      //Angle was never actually being set here -- both rings were built
+      //with a fixed placeholder arc (60-120 degrees) and only ever had
+      //their COLOR updated afterward, so they looked frozen regardless of
+      //real consumption. Same real-gauge treatment as the Battery ring
+      //above, scaled against MAX_GRID_POWER instead: the ring saturates
+      //at 22kW, but totalGrid/wattsBuf above are never clamped.
+      int16_t gridAngle = (int16_t)constrain(fabs(totalGrid) / MAX_GRID_POWER * 360.0, 0, 360);
+      lv_arc_set_angles(ring_home_grid, 0, gridAngle);
+      lv_arc_set_angles(ring_grid_grid, 0, gridAngle);
+    }
+
+    //Orbiting charge/discharge dot on the SoC ring (see updateOrbitDot()
+    //above): direction/color from g_batteryState, spin rate from real
+    //power -- feeder power (L1+L2) while discharging (1800W = 100%, same
+    //MAX_BATTERY_POWER ceiling as the Battery ring above), grid power
+    //while charging (a temporary stand-in until a real charge-power MQTT
+    //topic exists, per request: a two-point calibrated line, 50W->10%,
+    //7000W->100%, so even a trickle still shows a faint, visible spin
+    //rather than looking dead). Idle never spins, regardless of data; if
+    //the state says charging/discharging but that state's own power data
+    //hasn't arrived yet, the dot stays hidden rather than guessing.
+    {
+      int orbitDirection = 0;
+      float orbitPercent = 0;
+      if (g_batteryState == -1 && g_line1Power >= 0 && g_line2Power >= 0) {
+        orbitDirection = -1;
+        float feederPower = fabs(g_line1Power + g_line2Power);
+        orbitPercent = constrain(feederPower / MAX_BATTERY_POWER * 100.0, 0.0, 100.0);
+      } else if (g_batteryState == 1 && g_hasLine1GridPower && g_hasLine2GridPower) {
+        orbitDirection = 1;
+        float gridPower = fabs(g_line1GridPower + g_line2GridPower);
+        orbitPercent = constrain(10.0 + (gridPower - 50.0) * (90.0 / 6950.0), 0.0, 100.0);
+      }
+      updateOrbitDot(&orbitHomeBattery, orbitDirection, orbitPercent);
+      updateOrbitDot(&orbitBattScreen, orbitDirection, orbitPercent);
+    }
+
+    //Saved Today -- walks today's real g_daySoc* curve instead of a
+    //single instantaneous snapshot, so multiple charge/discharge cycles
+    //in one day all correctly contribute (a snapshot only ever sees the
+    //LAST cycle's state, silently losing an earlier cycle's savings if
+    //the battery recharged back to 100% in between). See
+    //computeSavedFromSocCurve() for the shared logic (also used by Saved
+    //Yesterday below): each discharging segment is priced at the actual
+    //historical TOU tier for that segment's own bucket, falling back to
+    //today's blended rate only if no real discharge has happened yet.
+    float savedToday = computeSavedFromSocCurve(g_daySocBucket, g_daySocValue, g_daySocState, g_daySocCount, localTm.tm_wday, localTm.tm_mon + 1, localTm.tm_mday, tou.weekendOrHoliday);
+    char savedBuf[16];
+    sprintf(savedBuf, "$%.2f", savedToday);
+    lv_label_set_text(lbl_grid_saved, savedBuf);
+
+    //Saved Yesterday -- same curve-walking calc as Saved Today, just
+    //against g_yesterdaySoc* (a full, already-closed day, published
+    //alongside today's curve by the same pyscript automation) and
+    //priced using YESTERDAY's real wday/month/day, not today's -- the
+    //TOU tier schedule and holiday status can differ day to day.
+    tm yesterdayTm;
+    getYesterdayLocalTm(yesterdayTm);
+    bool yesterdayWeekendOrHoliday = (yesterdayTm.tm_wday == 0 || yesterdayTm.tm_wday == 6) || isTouHoliday(yesterdayTm.tm_mon + 1, yesterdayTm.tm_mday);
+    float savedYesterday = computeSavedFromSocCurve(g_yesterdaySocBucket, g_yesterdaySocValue, g_yesterdaySocState, g_yesterdaySocCount, yesterdayTm.tm_wday, yesterdayTm.tm_mon + 1, yesterdayTm.tm_mday, yesterdayWeekendOrHoliday);
+    char savedYesterdayBuf[16];
+    sprintf(savedYesterdayBuf, "$%.2f", savedYesterday);
+    lv_label_set_text(lbl_grid_saved_yesterday, savedYesterdayBuf);
+  }
+}
