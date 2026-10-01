@@ -57,7 +57,7 @@
 // #define MQTT_USERNAME "YourMQTTUsername"
 // #define MQTT_PASSWORD "YourMQTTPassword"
 //
-//
+// Note: This uses the MBED OS as Arduino hasn't fully transitioned to Zephyr
 
 #include "Arduino_H7_Video.h"
 #include "lvgl.h"
@@ -77,14 +77,14 @@
 #define UNIT_NUMBER 1
 #define MAX_POWER 900
 #define STARTUP_DELAY 10 //Startup Delay in Seconds (e.g. 10 minutes as 600 seconds)
-#define COLLECTOR_TIME_CONSTANT 30 
+#define COLLECTOR_TIME_CONSTANT 10 //Time in seconds to wait, was 35 sec
 
 bool trace = true;
 
 //Unit >2 is only MQTT subscriber, not publisher Unit 1 is sub/pubber
 #define UNIT_NUMBER 1
 
-#define VERSION_POWER "1.0.7"
+#define VERSION_POWER "1.0.10"
 //version 1.0.0 - clock showing UTC
 //version 1.0.1 - fixed clock and included version referencing
 //version 1.0.2 - include MQTT publishing and pubsub
@@ -99,6 +99,9 @@ bool trace = true;
 //version 1.0.7 - First production version
 //version 1.0.8 - Running version minor fixes including watchdog on inputs
 //version 1.0.9 - GitHub version posting
+//version 1.0.10 - Some updates to algorithm
+//                Add Line1 and Line2 Enable Messages and logic
+//version 1.0.11 - some bug fixes because of dropoffs and non-loops
 //
 //TODO: Report on output
 //      Time of Use
@@ -148,6 +151,8 @@ const char pubtopic1[]  = "V1.0/Home/PowerFeeder/Line1";
 const char pubtopic2[]  = "V1.0/Home/PowerFeeder/Line2";
 const char subtopic1[]  = "V1.0/Home/PowerFeeder/Line1Set";
 const char subtopic2[]  = "V1.0/Home/PowerFeeder/Line2Set";
+const char subtopic3[]  = "V1.0/Home/PowerFeeder/Line1Enable";
+const char subtopic4[]  = "V1.0/Home/PowerFeeder/Line2Enable";
 
 //set interval for sending messages (milliseconds)
 const long interval = 5000;
@@ -227,6 +232,9 @@ uint16_t L2_Output = 0;
 
 uint16_t L1_State = 0;
 uint16_t L2_State = 0;
+
+bool Line1Enable = true;
+bool Line2Enable = true;
 
 //use float Power1 and 2 for display
 float f_L1_Power=0.0;
@@ -314,6 +322,15 @@ void connectToWiFi(void){
     if (verbosity > 0) Serial.println("Communication with WiFi module failed!");
     // don't continue
     while (true);
+  }
+
+  Serial.println("Scanning for networks...");
+  int n = WiFi.scanNetworks();
+  for (int i = 0; i < n; i++) {
+    Serial.print(WiFi.SSID(i));
+    Serial.print(" (");
+    Serial.print(WiFi.RSSI(i));
+    Serial.println(" dBm)");
   }
 
   // attempt to connect to WiFi network:
@@ -457,6 +474,38 @@ void onMqttMessage(int messageSize) {
     f_L2_Power = String(tbuf).toFloat();
     b_New_L2_Power = true;
   }
+  if(topic.equals(subtopic3)){
+    // use the Stream interface to print the contents
+    while (mqttClient.available()) {
+      tbuf[size]=(char)mqttClient.read();
+      size++;    
+    }
+    tbuf[size]=NULL;
+    if (verbosity > 4) Serial.print(String(tbuf));
+    if (verbosity > 4) Serial.println();
+    //set number based on input
+    if (!strcmp(tbuf,"On")){
+      Line1Enable = true;
+    } else if (!strcmp(tbuf,"Off")) {
+      Line1Enable = false;
+    }
+  }
+  if(topic.equals(subtopic4)){
+    // use the Stream interface to print the contents
+    while (mqttClient.available()) {
+      tbuf[size]=(char)mqttClient.read();
+      size++;    
+    }
+    tbuf[size]=NULL;
+    if (verbosity > 4) Serial.print(String(tbuf));
+    if (verbosity > 4) Serial.println();
+    //set number based on input
+    if (!strcmp(tbuf,"On")){
+      Line2Enable = true;
+    } else if (!strcmp(tbuf,"Off")) {
+      Line2Enable = false;
+    }
+  }
 }
 
 void displayInValues(float L1, float L2, uint16_t L1PM, uint16_t L2PM) {
@@ -595,6 +644,22 @@ void setup() {
   // subscribe to a topic
   mqttClient.subscribe(subtopic2);
 
+  // Subscribe to a topic
+  if (verbosity > 0) {
+    Serial.print("Subscribing to topic: ");
+    Serial.println(subtopic3);
+    Serial.println();
+  }
+  // subscribe to a topic
+  mqttClient.subscribe(subtopic3);
+  // Subscribe to a topic
+  if (verbosity > 0) {
+    Serial.print("Subscribing to topic: ");
+    Serial.println(subtopic4);
+    Serial.println();
+  }
+  // subscribe to a topic
+  mqttClient.subscribe(subtopic4);
   tStart = millis();
 }
 
@@ -782,41 +847,102 @@ void loop() {
   if(b_New_L1_Power){
     //f_L1_Power = String(tbuf).toFloat();
     //b_New_L1_Power = true;
-    if(!b_Start) { //account for delays in readout as well as power feeder 30 sec otherwise throw out update
-      float tOutput; //use positive and negative values
-      if (currentTime > (lastPowerChangeL1 + 30000)){
-        tOutput = L1_Output + f_L1_Power; //if f_L1_Power is negative, it will lower power out
-        if (tOutput > MAX_POWER) tOutput = MAX_POWER;
-        if ((f_L2_Power < 0) && (L2_Power==0)) tOutput += f_L2_Power; //try to balance loads
-        if (tOutput<0) tOutput = 0;
-        lastPowerChangeL1 = currentTime;
-      }else{
-        tOutput = L1_Output;
+    if(!b_Start) { //account for delays in readout as well as power feeder COLLECTOR_TIME_CONSTANT sec otherwise throw out update
+      //L1_Output, L2_Output = the power being requested from the feeder. Set to 0 if disabled (otherwise it will go to 900 W)
+      //f_L1_Power, f_L2_Power = the signed number (a float) being read by a Refoss energy meter
+      //f_L1_Power + f_L2_Power = the total power being fed to (or from) the grid
+      if (Line1Enable) {
+        float tL1_Output = 0.0; //temp output = use positive and negative values temporary calculation with limits
+        float tL2_Output = 0.0;
+        float totalOutput = 0.0;
+        float gridDelta = 0.0;
+        if (currentTime > (lastPowerChangeL1 + 1000*COLLECTOR_TIME_CONSTANT)){
+          //tOutput = L1_Output + f_L1_Power; //if f_L1_Power is negative, it will lower power out
+          totalOutput = (f_L1_Power + f_L2_Power) + (L1_Output + L2_Output);
+          gridDelta = f_L1_Power + f_L2_Power;
+          if (gridDelta != 0) { //need to change L1 and L2
+            tL1_Output = L1_Output + gridDelta/2;
+            tL2_Output = L2_Output + gridDelta/2;
+            if (tL1_Output > MAX_POWER) L1_Output = MAX_POWER;
+            if (tL2_Output > MAX_POWER) L2_Output = MAX_POWER;
+            if (tL1_Output < 0) L1_Output = 0;
+            if (tL2_Output < 0) L2_Output = 0;
+
+            L1_Output = (uint16_t) tL1_Output;
+            L2_Output = (uint16_t) tL2_Output;
+            lastPowerChangeL1 = currentTime;
+            lastPowerChangeL2 = currentTime;
+            b_New_L2_Power = true; //trigger L2 code
+            //L1_Output = tOutput;
+            //L1_Output += L1_Output + gridDelta/2;
+            //L2_Output += L2_Output + gridDelta/2;
+          }
+        }
       }
-      L1_Output = (int) tOutput;
+        //   tOutput = (f_L1_Power + f_L2_Power) - (L1_Output + L2_Output);//grid delta
+        //   tOutput += (float) L1_Output;
+        //   if ( tOutput < 0 ) L1_Output = 0;
+        //   if ((tOutput > MAX_POWER) && (L2_Output>=0) && Line2Enable ){
+        //     L1_Output = MAX_POWER; //Set L1 to max and try to add delta to L2 if maxed out
+        //     tOutput -= MAX_POWER; //remainder for L2
+        //     if ((L2_Output + tOutput) > MAX_POWER) { //Check if L2 is maxed out
+        //       L2_Output = MAX_POWER;
+        //     } else {
+        //       L2_Output += tOutput; //start shifting over to Line 2
+        //     }
+        //     b_New_L2_Power = true; //trigger an L2 change within COLLECTOR_TIME_CONSTANT seconds
+        //   }
+        //   //if ((f_L2_Power < 0) && (L2_Power==0)) tOutput += f_L2_Power; //try to balance loads
+          
+        //   lastPowerChangeL1 = currentTime;
+        // }else{
+        //   tOutput = L1_Output;
+        // }
+      //   L1_Output = (int) tOutput;
+      // } else {
+      //   L1_Output = 0;
     }
+  
     //if (trace) {Serial.print("L1_Output = "); Serial.println(L1_Output);}
     b_New_L1_Power=false;//fully processed power
     bSendMessage1=true; //output the new value to the feeder
     bDisplayMessage=true;
   }
   
+  //L1 Power is now coded to try and handle all of the grid delta. If more comes in it will go into L2. The lines
+  //seem to act as an autotransformer so overall some might be reading negative currents even though the delta is
+  //correct and matches the utility. Now a new L2 Power could cause a race condition, where both L1 and L2 try to
+  //compete with each other. So instead of just trying to adjust L2 based on a new output, we can just look and see
+  //if L2 is negative. If it is, we can assume L1 is handling most of the power, and feeding more on L2 really isn't
+  //going to help, but cutting it to zero is not going to either. So we just do the code if L1 is not enabled but L2 is.
+
   if(b_New_L2_Power){
-    //f_L1_Power = String(tbuf).toFloat();
-    //b_New_L1_Power = true;
-    if(!b_Start) { //account for delays in readout as well as power feeder 30 sec otherwise throw out update
-      float tOutput; //use positive and negative values
-      if (currentTime > (lastPowerChangeL2 + 30000)){
-        tOutput = L2_Output + f_L2_Power; //if f_L1_Power is negative, it will lower power out
-        if (tOutput > MAX_POWER) tOutput = MAX_POWER;
-        if ((f_L1_Power < 0) && (L1_Power==0)) tOutput += f_L1_Power; //try to balance loads
-        if (tOutput<0) tOutput = 0;
-        lastPowerChangeL2 = currentTime;
-      }else{
-        tOutput = L2_Output;
+    if (Line2Enable) {
+      if (!Line1Enable){ //avoid a race but feed power if L1 is off independently
+        //f_L1_Power = String(tbuf).toFloat();
+        //b_New_L1_Power = true;
+        if(!b_Start) { //account for delays in readout as well as power feeder COLLECTOR_TIME_CONSTANT sec otherwise throw out update
+          float tOutput; //use positive and negative values
+          if (currentTime > (lastPowerChangeL2 + 1000*COLLECTOR_TIME_CONSTANT)){
+            //tOutput = L2_Output + f_L2_Power; //if f_L1_Power is negative, it will lower power out
+            tOutput = (f_L1_Power + f_L2_Power) - (L2_Output);
+            if (tOutput > MAX_POWER) tOutput = MAX_POWER;
+            //if ((f_L1_Power < 0) && (L1_Power==0)) tOutput += f_L1_Power; //try to balance loads
+            if (tOutput<0) tOutput = 0;
+            lastPowerChangeL2 = currentTime;
+          }else{
+            tOutput = L2_Output;
+          }
+          L2_Output = (int) tOutput;
+        } else {
+          L2_Output = 0;
+        }
       }
-      L2_Output = (int) tOutput; 
+    } else {
+      L2_Output = 0;
     }
+    
+    //L2_Output may have been updated in the L1 code
     //if (trace) {Serial.print("L2_Output = "); Serial.println(L2_Output);}
     b_New_L2_Power=false;//fully processed power
     bSendMessage2=true; //output the new value to the feeder
@@ -825,10 +951,7 @@ void loop() {
 
   lv_timer_handler();
 
-    if ((tick > 4)  && (UNIT_NUMBER < 2)) {
-    //read value from A0
-    //int Rvalue = random(2000);
-
+  if ((tick > 4)  && (UNIT_NUMBER < 2)) {
     //print to serial monitor
     if (verbosity > 4){
       Serial.print("Sending message to topic: '");
@@ -840,17 +963,16 @@ void loop() {
       Serial.print((uint16_t) L2_Output);
       Serial.println();
     }
-      //publish the message to the specific topic
-      mqttClient.beginMessage(pubtopic1);
-      mqttClient.print((uint16_t) L1_Output);
-      mqttClient.endMessage();
-      //publish the message to the specific topic
-      mqttClient.beginMessage(pubtopic2);
-      mqttClient.print((uint16_t) L2_Output);
-      mqttClient.endMessage();
-      tick=0;
+    //publish the message to the specific topic
+    mqttClient.beginMessage(pubtopic1);
+    mqttClient.print((uint16_t) L1_Output);
+    mqttClient.endMessage();
+    //publish the message to the specific topic
+    mqttClient.beginMessage(pubtopic2);
+    mqttClient.print((uint16_t) L2_Output);
+    mqttClient.endMessage();
+    tick=0;
   }
-
 
   // call poll() regularly to allow the library to send MQTT keep alives which
   // avoids being disconnected by the broker
