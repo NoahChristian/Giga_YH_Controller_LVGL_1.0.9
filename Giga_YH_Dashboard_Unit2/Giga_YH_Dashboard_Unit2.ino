@@ -93,7 +93,6 @@
 //that type is already defined by this point. Hence these being all the
 //way up here instead of next to the functions that use them below.
 enum TouTier { TOU_SUPER_OFF_PEAK, TOU_OFF_PEAK, TOU_ON_PEAK };
-struct MonthDay { uint8_t month; uint8_t day; };
 struct TouStatus {
   TouTier tier;
   double rate;
@@ -133,7 +132,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.63"
+#define VERSION_DASHBOARD "1.0.64"
 //version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
 //version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
 //version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
@@ -316,6 +315,21 @@ uint32_t dsi_getDisplayYSize(void);
 //                 still $0.XX, so the worst-case widths these pills size against are unchanged.
 //                 Still outstanding: TOU_HOLIDAYS_2026 is 2026-only, so from 2027-01-01 every
 //                 holiday silently bills as a weekday (super off-peak ending 6am, not 2pm).
+//version 1.0.64 - TOU holidays are now derived from the date rather than read from a hardcoded
+//                 2026 table, closing the gap flagged in 1.0.63: from 2027-01-01 every holiday
+//                 would have billed as an ordinary weekday, ending super off-peak at 6am instead
+//                 of 2pm on eight days a year, with nothing on screen to show it was wrong.
+//                 Each holiday is either a fixed date or the Nth given-weekday of a month, and
+//                 both callers already held the weekday, so isTouHoliday() now takes wday and
+//                 reduces to range tests (3rd Monday -> days 15-21, last Monday -> day >= 25,
+//                 and so on). No day-of-week arithmetic, no year parameter, no table to maintain.
+//                 It also implements the Sunday -> observed-Monday rule that the old comment
+//                 acknowledged but skipped; 2027 is the first year that needs it, since Jul 4
+//                 falls on a Sunday and the holiday moves to Mon Jul 5.
+//                 MonthDay and TOU_HOLIDAYS_2026 are deleted -- nothing else referenced them.
+//                 Verified every day of 2026 through 2040 against an independently computed
+//                 holiday set: all 15 years agree on which days are weekend-shaped, and 2026
+//                 reproduces the deleted table exactly.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -599,24 +613,41 @@ const char* batteryStateText(int state) {
 //energy (state-of-charge x capacity), not a gauge saturation point.
 #define BATTERY_CAPACITY_KWH 18.0
 
-//2026 TOU holiday dates (month, day), computed exactly with Python (not
-//by hand -- see conversation). None fall on a Sunday this year, so the
-//"shift to the following Monday" rule needs no code this pass.
-static const MonthDay TOU_HOLIDAYS_2026[] = {
-  { 1, 1 },    //New Year's Day
-  { 1, 19 },   //MLK Day
-  { 2, 16 },   //Presidents' Day
-  { 5, 25 },   //Memorial Day
-  { 7, 4 },    //Independence Day
-  { 9, 7 },    //Labor Day
-  { 11, 26 },  //Thanksgiving
-  { 12, 25 },  //Christmas Day
-};
+//TOU holidays, derived from the date instead of tabulated, so this never
+//needs a new table again. The previous version hardcoded 2026 only and
+//would have silently treated every 2027 holiday as an ordinary weekday --
+//super off-peak ending at 6am instead of 2pm, on eight days a year, with
+//nothing on screen to indicate it was wrong.
+//
+//Every holiday here is either a fixed date or the Nth given-weekday of a
+//month, and every caller already knows the weekday, so each case reduces
+//to a range test. No day-of-week arithmetic and no year parameter:
+//    1st Monday  -> days 1-7        3rd Monday   -> days 15-21
+//    4th Thursday-> days 22-28      last Monday  -> day >= 25
+//
+//wday follows tm_wday: 0 = Sunday, 1 = Monday ... 6 = Saturday.
+//
+//A fixed-date holiday falling on a Sunday is observed the following
+//Monday. The Sunday itself needs no case because Sundays are already
+//weekend-shaped, and landing on a Monday is itself proof the day before
+//was that Sunday, so no extra date maths is needed there either.
+bool isTouHoliday(int month, int day, int wday) {
+  //Fixed dates.
+  if ((month == 1 && day == 1) || (month == 7 && day == 4) || (month == 12 && day == 25)) return true;
 
-bool isTouHoliday(int month, int day) {
-  for (size_t i = 0; i < sizeof(TOU_HOLIDAYS_2026) / sizeof(TOU_HOLIDAYS_2026[0]); i++) {
-    if (TOU_HOLIDAYS_2026[i].month == month && TOU_HOLIDAYS_2026[i].day == day) return true;
+  if (wday == 1) {  //Monday
+    //Observed the day after a Sunday holiday.
+    if ((month == 1 && day == 2) || (month == 7 && day == 5) || (month == 12 && day == 26)) return true;
+
+    if (month == 1 && day >= 15 && day <= 21) return true;  //MLK Day, 3rd Monday
+    if (month == 2 && day >= 15 && day <= 21) return true;  //Presidents' Day, 3rd Monday
+    if (month == 5 && day >= 25) return true;               //Memorial Day, last Monday
+    if (month == 9 && day <= 7) return true;                //Labor Day, 1st Monday
   }
+
+  //Thanksgiving, 4th Thursday of November.
+  if (wday == 4 && month == 11 && day >= 22 && day <= 28) return true;
+
   return false;
 }
 
@@ -649,7 +680,7 @@ int buildTouWindows(bool weekendOrHoliday, TouWindow* out) {
 
 TouStatus computeTouStatus(int hour, int wday, int month, int day) {
   TouStatus s;
-  s.weekendOrHoliday = (wday == 0 || wday == 6) || isTouHoliday(month, day);
+  s.weekendOrHoliday = (wday == 0 || wday == 6) || isTouHoliday(month, day, wday);
   TouWindow windows[6];
   int n = buildTouWindows(s.weekendOrHoliday, windows);
   for (int i = 0; i < n; i++) {
@@ -4051,7 +4082,7 @@ void loop() {
     //TOU tier schedule and holiday status can differ day to day.
     tm yesterdayTm;
     getYesterdayLocalTm(yesterdayTm);
-    bool yesterdayWeekendOrHoliday = (yesterdayTm.tm_wday == 0 || yesterdayTm.tm_wday == 6) || isTouHoliday(yesterdayTm.tm_mon + 1, yesterdayTm.tm_mday);
+    bool yesterdayWeekendOrHoliday = (yesterdayTm.tm_wday == 0 || yesterdayTm.tm_wday == 6) || isTouHoliday(yesterdayTm.tm_mon + 1, yesterdayTm.tm_mday, yesterdayTm.tm_wday);
     float savedYesterday = computeSavedFromSocCurve(g_yesterdaySocBucket, g_yesterdaySocValue, g_yesterdaySocState, g_yesterdaySocCount, yesterdayTm.tm_wday, yesterdayTm.tm_mon + 1, yesterdayTm.tm_mday, yesterdayWeekendOrHoliday);
     char savedYesterdayBuf[16];
     sprintf(savedYesterdayBuf, "$%.2f", savedYesterday);
