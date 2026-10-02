@@ -1,11 +1,14 @@
 # Draft upstream report: Arduino_H7_Video's bundled `lv_conf.h` breaks LVGL 9.6.0 on GIGA
 
-Status: **draft, not yet filed.** Target repo: [arduino/ArduinoCore-mbed](https://github.com/arduino/ArduinoCore-mbed).
+Status: **FILED 2026-10-01 as [arduino/ArduinoCore-mbed#1121](https://github.com/arduino/ArduinoCore-mbed/issues/1121).** This file is the working notes behind it; the filed text is the issue itself.
 Written 2026-10-01 from a reproduction on this machine. A secondary, unrelated LVGL PR
 candidate is noted at the end.
 
-Before filing, search the tracker again — related existing issues are listed under
-[Prior art](#prior-art); this may belong as a comment on one of them rather than a new issue.
+Checked for duplicates before filing: nothing in the tracker covered this. The closest,
+#1120, is a different symptom in the same library arising from the same quoted-`__has_include`
+fragility, and is cross-referenced from the issue. #1106 and #1119 are display-buffer bugs.
+
+The LVGL PR candidate at the end of this document is still **unfiled**.
 
 ---
 
