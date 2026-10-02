@@ -3,7 +3,10 @@
 //Version 1.0.9 - GitHub version posting
 //
 //Purpose: This controls power flow to a home based on time-of-use rates that
-//  can vary as much as 8x from peak to off-peak. Thus it can act as an arbitrator
+//  vary about 6x from peak to super-off-peak in summer and about 4x in winter
+//  (SDG&E Schedule EV-TOU-5; the rate table itself lives in the Unit 2
+//  dashboard sketch, which is the only unit that displays prices).
+//  Thus it can act as an arbitrator
 //  of power rates for a household with appropriate hardware. THe Y-H hardware is
 //  designed out-of-the-box to feed power from downstream current monitoring. This
 //  is not an easy connection in the US grid because the current monitor really
@@ -84,7 +87,7 @@ bool trace = true;
 //Unit >2 is only MQTT subscriber, not publisher Unit 1 is sub/pubber
 #define UNIT_NUMBER 1
 
-#define VERSION_POWER "1.0.10"
+#define VERSION_POWER "1.0.11b"
 //version 1.0.0 - clock showing UTC
 //version 1.0.1 - fixed clock and included version referencing
 //version 1.0.2 - include MQTT publishing and pubsub
