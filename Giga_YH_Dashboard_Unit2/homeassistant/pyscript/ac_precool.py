@@ -169,14 +169,23 @@ def publish_ac_precool():
                 prev = v
             t += datetime.timedelta(minutes=BUCKET_MINUTES)
 
-    watts_now = sum(_num(e) for e in AC_POWER_ENTITIES)
+    # Explicit loops throughout rather than generator expressions:
+    # pyscript's restricted AST interpreter raises
+    # "NotImplementedError: not implemented ast_generatorexp" on them.
+    watts_now = 0.0
+    for e in AC_POWER_ENTITIES:
+        watts_now += _num(e)
 
     # What it cost, versus what the pre-battery mix would have cost for
     # the same kWh. Both priced at today's season, so the figure is a
     # behaviour difference and not a seasonal one.
     rates = RATES[_season(now.date())]
-    actual = sum(by_tier[t] * rates[t] for t in by_tier)
-    baseline_rate = sum(BASELINE_MIX[t] * rates[t] for t in BASELINE_MIX)
+    actual = 0.0
+    for t in by_tier:
+        actual += by_tier[t] * rates[t]
+    baseline_rate = 0.0
+    for t in BASELINE_MIX:
+        baseline_rate += BASELINE_MIX[t] * rates[t]
     saved = total * baseline_rate - actual
 
     payload = "{:.2f}:{:.2f}:{:.2f}:{:.2f}:{:.0f}:{:.2f}".format(
