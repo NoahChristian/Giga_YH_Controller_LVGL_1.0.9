@@ -8,7 +8,7 @@ Checked for duplicates before filing: nothing in the tracker covered this. The c
 #1120, is a different symptom in the same library arising from the same quoted-`__has_include`
 fragility, and is cross-referenced from the issue. #1106 and #1119 are display-buffer bugs.
 
-The LVGL PR candidate at the end of this document is still **unfiled**.
+The LVGL PR candidate at the end of this document was filed as [lvgl/lvgl#10798](https://github.com/lvgl/lvgl/pull/10798).
 
 ---
 
@@ -181,7 +181,14 @@ Search before filing; this may be a comment on an existing thread.
 # Secondary, unrelated: LVGL PR candidate
 
 Separate from the above, and against [lvgl/lvgl](https://github.com/lvgl/lvgl) rather than
-the Arduino core.
+the Arduino core. **Filed 2026-10-01 as [lvgl/lvgl#10798](https://github.com/lvgl/lvgl/pull/10798)** (+12/-1 in
+`src/core/lv_obj_tree.c`).
+
+The filed version keeps the old pointer on failure rather than returning early, because
+`obj_delete_core()` is mid-deletion and still has to unparent and free `obj`. It also needs
+no zero-count special case, unlike `lv_obj_remove_child()`: `lv_realloc(p, 0)` frees `p` and
+returns the non-NULL `&zero_mem` sentinel, so deleting the last screen cannot be mistaken
+for an allocation failure.
 
 LVGL 9.6.0 fixed the unchecked `lv_realloc()` results on the children-array paths
 ([#9794](https://github.com/lvgl/lvgl/issues/9794) /
