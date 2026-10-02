@@ -133,7 +133,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.62"
+#define VERSION_DASHBOARD "1.0.63"
 //version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
 //version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
 //version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
@@ -295,6 +295,27 @@ uint32_t dsi_getDisplayYSize(void);
 //                 doesn't exist that day. Sunrise/sunset switched from the sun.sun entity's
 //                 next_rising/next_setting (same "next from now" problem, just far less
 //                 noticeable) to the identical skyfield calendar-day approach, for consistency.
+//version 1.0.63 - TOU rates corrected and made seasonal. The three rate constants here matched no
+//                 published SDG&E schedule at any 2025-2026 vintage -- super off-peak read 9.469
+//                 cents against EV-TOU-5's real 13.090 -- and were summer-only besides. Replaced
+//                 with the total electric rates (UDC + WF-NBC/DWR-BC + EECC) from SDG&E's Schedule
+//                 EV-TOU-5 table effective 2026-08-01, now split by season because SDG&E's summer
+//                 is Jun 1 - Oct 31 and winter is Nov 1 - May 31. The old numbers understated
+//                 every summer rate (on-peak by 14.8 cents/kWh), and with no winter set at all
+//                 they would from 2026-11-01 have OVERstated winter on-peak by 13.0 cents/kWh.
+//                 The real seasonal on-peak swing is 27.8 cents (80.2 -> 52.4), which the sketch
+//                 did not model; Saved Today was wrong in both directions, not just one.
+//                 touRate() now takes the month, and every call site already had one
+//                 in scope (computeTouStatus, computeSavedFromSocCurve, the pill refresh), so the
+//                 historical Saved Today walk prices each bucket in its own season too.
+//                 The schedule HOURS were re-verified against SDG&E's EV plan page and are
+//                 unchanged: weekday super off-peak really is both 12am-6am AND 10am-2pm. That
+//                 midday window went year-round on 2026-05-01 (previously March/April only),
+//                 which is exactly what the 2026-07-13 correction had caught.
+//                 Pill placeholders moved 0.09 -> 0.13 and 0.65 -> 0.80; all six real rates are
+//                 still $0.XX, so the worst-case widths these pills size against are unchanged.
+//                 Still outstanding: TOU_HOLIDAYS_2026 is 2026-only, so from 2027-01-01 every
+//                 holiday silently bills as a weekday (super off-peak ending 6am, not 2pm).
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -518,13 +539,45 @@ const char* batteryStateText(int state) {
   return state == 1 ? "Charging" : state == -1 ? "Discharging" : "Idle";
 }
 
-//---- Time-of-use rates and schedule (summer; display-only) ----
-//Real rates and hours as given 2026-07-13. Unit 2 has no control
-//authority over anything -- this only drives what's *displayed* here,
-//never what Unit 1 actually does with the battery.
-#define RATE_SUPER_OFF_PEAK 0.09469
-#define RATE_OFF_PEAK       0.43492
-#define RATE_ON_PEAK        0.65410
+//---- Time-of-use rates and schedule (display-only) ----
+//Plan: SDG&E Schedule EV-TOU-5 (the residential EV rate). Values are the
+//TOTAL electric rate per kWh -- UDC + WF-NBC/DWR-BC + EECC -- which is
+//what a bundled customer actually pays for a marginal kWh. Taken from
+//SDG&E's published rate table effective 2026-08-01:
+//  sdge.com/sites/default/files/regulatory/
+//    8-1-26 Schedule EV-TOU-5 Total Rates Table.pdf
+//Cross-checked by arithmetic: each total below equals its own UDC +
+//WF-NBC/DWR-BC + EECC components in that table, so these are not
+//transcription guesses.
+//
+//Seasonal, which the single set of constants here previously was not.
+//SDG&E's summer is Jun 1 - Oct 31 and winter is Nov 1 - May 31, and
+//winter compresses the spread hard: on-peak falls from $0.80 to $0.52
+//while super off-peak barely moves ($0.131 -> $0.123). The peak-to-trough
+//arbitrage this system exists to exploit is therefore worth about 6.1x in
+//summer but only 4.2x in winter.
+//
+//Deliberately NOT modelled: the daily Base Services Charge and
+//EV-TOU-5's monthly basic service fee. Both are flat, so neither changes
+//what moving a kWh from on-peak to super off-peak is worth, which is the
+//only thing Saved Today measures. Same reasoning for CARE/FERA
+//discounts. EV-TOU-5 has no 130%-of-baseline credit line at all, unlike
+//TOU-DR1, so there is nothing to net out there either.
+//
+//Caveat: generation on this account is supplied by San Diego Community
+//Power, not SDG&E, so the EECC component folded into these totals is
+//SDG&E's rather than SDCP's. The tier boundaries and hours are exact;
+//the absolute cents carry a few percent of uncertainty until derived
+//from an actual bill.
+//
+//Unit 2 has no control authority over anything -- these only drive what
+//is *displayed* here, never what Unit 1 does with the battery.
+#define RATE_SUMMER_SUPER_OFF_PEAK 0.13090
+#define RATE_SUMMER_OFF_PEAK       0.49627
+#define RATE_SUMMER_ON_PEAK        0.80205
+#define RATE_WINTER_SUPER_OFF_PEAK 0.12332
+#define RATE_WINTER_OFF_PEAK       0.46566
+#define RATE_WINTER_ON_PEAK        0.52383
 
 //Real hardware limit, per the user: max battery DISCHARGE/output is
 //1800W -- charging has no such limit (battery can charge as fast as it
@@ -606,12 +659,22 @@ TouStatus computeTouStatus(int hour, int wday, int month, int day) {
       break;
     }
   }
-  s.rate = touRate(s.tier);
+  s.rate = touRate(s.tier, month);
   return s;
 }
 
-double touRate(TouTier tier) {
-  return tier == TOU_ON_PEAK ? RATE_ON_PEAK : tier == TOU_SUPER_OFF_PEAK ? RATE_SUPER_OFF_PEAK : RATE_OFF_PEAK;
+//SDG&E's rate seasons, which are NOT the astronomical seasons used
+//elsewhere in this sketch: summer is Jun 1 - Oct 31, winter is
+//Nov 1 - May 31. Month is 1-based, matching tm_mon + 1.
+bool isTouSummer(int month) {
+  return month >= 6 && month <= 10;
+}
+
+double touRate(TouTier tier, int month) {
+  if (isTouSummer(month)) {
+    return tier == TOU_ON_PEAK ? RATE_SUMMER_ON_PEAK : tier == TOU_SUPER_OFF_PEAK ? RATE_SUMMER_SUPER_OFF_PEAK : RATE_SUMMER_OFF_PEAK;
+  }
+  return tier == TOU_ON_PEAK ? RATE_WINTER_ON_PEAK : tier == TOU_SUPER_OFF_PEAK ? RATE_WINTER_SUPER_OFF_PEAK : RATE_WINTER_OFF_PEAK;
 }
 
 //Of the two tiers OTHER than the current one, which appears next going
@@ -708,7 +771,8 @@ float computeSavedFromSocCurve(uint8_t* bucketArr, uint8_t* valueArr, uint8_t* s
       computeElapsedTierHours(weekendOrHoliday, 24.0, &onPeakHours, &offPeakHours);
       float totalHours = onPeakHours + offPeakHours;
       if (totalHours > 0) {
-        float blendedRate = (onPeakHours * RATE_ON_PEAK + offPeakHours * RATE_OFF_PEAK) / totalHours;
+        float blendedRate = (onPeakHours * touRate(TOU_ON_PEAK, month)
+                             + offPeakHours * touRate(TOU_OFF_PEAK, month)) / totalHours;
         saved = (netCharged / 100.0) * BATTERY_CAPACITY_KWH * blendedRate;
       }
     }
@@ -1743,7 +1807,7 @@ lv_obj_t* makeAutoPill(lv_obj_t* parent, lv_color_t bg, lv_color_t textColor, co
 //the screen's left edge and triggering scr_home's default scrollable
 //behavior (a visible scrollbar) even though nothing was meant to scroll.
 //Sizing to each real value's own width instead keeps the pill snug, the
-//same way pill_home_tou's fixed "$0.65/kWh" width already reads as snug.
+//same way pill_home_tou's fixed "$0.80/kWh" width already reads as snug.
 //Both the pill and its inner label were built with a persistent
 //LV_ALIGN_TOP_MID/lv_obj_center (a style-based align, not a one-time
 //lv_obj_set_pos -- see lbl_almanac_weather's identical fix), so resizing
@@ -2598,7 +2662,7 @@ void buildHomeScreen() {
   //amber-ish "warning" background behind green text would look wrong.
   //Real text/color set every second in loop(); this placeholder is just
   //sized correctly ($0.XX/kWh is the same length for all three rates).
-  pill_home_tou = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_RED, "$0.65/kWh", 16, 40);
+  pill_home_tou = makeAutoPill(q_time, lv_color_hex(0x17191c), COLOR_RED, "$0.80/kWh", 16, 40);
   lv_obj_align(pill_home_tou, LV_ALIGN_TOP_MID, 0, 190);
 
   //Hidden by default -- setConnStatusIndicator(WIFI_UI_CONNECTING), called
@@ -2761,20 +2825,20 @@ void buildTimeScreen() {
   //fixed-size design, 1.0.26) is correctly sized from the start --
   //real text set every second in loop() could otherwise be longer than
   //a shorter placeholder and overflow the pill.
-  pill_time_tou = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_RED, "Super off-peak - $0.09/kWh - until 12:00 AM", 20, 44);
+  pill_time_tou = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_RED, "Super off-peak - $0.13/kWh - until 12:00 AM", 20, 44);
   lv_obj_align(pill_time_tou, LV_ALIGN_TOP_MID, 0, 295);
 
   //The other two rates, no "until" time -- ordered by whichever comes
   //next in the schedule first, per request. Stacked one per row (not
   //side by side -- a side-by-side pair ran off both edges of the
-  //screen, since "Super off-peak - $0.09/kWh" is long enough that two
+  //screen, since "Super off-peak - $0.13/kWh" is long enough that two
   //of them plus a gap don't fit in 800px). Each is its own
   //individually-centered pill, same pattern as the main pill above.
   //Placeholder text is again the worst-case length so build-time sizing
   //is correct no matter which tier ends up in which pill at runtime.
-  pill_time_next = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_AMBER, "Super off-peak - $0.09/kWh", 20, 40);
+  pill_time_next = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_AMBER, "Super off-peak - $0.13/kWh", 20, 40);
   lv_obj_align(pill_time_next, LV_ALIGN_TOP_MID, 0, 350);
-  pill_time_third = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_GREEN, "Super off-peak - $0.09/kWh", 20, 40);
+  pill_time_third = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_GREEN, "Super off-peak - $0.13/kWh", 20, 40);
   lv_obj_align(pill_time_third, LV_ALIGN_TOP_MID, 0, 401);
 }
 
@@ -3775,13 +3839,13 @@ void loop() {
     findUpcomingTiers(tou.tier, tou.weekendOrHoliday, localTm.tm_hour, &nextTier, &thirdTier);
 
     char nextBuf[32];
-    sprintf(nextBuf, "%s - $%.2f/kWh", touTierName(nextTier), touRate(nextTier));
+    sprintf(nextBuf, "%s - $%.2f/kWh", touTierName(nextTier), touRate(nextTier, localTm.tm_mon + 1));
     lv_obj_t* nextLbl = lv_obj_get_child(pill_time_next, 0);
     lv_label_set_text(nextLbl, nextBuf);
     lv_obj_set_style_text_color(nextLbl, touTierColor(nextTier), 0);
 
     char thirdBuf[32];
-    sprintf(thirdBuf, "%s - $%.2f/kWh", touTierName(thirdTier), touRate(thirdTier));
+    sprintf(thirdBuf, "%s - $%.2f/kWh", touTierName(thirdTier), touRate(thirdTier, localTm.tm_mon + 1));
     lv_obj_t* thirdLbl = lv_obj_get_child(pill_time_third, 0);
     lv_label_set_text(thirdLbl, thirdBuf);
     lv_obj_set_style_text_color(thirdLbl, touTierColor(thirdTier), 0);

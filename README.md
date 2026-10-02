@@ -1,7 +1,8 @@
 # Giga YH — Time-of-Use Power Controller
 
 Home power flow arbitrated against time-of-use electricity rates that swing
-as much as 8x between peak and off-peak. Two Arduino Giga R1 boards:
+about 6x between peak and super-off-peak in summer, and about 4x in winter
+(SDG&E Schedule EV-TOU-5). Two Arduino Giga R1 boards:
 
 - **Unit 1 — controller** (`Giga_YH_Controller_LVGL_1.0.9.ino`): reads signed
   grid power from a Home Assistant current monitor and trims two Y-H
