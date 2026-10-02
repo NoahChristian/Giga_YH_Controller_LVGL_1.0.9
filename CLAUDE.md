@@ -162,17 +162,32 @@ household consumption is their sum. This contradicts the assumption behind
 Unit 1's 2026-07-11 oscillation fix (see above) — **that halving logic
 needs re-verification**, flagged but not yet done.
 
-**LVGL 9.5.0 requires local patches — see
+**LVGL requires a local patch on every version — see
 [`Giga_YH_Dashboard_Unit2/lvgl_patches/README.md`](Giga_YH_Dashboard_Unit2/lvgl_patches/README.md).**
-Two bugs behind a board hang on repeated "Change WiFi"/"Change MQTT":
-(1) an unchecked `lv_realloc()` upstream
-([lvgl/lvgl#9794](https://github.com/lvgl/lvgl/issues/9794)) that can
-corrupt memory instead of failing cleanly, and (2) `Arduino_H7_Video`
-(the Giga core's own display helper) shipping a bundled `lv_conf.h` that
-shadows any user-supplied one via `__has_include`, leaving LVGL silently
-on a 64KB heap instead of the intended 512KB SDRAM-backed pool. **If
-LVGL is ever reinstalled or updated, the patches in `lvgl_patches/` must
-be reapplied** (or re-verified as fixed upstream). `logMemStatus()`
+Run `lvgl_patches/Reapply-LvglPatches.ps1` after any LVGL install,
+upgrade or downgrade; it detects the version and applies only what that
+version needs. **Both 9.5.0 and 9.6.0 are verified working (2026-10-01).**
+
+The root cause is `Arduino_H7_Video` (the Giga core's own display helper)
+shipping a bundled `lv_conf.h` that shadows any user-supplied one via
+`__has_include`, so the core's config wins for every LVGL translation
+unit. Including `lvgl.h` before `Arduino_H7_Video.h` does **not** fix it
+(tested) — library sources resolve their own config regardless of sketch
+include order. Consequences differ by version:
+
+- **9.6.0:** the core config sets `LV_USE_DRAW_ARM2D_SYNC 1` while the
+  core ships no Arm-2D, so the build fails outright on `arm_2d.h`. LVGL
+  9.5.0 had no arm2d sources, so the flag was inert there — a latent core
+  bug that 9.6.0 exposed. Draft upstream report:
+  [`Giga_YH_Dashboard_Unit2/tools/arduino_core_lv_conf_shadowing_issue.md`](Giga_YH_Dashboard_Unit2/tools/arduino_core_lv_conf_shadowing_issue.md).
+- **9.5.0:** it builds and silently uses `montserrat_14` and a 64KB heap
+  instead of the intended `montserrat_32` and 512KB SDRAM-backed pool.
+  Reads like a lost `lv_conf.h` edit; the file is fine, just unread.
+
+The second historical patch — unchecked `lv_realloc()` behind a board
+hang on repeated "Change WiFi"/"Change MQTT"
+([lvgl/lvgl#9794](https://github.com/lvgl/lvgl/issues/9794)) — **is fixed
+upstream in 9.6.0** and is no longer applied there. `logMemStatus()`
 (calls `lv_mem_monitor()`) logs after every Change WiFi/Change MQTT flow
 as an ongoing regression signal — watch `free_size`/`frag_pct` if hangs
 ever recur.
