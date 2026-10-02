@@ -141,7 +141,7 @@ re-verification against that corrected understanding**, not yet done.
 `Giga_YH_Dashboard_Unit2/Giga_YH_Dashboard_Unit2.ino` — second physical
 Giga board + Display Shield, `UNIT_NUMBER 2`: subscribe-only, no RS485, no
 publish, no control authority. Safe to iterate on freely without touching
-Unit 1's control loop. Fully implemented (touch-navigable Home + five
+Unit 1's control loop. Fully implemented (touch-navigable Home + six
 detail screens) — see `README.md` for the current screens/interactions
 with real screenshots; the `.ino`'s own header comment has full
 scope/changelog history. `VERSION_DASHBOARD` tracks its own changelog
@@ -151,7 +151,10 @@ All real data, display-only, no control path: TOU rates/schedule (holidays
 derived from the date, no table), NOAA tide predictions for La Jolla (station
 9410230, `tide_data_2026.h`, regenerate via
 `tools/tide_data/convert_tide_data.py` for a future year), real per-line
-grid power via `Line1Set`/`Line2Set` MQTT topics, and weather/sun/moon on
+grid power via `Line1Set`/`Line2Set` MQTT topics, AC pre-cool tier split via
+`V1.0/Home/AC/Precool` (`homeassistant/pyscript/ac_precool.py`, v1.0.65 --
+thermal load shifting tracked separately from the battery because it has no
+round-trip conversion loss), and weather/sun/moon on
 the Almanac screen (and the Home quadrant's weather pill) -- see the
 v1.0.58 paragraph below.
 

@@ -132,7 +132,7 @@ uint32_t dsi_getDisplayXSize(void);
 uint32_t dsi_getDisplayYSize(void);
 
 #define UNIT_NUMBER 2
-#define VERSION_DASHBOARD "1.0.64"
+#define VERSION_DASHBOARD "1.0.65"
 //version 1.0.0  - Spiral 1: all six screens built, touch-navigable. Didn't compile (LVGL v8 API used against v9).
 //version 1.0.1  - Fixed touch driver for the LVGL 9 indev API. First clean compile.
 //version 1.0.9  - Renumbered to continue the prior Unit 2 lineage. Added boot-time version banner.
@@ -330,6 +330,33 @@ uint32_t dsi_getDisplayYSize(void);
 //                 Verified every day of 2026 through 2040 against an independently computed
 //                 holiday set: all 15 years agree on which days are weekend-shaped, and 2026
 //                 reproduces the deleted table exactly.
+//version 1.0.65 - New AC Precool screen, reached from a pill on Time & rates. Pre-cooling the
+//                 house during super off-peak is a second load-shifting mode alongside the
+//                 battery, and a cheaper one: it is thermal storage, so there is no round-trip
+//                 conversion loss -- the same cooling, bought at 13.1c instead of 80.2c. Both
+//                 modes look identical at the meter, so per-circuit data is the only way to
+//                 separate them, and the cheaper lever was previously invisible inside the
+//                 battery's Saved Today.
+//                 Measured against SDG&E 15-minute interval data for Jul-Sep 2026: 98.2% of AC
+//                 energy landed in super off-peak and 0.5% on-peak, worth about $50 of the
+//                 ~$240/month total shift. The AC stops almost exactly on the window boundary
+//                 (69.1 kWh in hour 13, 1.2 kWh in hour 14), which is what the screen is for --
+//                 that discipline is the thing worth watching, not the kWh, since total AC
+//                 energy is weather and the SHARE is control.
+//                 Screen shows the super-off-peak share as the headline (green/amber/red at
+//                 90%/70%), a proportional tier bar, today's kWh split, live state, and the
+//                 dollar saving. "PRECOOLING" is shown only when the compressor is drawing AND
+//                 the current tier is super off-peak -- running at 5pm is the opposite of
+//                 pre-cooling and labelling it the same would hide the failure this screen
+//                 exists to surface.
+//                 New MQTT topic V1.0/Home/AC/Precool, published every 5 minutes by
+//                 homeassistant/pyscript/ac_precool.py (new). Payload is colon-delimited like
+//                 almanac_data.py. The counterfactual behind the dollar figure is this house's
+//                 own measured pre-battery tier mix (Oct 2025, the one pre-battery summer month
+//                 in the SDG&E record), not "all on-peak", which would flatter it.
+//                 parseAcPrecoolPayload() rejects a malformed or negative-energy payload
+//                 outright rather than clamping, so a publisher bug shows as stale data rather
+//                 than a plausible-looking wrong bar.
 
 uint8_t verbosity = 255;
 bool trace = true;
@@ -478,6 +505,34 @@ char g_moonPhaseName[24] = "";
 bool g_hasAlmanacData = false;
 unsigned long g_lastAlmanacDataMs = 0;
 bool g_almanacDataDirty = false; //set on new MQTT data, cleared once the Almanac screen's been refreshed from it
+
+//Published by a pyscript automation on the HA side (see
+//homeassistant/pyscript/ac_precool.py), every 5 minutes: today's AC
+//energy split by TOU tier, the live AC draw, and what that split saved
+//today.
+//
+//Tracked separately from the battery's Saved Today rather than lumped in
+//with it, because pre-cooling the house during super off-peak shifts load
+//WITHOUT the battery's round-trip conversion loss -- the same kWh of
+//cooling, bought earlier. Measured Jul-Sep 2026: 98.2% of AC energy
+//landed in super off-peak and 0.5% on-peak, worth about $50/month on its
+//own, so it is a materially different lever from battery cycling and
+//deserves its own number rather than being invisible inside the total.
+//
+//Payload is colon-delimited, same convention as subtopicAlmanacData:
+//  kwhToday:kwhSop:kwhOff:kwhOn:wattsNow:savedToday
+//e.g. "8.42:8.26:0.12:0.04:1823:2.27"
+const char subtopicAcPrecool[] = "V1.0/Home/AC/Precool";
+
+float g_acKwhToday = 0;
+float g_acKwhSop = 0;      //super off-peak -- the pre-cooling window
+float g_acKwhOff = 0;
+float g_acKwhOn = 0;
+float g_acWattsNow = 0;
+float g_acSavedToday = 0;
+bool g_hasAcPrecool = false;
+unsigned long g_lastAcPrecoolMs = 0;
+bool g_acPrecoolDirty = false; //same pattern as g_almanacDataDirty above
 
 #define MAX_DAYSOC_POINTS 96 //one point per 15-min bucket, full 24h day
 uint8_t g_daySocBucket[MAX_DAYSOC_POINTS];
@@ -868,6 +923,7 @@ lv_obj_t* scr_connection;
 lv_obj_t* scr_battery;
 lv_obj_t* scr_grid;
 lv_obj_t* scr_almanac;
+lv_obj_t* scr_ac;
 lv_obj_t* scr_wifi_scan;
 lv_obj_t* scr_wifi_password;
 lv_obj_t* scr_mqtt_host;
@@ -928,6 +984,19 @@ bool g_wifiChangeRequested = false;
 bool g_pendingWifiAttempt = false;
 char g_pendingAttemptSsid[33];
 char g_pendingAttemptPassword[64];
+
+//---- AC Precool screen widgets ----
+//Three proportional segments, same construction as the Time screen's
+//schedule bar: pre-created once, resized/repositioned per real data. A
+//zero-width LVGL object still draws its border, so an empty tier is
+//hidden outright rather than set to width 0.
+lv_obj_t* ac_bar_seg[3];
+lv_obj_t* lbl_ac_kwh;
+lv_obj_t* lbl_ac_pct;
+lv_obj_t* lbl_ac_state;
+lv_obj_t* lbl_ac_saved;
+lv_obj_t* lbl_ac_breakdown;
+lv_obj_t* pill_time_ac;   //the tap target on the Time & rates screen
 
 lv_obj_t* wifiScanList;
 lv_obj_t* wifiScanStatusLbl;
@@ -1255,6 +1324,8 @@ void subscribeAllMqttTopics() {
 
   if (verbosity > 0) { Serial.print("Subscribing to topic: "); Serial.println(subtopicAlmanacData); }
   mqttClient.subscribe(subtopicAlmanacData);
+  if (verbosity > 100) { Serial.print("Subscribed: "); Serial.println(subtopicAcPrecool); }
+  mqttClient.subscribe(subtopicAcPrecool);
   //Subscribe-only -- no mqttClient.beginMessage()/publish anywhere in this
   //sketch, on any topic. Unit 2 has no publish authority, by design.
 }
@@ -1476,6 +1547,44 @@ bool parseAlmanacPayload(const char* payload, char* conditionOut, size_t conditi
   return true;
 }
 
+//Parses ac_precool.py's colon-delimited payload -- see subtopicAcPrecool
+//for the field order. Same manual-parse convention as
+//parseAlmanacPayload() above (no strtok, which would mutate the buffer).
+//Returns false leaving every *Out untouched if the payload is malformed,
+//so a truncated message can't silently zero a good reading.
+bool parseAcPrecoolPayload(const char* payload, float* kwhTodayOut, float* kwhSopOut,
+                            float* kwhOffOut, float* kwhOnOut, float* wattsOut,
+                            float* savedOut) {
+  const char* p = payload;
+  const char* c[5];
+  c[0] = strchr(p, ':');
+  if (!c[0]) return false;
+  for (int i = 1; i < 5; i++) {
+    c[i] = strchr(c[i - 1] + 1, ':');
+    if (!c[i]) return false;
+  }
+  float kwhToday = atof(p);
+  float kwhSop = atof(c[0] + 1);
+  float kwhOff = atof(c[1] + 1);
+  float kwhOn = atof(c[2] + 1);
+  float watts = atof(c[3] + 1);
+  float saved = atof(c[4] + 1);
+
+  //A negative energy or power here is meaningless for a condenser and
+  //would break the bar's proportional widths, so reject the whole
+  //message rather than clamp -- a publisher bug should be visible as
+  //stale data, not as a plausible-looking wrong bar.
+  if (kwhToday < 0 || kwhSop < 0 || kwhOff < 0 || kwhOn < 0 || watts < 0) return false;
+
+  *kwhTodayOut = kwhToday;
+  *kwhSopOut = kwhSop;
+  *kwhOffOut = kwhOff;
+  *kwhOnOut = kwhOn;
+  *wattsOut = watts;
+  *savedOut = saved;   //signed on purpose: a bad day can be negative
+  return true;
+}
+
 //---- MQTT message handler (subscribe-only -- this never publishes) ----
 void onMqttMessage(int messageSize) {
   //1024, not the 256 every other topic here has gotten away with -- the
@@ -1610,6 +1719,21 @@ void onMqttMessage(int messageSize) {
       g_lastAlmanacDataMs = millis();
       g_almanacDataDirty = true;
       if (trace) { Serial.print("Almanac: "); Serial.print(g_weatherTempF); Serial.print("F "); Serial.print(g_weatherCondition); Serial.print(", phase="); Serial.println(g_moonPhaseName); }
+    }
+
+  } else if (topic.equals(subtopicAcPrecool)) {
+    while (mqttClient.available() && size < (int)sizeof(tbuf) - 1) {
+      tbuf[size] = (char)mqttClient.read();
+      size++;
+    }
+    while (mqttClient.available()) mqttClient.read();
+    tbuf[size] = '\0';
+    if (parseAcPrecoolPayload(tbuf, &g_acKwhToday, &g_acKwhSop, &g_acKwhOff,
+                              &g_acKwhOn, &g_acWattsNow, &g_acSavedToday)) {
+      g_hasAcPrecool = true;
+      g_lastAcPrecoolMs = millis();
+      g_acPrecoolDirty = true;
+      if (trace) { Serial.print("AC precool: "); Serial.print(g_acKwhToday, 2); Serial.print(" kWh, "); Serial.print(g_acWattsNow, 0); Serial.println(" W"); }
     }
   }
 }
@@ -2035,6 +2159,11 @@ void navAlmanac(lv_event_t* e) {
   lv_scr_load(scr_almanac);
   updateAlmanacScreen(); //always fresh on entry, same reasoning as navBattery()
   g_almanacDataDirty = false;
+}
+void navAc(lv_event_t* e) {
+  lv_scr_load(scr_ac);
+  updateAcScreen(); //always fresh on entry, same reasoning as navBattery()
+  g_acPrecoolDirty = false;
 }
 
 void makeBackButton(lv_obj_t* parent) {
@@ -2871,6 +3000,143 @@ void buildTimeScreen() {
   lv_obj_align(pill_time_next, LV_ALIGN_TOP_MID, 0, 350);
   pill_time_third = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_GREEN, "Super off-peak - $0.13/kWh", 20, 40);
   lv_obj_align(pill_time_third, LV_ALIGN_TOP_MID, 0, 401);
+
+  //Entry point to the AC Precool screen. Top-right, because this screen
+  //is already full from y=95 down to 441 and the back button owns the
+  //top-left -- and because pre-cooling is a time-of-use behaviour, so
+  //this is where someone looking at the schedule would expect it.
+  pill_time_ac = makeAutoPill(scr_time, lv_color_hex(0x17191c), COLOR_TEAL, "AC Precool  >", 16, 36);
+  lv_obj_align(pill_time_ac, LV_ALIGN_TOP_RIGHT, -24, 92);
+  lv_obj_add_flag(pill_time_ac, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(pill_time_ac, navAc, LV_EVENT_CLICKED, NULL);
+}
+
+//---- AC Precool screen ----
+//Thermal load shifting, tracked separately from the battery because it
+//costs nothing to convert: pre-cooling during super off-peak buys the
+//same cooling at 13.1c that would otherwise be bought at 80.2c, with no
+//round-trip loss. The headline number here is the super-off-peak SHARE,
+//not the kWh -- total AC energy is weather, the share is control.
+void buildAcScreen() {
+  scr_ac = makeScreenRoot();
+  makeBackButton(scr_ac);
+
+  lv_obj_t* title = makeLabel(scr_ac, "AC Precool", COLOR_TEXT);
+  lv_obj_set_style_text_font(title, &lv_font_montserrat_34, 0);
+  lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 80);
+
+  //Share first and largest: it is the part the control system decides.
+  lbl_ac_pct = makeLabel(scr_ac, "--%", COLOR_GREEN);
+  lv_obj_set_style_text_font(lbl_ac_pct, &lv_font_montserrat_34, 0);
+  lv_obj_align(lbl_ac_pct, LV_ALIGN_TOP_MID, 0, 135);
+  lv_obj_t* pctCap = makeLabel(scr_ac, "of today's AC in super off-peak", COLOR_TEXT_MUTED);
+  lv_obj_align(pctCap, LV_ALIGN_TOP_MID, 0, 180);
+
+  //Proportional tier bar. Same geometry as the Time screen's schedule
+  //bar (x=100, 600px wide) so the two read as the same kind of object,
+  //but here the widths are energy shares rather than hours.
+  for (int i = 0; i < 3; i++) {
+    ac_bar_seg[i] = lv_obj_create(scr_ac);
+    lv_obj_set_size(ac_bar_seg[i], 1, 16);
+    lv_obj_set_pos(ac_bar_seg[i], 100, 220);
+    lv_obj_set_style_radius(ac_bar_seg[i], 4, 0);
+    lv_obj_set_style_border_width(ac_bar_seg[i], 0, 0);
+    lv_obj_add_flag(ac_bar_seg[i], LV_OBJ_FLAG_HIDDEN);
+  }
+  lv_obj_set_style_bg_color(ac_bar_seg[0], COLOR_GREEN, 0);  //super off-peak
+  lv_obj_set_style_bg_color(ac_bar_seg[1], COLOR_AMBER, 0);  //off-peak
+  lv_obj_set_style_bg_color(ac_bar_seg[2], COLOR_RED, 0);    //on-peak
+
+  //40px tall, not 30 -- the same too-short-container clipping bug fixed
+  //on the Battery/Almanac/Time legends.
+  lv_obj_t* legend = makeFlexRow(scr_ac, 0, 250, 800, 40, 40);
+  makeLegendItem(legend, COLOR_GREEN, "Super off-peak");
+  makeLegendItem(legend, COLOR_AMBER, "Off-peak");
+  makeLegendItem(legend, COLOR_RED, "On-peak");
+
+  //Worst-case placeholder width, same reasoning as the Time screen pills.
+  lbl_ac_breakdown = makeLabel(scr_ac, "00.0 kWh today   SOP 00.0  Off 00.0  On 00.0", COLOR_TEXT_MUTED);
+  lv_obj_align(lbl_ac_breakdown, LV_ALIGN_TOP_MID, 0, 300);
+
+  lbl_ac_state = makeLabel(scr_ac, "Waiting for data", COLOR_TEXT_MUTED);
+  lv_obj_align(lbl_ac_state, LV_ALIGN_TOP_MID, 0, 345);
+
+  lbl_ac_saved = makeLabel(scr_ac, "--", COLOR_TEAL);
+  lv_obj_set_style_text_font(lbl_ac_saved, &lv_font_montserrat_34, 0);
+  lv_obj_align(lbl_ac_saved, LV_ALIGN_TOP_MID, 0, 390);
+  lv_obj_t* savedCap = makeLabel(scr_ac, "saved today vs pre-battery AC habit", COLOR_TEXT_DIM);
+  lv_obj_align(savedCap, LV_ALIGN_TOP_MID, 0, 436);
+
+  //Unused on this screen but referenced by updateAcScreen()'s guard --
+  //kept so the updater can be written once without screen-specific
+  //null checks.
+  lbl_ac_kwh = lbl_ac_breakdown;
+}
+
+//Repaints the AC screen from the latest MQTT payload. Called on entry
+//(navAc) and whenever fresh data lands while the screen is showing --
+//same two-path pattern as the Battery curve and Almanac screens.
+void updateAcScreen() {
+  if (!g_hasAcPrecool) return;
+
+  float total = g_acKwhSop + g_acKwhOff + g_acKwhOn;
+
+  char buf[72];
+  if (total > 0.01) {
+    sprintf(buf, "%.0f%%", 100.0 * g_acKwhSop / total);
+  } else {
+    strcpy(buf, "--%");
+  }
+  lv_label_set_text(lbl_ac_pct, buf);
+  //Colored by how well the shift is actually going, using the same
+  //green/amber/red vocabulary the tiers themselves use elsewhere.
+  float share = (total > 0.01) ? (g_acKwhSop / total) : 0;
+  lv_obj_set_style_text_color(lbl_ac_pct,
+      share >= 0.90 ? COLOR_GREEN : share >= 0.70 ? COLOR_AMBER : COLOR_RED, 0);
+
+  sprintf(buf, "%.1f kWh today   SOP %.1f  Off %.1f  On %.1f",
+          g_acKwhToday, g_acKwhSop, g_acKwhOff, g_acKwhOn);
+  lv_label_set_text(lbl_ac_breakdown, buf);
+
+  //Bar: 600px split by energy share. Segments narrower than 2px are
+  //hidden rather than drawn, since a 1px sliver of color reads as a
+  //rendering artifact rather than as data.
+  float parts[3] = { g_acKwhSop, g_acKwhOff, g_acKwhOn };
+  lv_coord_t x = 100;
+  for (int i = 0; i < 3; i++) {
+    lv_coord_t w = (total > 0.01) ? (lv_coord_t)(600.0 * parts[i] / total + 0.5) : 0;
+    if (w < 2) {
+      lv_obj_add_flag(ac_bar_seg[i], LV_OBJ_FLAG_HIDDEN);
+      continue;
+    }
+    lv_obj_clear_flag(ac_bar_seg[i], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_size(ac_bar_seg[i], w, 16);
+    lv_obj_set_pos(ac_bar_seg[i], x, 220);
+    x += w;
+  }
+
+  //"Pre-cooling" only when the compressor is actually drawing AND the
+  //current tier is one worth pre-cooling in -- running at 5pm is the
+  //opposite of pre-cooling, and labelling it the same would hide
+  //exactly the failure this screen exists to show.
+  tm lt;
+  getLocalTm(lt);
+  TouStatus tou = computeTouStatus(lt.tm_hour, lt.tm_wday, lt.tm_mon + 1, lt.tm_mday);
+  bool running = g_acWattsNow > 100.0;
+  if (!running) {
+    sprintf(buf, "AC idle");
+    lv_obj_set_style_text_color(lbl_ac_state, COLOR_TEXT_MUTED, 0);
+  } else if (tou.tier == TOU_SUPER_OFF_PEAK) {
+    sprintf(buf, "PRECOOLING   %.1f kW", g_acWattsNow / 1000.0);
+    lv_obj_set_style_text_color(lbl_ac_state, COLOR_GREEN, 0);
+  } else {
+    sprintf(buf, "Running on %s   %.1f kW", touTierName(tou.tier), g_acWattsNow / 1000.0);
+    lv_obj_set_style_text_color(lbl_ac_state, touTierColor(tou.tier), 0);
+  }
+  lv_label_set_text(lbl_ac_state, buf);
+
+  sprintf(buf, "$%.2f", g_acSavedToday);
+  lv_label_set_text(lbl_ac_saved, buf);
 }
 
 //---- Connection screen (fully live this spiral) ----
@@ -3628,6 +3894,7 @@ void setup() {
   buildBatteryScreen();
   buildGridScreen();
   buildAlmanacScreen();
+  buildAcScreen();
   buildWifiScanScreen();
   buildWifiPasswordScreen();
   buildMqttHostScreen();
@@ -3791,6 +4058,14 @@ void loop() {
   if (g_almanacDataDirty && lv_scr_act() == scr_almanac) {
     g_almanacDataDirty = false;
     updateAlmanacScreen();
+  }
+
+  //Same pattern again for the AC screen -- navAc() covers arriving on
+  //the screen, this covers a new 5-minute payload landing while it is
+  //already showing.
+  if (g_acPrecoolDirty && lv_scr_act() == scr_ac) {
+    g_acPrecoolDirty = false;
+    updateAcScreen();
   }
 
   //Tide data only changes once a day; re-checking every minute (not
